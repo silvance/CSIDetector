@@ -1,26 +1,19 @@
 menu "CSI Transmitter Configuration"
 
-config CSI_TX_AP_SSID
-    string "SoftAP SSID"
-    default "csi-link"
-    help
-        SSID broadcast by the transmitter so the receiver can associate.
-
-config CSI_TX_AP_PASSWORD
-    string "SoftAP password (>= 8 chars, blank = open)"
-    default "csidetector"
-
-config CSI_TX_AP_CHANNEL
-    int "WiFi channel"
+config CSI_TX_CHANNEL
+    int "WiFi channel (ESP-NOW)"
     range 1 13
-    default 6
+    default 11
+    help
+        Both transmitter and receiver must be on the same channel.
+        Channel 11 typically has the least interference in the 2.4 GHz band.
 
-config CSI_TX_BEACON_RATE_HZ
-    int "Application broadcast rate (Hz)"
-    range 1 200
+config CSI_TX_RATE_HZ
+    int "Broadcast rate (Hz)"
+    range 1 500
     default 100
     help
-        How often we transmit a UDP broadcast frame. Each frame triggers one
-        CSI sample on the receiver side, so this is the effective sample rate.
+        How often we broadcast an ESP-NOW packet. Each broadcast triggers one
+        CSI sample on every receiver, so this is the effective sample rate.
 
 endmenu

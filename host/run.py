@@ -1,18 +1,22 @@
 """Command-line entry point for the CSI motion detector.
 
-Three subcommands:
+Subcommands:
 
-    capture  <source> <out.log>
-        Just dump raw CSI lines to disk. Use this to record a still-room
-        baseline or a labeled test session for offline analysis.
+    capture <source> <out.log> [--seconds N]
+        Dump raw CSI_DATA lines to disk. Use this to record a still-room
+        baseline or a labeled session for offline analysis.
 
-    calibrate <log_or_source> [--seconds N] [--window W]
-        Read still-room samples and emit a baseline score. Pipe the result
-        into `detect` via --baseline.
+    calibrate <log_or_source> [--seconds N] [--window W] [--settle S]
+        Read still-room samples and emit a baseline motion score. Drops
+        the first --settle seconds to let the radio's AGC lock.
 
-    detect   <source> --baseline B [--window W] [--enter R] [--exit R]
-        Live detection. Prints a status line per sample and an event line
-        on every transition between still and motion.
+    detect <source> --baseline B [--window W] [--enter R] [--exit R]
+        Live detection. Prints an event line on every transition between
+        STILL and MOTION.
+
+    view <source> [--history N] [--window W]
+        Open a live matplotlib heatmap (subcarrier x time, color = |H| in
+        dB) with a motion-score line below it.
 """
 
 from __future__ import annotations
@@ -50,11 +54,14 @@ def cmd_capture(args: argparse.Namespace) -> int:
     deadline = time.time() + args.seconds if args.seconds else None
     n = 0
     with open(args.out, "w") as f:
+        # Preserve the header line so downstream tools that key off it work.
         for line in _raw_lines(args.source, args.baud):
-            if not line.startswith("CSI "):
+            stripped = line.strip()
+            if not (stripped.startswith("CSI_DATA,") or stripped.startswith("type,")):
                 continue
             f.write(line if line.endswith("\n") else line + "\n")
-            n += 1
+            if stripped.startswith("CSI_DATA,"):
+                n += 1
             if deadline and time.time() >= deadline:
                 break
     print(f"captured {n} samples to {args.out}", file=sys.stderr)
@@ -62,14 +69,21 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 
 def _collect_amplitudes(source: str, seconds: float | None,
-                        max_samples: int | None) -> tuple[np.ndarray, np.ndarray]:
+                        max_samples: int | None,
+                        settle_seconds: float = 0.0
+                        ) -> tuple[np.ndarray, np.ndarray]:
     src = csi_collector.open_source(source)
-    deadline = time.time() + seconds if seconds else None
     rows: list[np.ndarray] = []
     idx = None
+    start = time.time()
+    settle_until = start + settle_seconds
+    deadline = (settle_until + seconds) if seconds else None
+    skipped = 0
     for sample in src:
+        if time.time() < settle_until:
+            skipped += 1
+            continue
         if idx is None:
-            # Discover active subcarriers from the first sample's nonzero bins.
             idx = np.flatnonzero(sample.amplitude > 0)
             if idx.size == 0:
                 continue
@@ -80,12 +94,18 @@ def _collect_amplitudes(source: str, seconds: float | None,
             break
     if not rows or idx is None:
         raise SystemExit("no CSI samples received")
+    if settle_seconds > 0:
+        print(f"dropped {skipped} samples during AGC settle ({settle_seconds:.1f}s)",
+              file=sys.stderr)
     amps = np.stack(rows)[:, idx]
     return amps, idx
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    amps, idx = _collect_amplitudes(args.source, args.seconds, args.max_samples)
+    amps, idx = _collect_amplitudes(
+        args.source, args.seconds, args.max_samples,
+        settle_seconds=args.settle,
+    )
     baseline = detector.compute_baseline(amps, args.window)
     print(f"baseline={baseline:.6f}  samples={amps.shape[0]}  subcarriers={idx.size}",
           file=sys.stderr)
@@ -102,7 +122,10 @@ def cmd_detect(args: argparse.Namespace) -> int:
     src = csi_collector.open_source(args.source)
     det: detector.MotionDetector | None = None
     last_state = False
+    settle_until = time.time() + args.settle
     for sample in src:
+        if time.time() < settle_until:
+            continue
         if det is None:
             idx = np.flatnonzero(sample.amplitude > 0)
             if idx.size == 0:
@@ -122,6 +145,11 @@ def cmd_detect(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_view(args: argparse.Namespace) -> int:
+    import viewer
+    return viewer.run_viewer(args.source, history=args.history, motion_window=args.window)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="csi-detector")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -136,6 +164,8 @@ def build_parser() -> argparse.ArgumentParser:
     cal = sub.add_parser("calibrate", help="estimate still-room baseline score")
     cal.add_argument("source")
     cal.add_argument("--seconds", type=float, default=15.0)
+    cal.add_argument("--settle", type=float, default=detector.AGC_SETTLE_SECONDS_DEFAULT,
+                     help="seconds to drop after start while AGC locks (default 10)")
     cal.add_argument("--max-samples", type=int, default=None)
     cal.add_argument("--window", type=int, default=50)
     cal.set_defaults(func=cmd_calibrate)
@@ -143,11 +173,20 @@ def build_parser() -> argparse.ArgumentParser:
     det_p = sub.add_parser("detect", help="live motion detection")
     det_p.add_argument("source")
     det_p.add_argument("--baseline", type=float, required=True)
+    det_p.add_argument("--settle", type=float, default=detector.AGC_SETTLE_SECONDS_DEFAULT)
     det_p.add_argument("--window", type=int, default=50)
     det_p.add_argument("--enter", type=float, default=3.0)
     det_p.add_argument("--exit", type=float, default=1.5)
     det_p.add_argument("--verbose", action="store_true")
     det_p.set_defaults(func=cmd_detect)
+
+    view_p = sub.add_parser("view", help="live matplotlib CSI heatmap")
+    view_p.add_argument("source")
+    view_p.add_argument("--history", type=int, default=500,
+                        help="samples shown horizontally (~5 s at 100 Hz)")
+    view_p.add_argument("--window", type=int, default=50,
+                        help="motion-score sliding window (samples)")
+    view_p.set_defaults(func=cmd_view)
 
     return p
 
