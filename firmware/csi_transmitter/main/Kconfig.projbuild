@@ -1,0 +1,26 @@
+menu "CSI Transmitter Configuration"
+
+config CSI_TX_AP_SSID
+    string "SoftAP SSID"
+    default "csi-link"
+    help
+        SSID broadcast by the transmitter so the receiver can associate.
+
+config CSI_TX_AP_PASSWORD
+    string "SoftAP password (>= 8 chars, blank = open)"
+    default "csidetector"
+
+config CSI_TX_AP_CHANNEL
+    int "WiFi channel"
+    range 1 13
+    default 6
+
+config CSI_TX_BEACON_RATE_HZ
+    int "Application broadcast rate (Hz)"
+    range 1 200
+    default 100
+    help
+        How often we transmit a UDP broadcast frame. Each frame triggers one
+        CSI sample on the receiver side, so this is the effective sample rate.
+
+endmenu

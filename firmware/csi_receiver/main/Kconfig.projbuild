@@ -1,0 +1,19 @@
+menu "CSI Receiver Configuration"
+
+config CSI_RX_AP_SSID
+    string "Transmitter SSID"
+    default "csi-link"
+
+config CSI_RX_AP_PASSWORD
+    string "Transmitter password"
+    default "csidetector"
+
+config CSI_RX_FILTER_BY_BSSID
+    bool "Only emit CSI for frames from the associated AP"
+    default y
+    help
+        When enabled, frames whose source MAC does not match the AP BSSID are
+        dropped before being printed. This is the cleanest signal for the
+        pair-based detector but excludes ambient-traffic experimentation.
+
+endmenu
