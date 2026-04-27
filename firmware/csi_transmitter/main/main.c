@@ -58,8 +58,11 @@ static void espnow_init(void) {
 static void broadcast_task(void *arg) {
     const TickType_t period = pdMS_TO_TICKS(1000 / CONFIG_CSI_TX_RATE_HZ);
     uint32_t seq = 0;
+    uint32_t sent = 0;
+    uint32_t dropped = 0;
     uint8_t payload[16];
     TickType_t next = xTaskGetTickCount();
+    TickType_t last_report = next;
     while (1) {
         // Gate on previous send: the WiFi TX queue is shallow (2 FG buffers
         // by default), so if we don't wait for completion we'll saturate it
@@ -69,10 +72,23 @@ static void broadcast_task(void *arg) {
         memcpy(payload, &seq, sizeof(seq));
         memset(payload + sizeof(seq), 0xA5, sizeof(payload) - sizeof(seq));
         esp_err_t err = esp_now_send(BROADCAST_MAC, payload, sizeof(payload));
-        if (err != ESP_OK && err != ESP_ERR_ESPNOW_NO_MEM) {
-            ESP_LOGW(TAG, "esp_now_send: %s", esp_err_to_name(err));
+        if (err == ESP_OK) {
+            sent++;
+        } else {
+            dropped++;
+            if (err != ESP_ERR_ESPNOW_NO_MEM) {
+                ESP_LOGW(TAG, "esp_now_send: %s", esp_err_to_name(err));
+            }
         }
         seq++;
+
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_report) >= pdMS_TO_TICKS(2000)) {
+            ESP_LOGI(TAG, "heartbeat: sent=%lu dropped=%lu",
+                     (unsigned long)sent, (unsigned long)dropped);
+            last_report = now;
+        }
+
         vTaskDelayUntil(&next, period);
     }
 }
