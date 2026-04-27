@@ -32,6 +32,14 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
+    // Force HT20 / 11n. ESP-NOW broadcasts default to legacy 11b without
+    // HT-LTF, which means the receiver's CSI engine never fires for our
+    // frames. Selecting 11n + HT20 makes every broadcast carry HT-LTF so
+    // CSI samples are produced. Matches esp-csi/csi_send.
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
+
     // Pin to a fixed channel so receivers can stay tuned.
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_TX_CHANNEL, WIFI_SECOND_CHAN_NONE));
 }
