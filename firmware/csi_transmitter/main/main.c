@@ -33,8 +33,14 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_TX_CHANNEL, WIFI_SECOND_CHAN_NONE));
 }
 
+static void on_send_done(const uint8_t *mac, esp_now_send_status_t status) {
+    (void)mac;
+    (void)status;
+}
+
 static void espnow_init(void) {
     ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_send_cb(on_send_done));
     esp_now_peer_info_t peer = {
         .channel = CONFIG_CSI_TX_CHANNEL,
         .ifidx = WIFI_IF_STA,
