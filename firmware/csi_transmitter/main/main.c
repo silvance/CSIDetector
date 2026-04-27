@@ -6,6 +6,7 @@
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -17,6 +18,8 @@
 static const char *TAG = "csi_tx";
 
 static const uint8_t BROADCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+
+static SemaphoreHandle_t s_send_complete;
 
 static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -36,9 +39,11 @@ static void wifi_init(void) {
 static void on_send_done(const uint8_t *mac, esp_now_send_status_t status) {
     (void)mac;
     (void)status;
+    xSemaphoreGive(s_send_complete);
 }
 
 static void espnow_init(void) {
+    s_send_complete = xSemaphoreCreateBinary();
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_send_cb(on_send_done));
     esp_now_peer_info_t peer = {
@@ -56,10 +61,15 @@ static void broadcast_task(void *arg) {
     uint8_t payload[16];
     TickType_t next = xTaskGetTickCount();
     while (1) {
+        // Gate on previous send: the WiFi TX queue is shallow (2 FG buffers
+        // by default), so if we don't wait for completion we'll saturate it
+        // under any RF contention and esp_now_send starts returning NO_MEM.
+        xSemaphoreTake(s_send_complete, pdMS_TO_TICKS(100));
+
         memcpy(payload, &seq, sizeof(seq));
         memset(payload + sizeof(seq), 0xA5, sizeof(payload) - sizeof(seq));
         esp_err_t err = esp_now_send(BROADCAST_MAC, payload, sizeof(payload));
-        if (err != ESP_OK) {
+        if (err != ESP_OK && err != ESP_ERR_ESPNOW_NO_MEM) {
             ESP_LOGW(TAG, "esp_now_send: %s", esp_err_to_name(err));
         }
         seq++;
