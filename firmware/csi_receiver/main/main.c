@@ -126,13 +126,15 @@ static void espnow_init(void) {
 }
 
 static void enable_csi(void) {
-    // Defaults from esp-csi examples/get-started/csi_recv (line ~195-203).
+    // channel_filter_en=true was dropping every frame on this setup --
+    // promisc=5000+ but csi_calls=0. Disabling it lets CSI fire for any
+    // received HT frame regardless of secondary-channel state.
     wifi_csi_config_t cfg = {
         .lltf_en = true,
         .htltf_en = true,
         .stbc_htltf2_en = true,
         .ltf_merge_en = true,
-        .channel_filter_en = true,
+        .channel_filter_en = false,
         .manu_scale = false,
         .shift = 0,
     };
