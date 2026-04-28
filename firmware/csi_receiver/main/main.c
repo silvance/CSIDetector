@@ -34,6 +34,7 @@ static uint8_t s_filter_mac[6];
 static bool s_filter_active = false;
 static volatile uint32_t s_csi_total_calls = 0;
 static volatile uint32_t s_csi_emitted = 0;
+static volatile uint32_t s_promisc_count = 0;
 
 static int hex_nibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -92,6 +93,10 @@ static void csi_callback(void *ctx, wifi_csi_info_t *info) {
     putchar('\n');
 }
 
+static void promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    s_promisc_count++;
+}
+
 static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -103,9 +108,13 @@ static void wifi_init(void) {
     // (we never associate). Matches esp-csi/csi_recv.
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
     ESP_ERROR_CHECK(esp_wifi_start());
-    // Promiscuous must come before set_channel in IDF v5.x; otherwise
-    // the radio is in a transient state and the channel write crashes.
+    // Promiscuous must come before set_channel in IDF v5.x.
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    // Without an explicit filter, only mgmt frames are captured by default
+    // and CSI never fires for the data frames we care about. Capture all.
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&promiscuous_cb));
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
 }
 
@@ -168,7 +177,8 @@ void app_main(void) {
              CONFIG_CSI_RX_CHANNEL);
 
     while (1) {
-        ESP_LOGI(TAG, "BISECT: alive cb_calls=%lu emitted=%lu",
+        ESP_LOGI(TAG, "BISECT: alive promisc=%lu csi_calls=%lu emitted=%lu",
+                 (unsigned long)s_promisc_count,
                  (unsigned long)s_csi_total_calls,
                  (unsigned long)s_csi_emitted);
         vTaskDelay(pdMS_TO_TICKS(2000));
