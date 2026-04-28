@@ -164,7 +164,11 @@ static void enable_csi(void) {
         .htltf_en = true,
         .stbc_htltf2_en = true,
         .ltf_merge_en = true,
-        .channel_filter_en = true,
+        // false: accept CSI from HT20 frames even though we're in HT40.
+        // The TX is pinned to HT20 (so its ESP-NOW broadcasts carry HT-LTF),
+        // and channel_filter_en=true silently drops bandwidth-mismatched
+        // frames from the CSI path — promisc still sees them.
+        .channel_filter_en = false,
         .manu_scale = false,
         .shift = 0,
     };
