@@ -104,16 +104,15 @@ static void wifi_init(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    // STA mode is required for CSI to compute on HT frames. NULL mode
-    // captured promiscuous packets fine but CSI never fired for any of
-    // them (csi_calls=0 vs promisc=3000+).
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    // Force HT mode so the radio decodes HT-LTF preambles and CSI fires.
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
-        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    // Match esp-csi/csi_recv exactly: 11B|11G|11N|LR, HT40 bandwidth,
+    // permissive promiscuous filter, then channel last.
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&promiscuous_cb));
@@ -126,20 +125,19 @@ static void espnow_init(void) {
 }
 
 static void enable_csi(void) {
-    // channel_filter_en=true was dropping every frame on this setup --
-    // promisc=5000+ but csi_calls=0. Disabling it lets CSI fire for any
-    // received HT frame regardless of secondary-channel state.
     wifi_csi_config_t cfg = {
         .lltf_en = true,
         .htltf_en = true,
         .stbc_htltf2_en = true,
         .ltf_merge_en = true,
-        .channel_filter_en = false,
+        .channel_filter_en = true,
         .manu_scale = false,
         .shift = 0,
     };
-    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&cfg));
+    // esp-csi/csi_recv order: rx_cb -> config -> enable. Some IDF
+    // versions ignore set_csi_config if it comes before set_csi_rx_cb.
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(&csi_callback, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));
 }
 
