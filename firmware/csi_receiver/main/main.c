@@ -89,25 +89,20 @@ static void csi_callback(void *ctx, wifi_csi_info_t *info) {
 }
 
 static void wifi_init(void) {
-    ESP_LOGI(TAG, "step 1: netif_init");
     ESP_ERROR_CHECK(esp_netif_init());
-    ESP_LOGI(TAG, "step 2: event_loop_create_default");
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_LOGI(TAG, "step 3: wifi_init");
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    ESP_LOGI(TAG, "step 4: set_storage");
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_LOGI(TAG, "step 5: set_mode NULL");
+    // WIFI_MODE_NULL avoids spinning up the STA TX path we don't need
+    // (we never associate). Matches esp-csi/csi_recv.
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
-    ESP_LOGI(TAG, "step 6: wifi_start");
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "step 7: set_promiscuous true");
+    // Promiscuous must come before set_channel in IDF v5.x; otherwise
+    // the radio is in a transient state and the channel write crashes.
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-    ESP_LOGI(TAG, "step 8: set_channel %d", CONFIG_CSI_RX_CHANNEL);
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
-    ESP_LOGI(TAG, "wifi_init done");
 }
 
 static void espnow_init(void) {
@@ -139,16 +134,6 @@ static void emit_header(void) {
 }
 
 void app_main(void) {
-    // DIAGNOSTIC MODE: skip everything, just heartbeat. If we see these
-    // logs, app code is reaching the heartbeat loop and USB-CDC is OK.
-    // If we don't, the failure is below app_main and needs different
-    // tooling.
-    for (int i = 0; ; i++) {
-        ESP_LOGI(TAG, "heartbeat %d", i);
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-    return;
-
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
