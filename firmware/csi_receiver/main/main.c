@@ -32,9 +32,6 @@ static const char *TAG = "csi_rx";
 
 static uint8_t s_filter_mac[6];
 static bool s_filter_active = false;
-static volatile uint32_t s_csi_total_calls = 0;
-static volatile uint32_t s_csi_emitted = 0;
-static volatile uint32_t s_promisc_count = 0;
 
 static int hex_nibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -55,10 +52,8 @@ static bool parse_filter_mac(const char *s, uint8_t out[6]) {
 }
 
 static void csi_callback(void *ctx, wifi_csi_info_t *info) {
-    s_csi_total_calls++;
     if (!info || !info->buf || info->len <= 0) return;
     if (s_filter_active && memcmp(info->mac, s_filter_mac, 6) != 0) return;
-    s_csi_emitted++;
 
     static uint32_t seq = 0;
     wifi_pkt_rx_ctrl_t *rx = &info->rx_ctrl;
@@ -93,10 +88,6 @@ static void csi_callback(void *ctx, wifi_csi_info_t *info) {
     putchar('\n');
 }
 
-static void promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
-    s_promisc_count++;
-}
-
 static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -109,13 +100,12 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     // Match esp-csi/csi_recv exactly: 11B|11G|11N|LR, HT40 bandwidth,
-    // permissive promiscuous filter, then channel last.
+    // permissive promiscuous filter so CSI fires for data frames too.
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
         WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&promiscuous_cb));
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
 }
 
@@ -134,8 +124,8 @@ static void enable_csi(void) {
         .manu_scale = false,
         .shift = 0,
     };
-    // esp-csi/csi_recv order: rx_cb -> config -> enable. Some IDF
-    // versions ignore set_csi_config if it comes before set_csi_rx_cb.
+    // esp-csi/csi_recv order: rx_cb -> config -> enable. Some IDF versions
+    // silently drop set_csi_config if it lands before set_csi_rx_cb.
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(&csi_callback, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_csi_config(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));
@@ -163,26 +153,9 @@ void app_main(void) {
                  s_filter_mac[3], s_filter_mac[4], s_filter_mac[5]);
     }
 
-    ESP_LOGI(TAG, "BISECT: pre-wifi_init");
-    vTaskDelay(pdMS_TO_TICKS(200));
     wifi_init();
-    ESP_LOGI(TAG, "BISECT: post-wifi_init");
-    vTaskDelay(pdMS_TO_TICKS(200));
-
     espnow_init();
-    ESP_LOGI(TAG, "BISECT: post-espnow_init");
-    vTaskDelay(pdMS_TO_TICKS(200));
-
     emit_header();
     enable_csi();
-    ESP_LOGI(TAG, "BISECT: post-enable_csi (CSI capture started on channel %d)",
-             CONFIG_CSI_RX_CHANNEL);
-
-    while (1) {
-        ESP_LOGI(TAG, "BISECT: alive promisc=%lu csi_calls=%lu emitted=%lu",
-                 (unsigned long)s_promisc_count,
-                 (unsigned long)s_csi_total_calls,
-                 (unsigned long)s_csi_emitted);
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
+    ESP_LOGI(TAG, "CSI capture started on channel %d", CONFIG_CSI_RX_CHANNEL);
 }
