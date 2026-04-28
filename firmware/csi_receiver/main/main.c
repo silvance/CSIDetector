@@ -148,9 +148,23 @@ void app_main(void) {
                  s_filter_mac[3], s_filter_mac[4], s_filter_mac[5]);
     }
 
+    ESP_LOGI(TAG, "BISECT: pre-wifi_init");
+    vTaskDelay(pdMS_TO_TICKS(200));
     wifi_init();
+    ESP_LOGI(TAG, "BISECT: post-wifi_init");
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     espnow_init();
+    ESP_LOGI(TAG, "BISECT: post-espnow_init");
+    vTaskDelay(pdMS_TO_TICKS(200));
+
     emit_header();
     enable_csi();
-    ESP_LOGI(TAG, "CSI capture started on channel %d", CONFIG_CSI_RX_CHANNEL);
+    ESP_LOGI(TAG, "BISECT: post-enable_csi (CSI capture started on channel %d)",
+             CONFIG_CSI_RX_CHANNEL);
+
+    while (1) {
+        ESP_LOGI(TAG, "BISECT: alive");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
 }
