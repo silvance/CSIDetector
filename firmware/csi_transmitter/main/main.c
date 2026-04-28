@@ -61,6 +61,18 @@ static void espnow_init(void) {
     };
     memcpy(peer.peer_addr, BROADCAST_MAC, 6);
     ESP_ERROR_CHECK(esp_now_add_peer(&peer));
+
+    // Pin broadcasts to 11n HT20 MCS0. esp_wifi_set_protocol/set_bandwidth
+    // alone don't bind the per-peer broadcast rate — ESP-NOW falls back
+    // to 11b 1 Mbps DSSS for compatibility, which has no LLTF/HT-LTF and
+    // therefore produces no CSI sample on the receiver.
+    esp_now_rate_config_t rate_cfg = {
+        .phymode = WIFI_PHY_MODE_HT20,
+        .rate = WIFI_PHY_RATE_MCS0_LGI,
+        .ersu = false,
+        .dcm = false,
+    };
+    ESP_ERROR_CHECK(esp_now_set_peer_rate_config(peer.peer_addr, &rate_cfg));
 }
 
 static void broadcast_task(void *arg) {
