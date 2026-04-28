@@ -139,6 +139,16 @@ static void emit_header(void) {
 }
 
 void app_main(void) {
+    // DIAGNOSTIC MODE: skip everything, just heartbeat. If we see these
+    // logs, app code is reaching the heartbeat loop and USB-CDC is OK.
+    // If we don't, the failure is below app_main and needs different
+    // tooling.
+    for (int i = 0; ; i++) {
+        ESP_LOGI(TAG, "heartbeat %d", i);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    return;
+
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
