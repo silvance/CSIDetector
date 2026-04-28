@@ -33,6 +33,14 @@ static const char *TAG = "csi_rx";
 static uint8_t s_filter_mac[6];
 static bool s_filter_active = false;
 
+// Diagnostic counters. Help separate "TX frames don't reach the radio"
+// (promisc_match stays 0) from "they reach the radio but no CSI fires"
+// (promisc_match grows, csi_emitted stays 0).
+static volatile uint32_t s_promisc_total = 0;
+static volatile uint32_t s_promisc_match = 0;
+static volatile uint32_t s_csi_total = 0;
+static volatile uint32_t s_csi_emitted = 0;
+
 static int hex_nibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     c = tolower((unsigned char)c);
@@ -61,9 +69,33 @@ static bool parse_filter_mac(const char *s, uint8_t out[6]) {
     return nibbles == 12;
 }
 
+static void promisc_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
+    (void)type;
+    s_promisc_total++;
+    if (!s_filter_active) return;
+    // 802.11 A2 (transmitter address) lives at byte 10 of every
+    // non-control frame — same offset for management/data, and that's
+    // what wifi_csi_info_t.mac is supposed to mirror.
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    if (memcmp(pkt->payload + 10, s_filter_mac, 6) == 0) {
+        s_promisc_match++;
+    }
+}
+
+static void diag_timer_cb(void *arg) {
+    (void)arg;
+    ESP_LOGI(TAG, "diag: promisc_total=%lu promisc_match=%lu csi_total=%lu csi_emitted=%lu",
+             (unsigned long)s_promisc_total,
+             (unsigned long)s_promisc_match,
+             (unsigned long)s_csi_total,
+             (unsigned long)s_csi_emitted);
+}
+
 static void csi_callback(void *ctx, wifi_csi_info_t *info) {
+    s_csi_total++;
     if (!info || !info->buf || info->len <= 0) return;
     if (s_filter_active && memcmp(info->mac, s_filter_mac, 6) != 0) return;
+    s_csi_emitted++;
 
     static uint32_t seq = 0;
     wifi_pkt_rx_ctrl_t *rx = &info->rx_ctrl;
@@ -117,6 +149,7 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&promisc_callback));
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
 }
 
@@ -179,4 +212,12 @@ void app_main(void) {
     emit_header();
     enable_csi();
     ESP_LOGI(TAG, "CSI capture started on channel %d", CONFIG_CSI_RX_CHANNEL);
+
+    const esp_timer_create_args_t diag_args = {
+        .callback = &diag_timer_cb,
+        .name = "csi_diag",
+    };
+    esp_timer_handle_t diag_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&diag_args, &diag_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(diag_timer, 2 * 1000 * 1000));
 }
