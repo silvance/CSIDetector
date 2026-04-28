@@ -89,20 +89,25 @@ static void csi_callback(void *ctx, wifi_csi_info_t *info) {
 }
 
 static void wifi_init(void) {
+    ESP_LOGI(TAG, "step 1: netif_init");
     ESP_ERROR_CHECK(esp_netif_init());
+    ESP_LOGI(TAG, "step 2: event_loop_create_default");
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_LOGI(TAG, "step 3: wifi_init");
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_LOGI(TAG, "step 4: set_storage");
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    // WIFI_MODE_NULL avoids spinning up the STA TX path we don't need
-    // (we never associate). Matches esp-csi/csi_recv.
+    ESP_LOGI(TAG, "step 5: set_mode NULL");
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
+    ESP_LOGI(TAG, "step 6: wifi_start");
     ESP_ERROR_CHECK(esp_wifi_start());
-    // Promiscuous must come before set_channel in IDF v5.x; otherwise
-    // the radio is in a transient state and the channel write crashes.
+    ESP_LOGI(TAG, "step 7: set_promiscuous true");
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    ESP_LOGI(TAG, "step 8: set_channel %d", CONFIG_CSI_RX_CHANNEL);
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
+    ESP_LOGI(TAG, "wifi_init done");
 }
 
 static void espnow_init(void) {
