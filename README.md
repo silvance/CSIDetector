@@ -40,7 +40,14 @@ analyzes it.
 
 ## Firmware
 
-Both firmware projects target ESP-IDF v5.x.
+Both firmware projects target **ESP-IDF v5.3 or newer**. The CSI driver in
+v5.2.x has a bug where the receive callback never fires for some chip
+revisions; v5.3+ fixes it. Verify with `idf.py --version`.
+
+The boards stream over the ESP32-S3's native USB-Serial-JTAG, so each shows
+up as `/dev/ttyACMn` (Linux) or a COM port (Windows) — no external
+USB-UART bridge needed. If your dev kit has a separate UART bridge port,
+either side works.
 
 ### Transmitter (`firmware/csi_transmitter/`)
 

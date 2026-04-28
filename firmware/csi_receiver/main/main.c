@@ -95,11 +95,18 @@ static void wifi_init(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
-    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+    // Match esp-csi/csi_recv exactly: 11B|11G|11N|LR, HT40 bandwidth,
+    // permissive promiscuous filter so CSI fires for data frames too.
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
+    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
+    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
 }
 
 static void espnow_init(void) {
@@ -108,7 +115,6 @@ static void espnow_init(void) {
 }
 
 static void enable_csi(void) {
-    // Defaults from esp-csi examples/get-started/csi_recv (line ~195-203).
     wifi_csi_config_t cfg = {
         .lltf_en = true,
         .htltf_en = true,
@@ -118,8 +124,10 @@ static void enable_csi(void) {
         .manu_scale = false,
         .shift = 0,
     };
-    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&cfg));
+    // esp-csi/csi_recv order: rx_cb -> config -> enable. Some IDF versions
+    // silently drop set_csi_config if it lands before set_csi_rx_cb.
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(&csi_callback, NULL));
+    ESP_ERROR_CHECK(esp_wifi_set_csi_config(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_csi(true));
 }
 
