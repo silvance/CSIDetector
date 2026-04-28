@@ -104,14 +104,16 @@ static void wifi_init(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    // WIFI_MODE_NULL avoids spinning up the STA TX path we don't need
-    // (we never associate). Matches esp-csi/csi_recv.
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_NULL));
+    // STA mode is required for CSI to compute on HT frames. NULL mode
+    // captured promiscuous packets fine but CSI never fired for any of
+    // them (csi_calls=0 vs promisc=3000+).
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    // Promiscuous must come before set_channel in IDF v5.x.
+    // Force HT mode so the radio decodes HT-LTF preambles and CSI fires.
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-    // Without an explicit filter, only mgmt frames are captured by default
-    // and CSI never fires for the data frames we care about. Capture all.
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&promiscuous_cb));
