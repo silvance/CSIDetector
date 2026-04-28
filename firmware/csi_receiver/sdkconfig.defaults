@@ -19,9 +19,3 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # brief voltage dips. Re-enable if you switch to clean power and want
 # the safety net back.
 CONFIG_ESP_BROWNOUT_DET=n
-
-# Drop CPU clock from default 240 MHz to 80 MHz to roughly halve
-# steady-state current draw. The receiver is doing very little work
-# (one printf per CSI sample at 100 Hz), so 80 MHz is plenty.
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_80=y
-CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=80
