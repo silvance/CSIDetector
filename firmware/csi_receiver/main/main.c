@@ -40,6 +40,12 @@ static volatile uint32_t s_promisc_total = 0;
 static volatile uint32_t s_promisc_match = 0;
 static volatile uint32_t s_csi_total = 0;
 static volatile uint32_t s_csi_emitted = 0;
+// Last rx_ctrl on a promisc-matched frame, so we can see how the TX is
+// actually being received (sig_mode 0=legacy/no HT-LTF, 1=HT, 2=VHT).
+static volatile uint8_t s_tx_sig_mode = 0xff;
+static volatile uint8_t s_tx_rate = 0xff;
+static volatile uint8_t s_tx_mcs = 0xff;
+static volatile uint8_t s_tx_cwb = 0xff;
 
 static int hex_nibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -79,16 +85,22 @@ static void promisc_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
     const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
     if (memcmp(pkt->payload + 10, s_filter_mac, 6) == 0) {
         s_promisc_match++;
+        s_tx_sig_mode = pkt->rx_ctrl.sig_mode;
+        s_tx_rate = pkt->rx_ctrl.rate;
+        s_tx_mcs = pkt->rx_ctrl.mcs;
+        s_tx_cwb = pkt->rx_ctrl.cwb;
     }
 }
 
 static void diag_timer_cb(void *arg) {
     (void)arg;
-    ESP_LOGI(TAG, "diag: promisc_total=%lu promisc_match=%lu csi_total=%lu csi_emitted=%lu",
+    ESP_LOGI(TAG, "diag: promisc_total=%lu promisc_match=%lu csi_total=%lu csi_emitted=%lu "
+                  "tx_sig_mode=%u rate=%u mcs=%u cwb=%u",
              (unsigned long)s_promisc_total,
              (unsigned long)s_promisc_match,
              (unsigned long)s_csi_total,
-             (unsigned long)s_csi_emitted);
+             (unsigned long)s_csi_emitted,
+             s_tx_sig_mode, s_tx_rate, s_tx_mcs, s_tx_cwb);
 }
 
 static void csi_callback(void *ctx, wifi_csi_info_t *info) {
