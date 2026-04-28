@@ -6,11 +6,18 @@ config CSI_RX_CHANNEL
     default 11
 
 config CSI_RX_FILTER_TX_MAC
-    string "Transmitter MAC filter (12 hex chars, blank = accept all)"
+    string "Transmitter MAC filter (blank = accept all)"
     default ""
     help
-        If set (e.g. "aabbccddeeff"), only CSI samples whose source MAC
-        matches this address are emitted. Recommended once you know the
-        transmitter MAC, to avoid mixing CSI from neighboring traffic.
+        If set, only CSI samples whose source MAC matches this address
+        are emitted. Both forms are accepted:
+
+            aa:bb:cc:dd:ee:ff   (as logged by the TX firmware at boot)
+            aabbccddeeff        (12 hex chars, no separators)
+
+        Recommended once you know the transmitter MAC, to avoid mixing
+        CSI from neighboring traffic. If the value is non-empty but does
+        not parse, the receiver logs an error at boot and disables the
+        filter rather than silently passing everything.
 
 endmenu

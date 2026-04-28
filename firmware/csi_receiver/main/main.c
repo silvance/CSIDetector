@@ -40,15 +40,25 @@ static int hex_nibble(char c) {
     return -1;
 }
 
+// Accept colon/hyphen separators too: the TX firmware logs its MAC as
+// aa:bb:cc:dd:ee:ff, and rejecting that form silently disables the filter.
 static bool parse_filter_mac(const char *s, uint8_t out[6]) {
-    if (!s || strlen(s) != 12) return false;
-    for (int i = 0; i < 6; i++) {
-        int hi = hex_nibble(s[i * 2]);
-        int lo = hex_nibble(s[i * 2 + 1]);
-        if (hi < 0 || lo < 0) return false;
-        out[i] = (uint8_t)((hi << 4) | lo);
+    if (!s) return false;
+    int nibbles = 0;
+    int acc = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == ':' || *p == '-' || *p == ' ') continue;
+        int n = hex_nibble(*p);
+        if (n < 0) return false;
+        acc = (acc << 4) | n;
+        if ((nibbles & 1) == 1) {
+            if (nibbles / 2 >= 6) return false;
+            out[nibbles / 2] = (uint8_t)acc;
+            acc = 0;
+        }
+        nibbles++;
     }
-    return true;
+    return nibbles == 12;
 }
 
 static void csi_callback(void *ctx, wifi_csi_info_t *info) {
@@ -146,11 +156,21 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    s_filter_active = parse_filter_mac(CONFIG_CSI_RX_FILTER_TX_MAC, s_filter_mac);
+    const char *cfg_mac = CONFIG_CSI_RX_FILTER_TX_MAC;
+    s_filter_active = parse_filter_mac(cfg_mac, s_filter_mac);
     if (s_filter_active) {
         ESP_LOGI(TAG, "filtering on TX MAC %02x:%02x:%02x:%02x:%02x:%02x",
                  s_filter_mac[0], s_filter_mac[1], s_filter_mac[2],
                  s_filter_mac[3], s_filter_mac[4], s_filter_mac[5]);
+    } else if (cfg_mac && cfg_mac[0]) {
+        // Non-empty but unparseable: surface this loudly so the user
+        // doesn't think they're filtering when they aren't.
+        ESP_LOGE(TAG, "CSI_RX_FILTER_TX_MAC=\"%s\" is not a valid MAC; "
+                      "filter DISABLED. Use aa:bb:cc:dd:ee:ff or aabbccddeeff.",
+                 cfg_mac);
+    } else {
+        ESP_LOGW(TAG, "no TX MAC filter set — emitting CSI for every frame "
+                      "the radio decodes (set CSI_RX_FILTER_TX_MAC to clean up)");
     }
 
     wifi_init();
