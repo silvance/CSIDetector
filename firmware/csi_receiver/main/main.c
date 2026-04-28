@@ -109,14 +109,12 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-    // 11B|11G|11N|LR + HT20, permissive promisc filter so CSI fires for
-    // data frames too. Bandwidth must match the TX (csi_transmitter pins
-    // itself to HT20): the CSI engine only accumulates HT-LTF for frames
-    // whose bandwidth matches the radio's configured bandwidth, so an
-    // HT40 RX silently drops the TX's HT20 broadcasts on the floor.
+    // 11B|11G|11N|LR + HT40, permissive promisc filter so CSI fires for
+    // data frames too. HT20 was tried (to match the TX's HT20 broadcasts)
+    // and wedged the chip — no frames decoded at all. Stay HT40.
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
         WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
