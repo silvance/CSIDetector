@@ -1,3 +1,7 @@
 numpy>=1.24
 pyserial>=3.5
 matplotlib>=3.7
+# matplotlib needs an interactive backend for the live viewer; ship one
+# explicitly so a fresh "pip install -r requirements.txt" produces a
+# working GUI on any platform without relying on system tkinter.
+PyQt6>=6.6
