@@ -1,7 +1,7 @@
 menu "CSI Receiver Configuration"
 
 config CSI_RX_CHANNEL
-    int "WiFi channel (must match transmitter)"
+    int "WiFi channel (must match transmitter AND host hotspot)"
     range 1 13
     default 11
 
@@ -19,5 +19,33 @@ config CSI_RX_FILTER_TX_MAC
         CSI from neighboring traffic. If the value is non-empty but does
         not parse, the receiver logs an error at boot and disables the
         filter rather than silently passing everything.
+
+config CSI_RX_WIFI_SSID
+    string "Hotspot SSID for UDP forwarding (blank = UART-only)"
+    default ""
+    help
+        If set, the receiver associates as a STA to this SSID after
+        bringing up promiscuous CSI capture. Each CSI sample is sent
+        as a binary UDP packet to CSI_RX_HOST_IP:CSI_RX_HOST_PORT, in
+        addition to being printed over UART. Must be on the same
+        channel as the transmitter (CSI_RX_CHANNEL) — the radio
+        cannot capture CSI on one channel while associated to an AP
+        on another.
+
+config CSI_RX_WIFI_PASS
+    string "Hotspot password"
+    default ""
+    depends on CSI_RX_WIFI_SSID != ""
+
+config CSI_RX_HOST_IP
+    string "Host IP address (UDP destination)"
+    default "10.42.0.1"
+    depends on CSI_RX_WIFI_SSID != ""
+
+config CSI_RX_HOST_PORT
+    int "Host UDP port"
+    range 1 65535
+    default 5566
+    depends on CSI_RX_WIFI_SSID != ""
 
 endmenu

@@ -1,10 +1,11 @@
 // CSI receiver: tunes to the transmitter's channel and prints CSI samples
 // over UART in the esp-csi line format so existing host tooling
 // (esp-csi/examples/get-started/tools/csi_data_read_parse.py) works
-// untouched. ESP-NOW is initialized so the radio decodes the broadcast
-// frames and fires the CSI callback; we do not consume the payloads.
+// untouched. Optionally also forwards each sample as a binary UDP packet
+// to a host on a configured WiFi hotspot, so multiple receivers can
+// stream into one PC without USB tethers (multi-RX heatmap setup).
 //
-// Output line format (single header at boot, then one row per CSI sample):
+// UART output format (single header at boot, then one row per CSI sample):
 //
 //   CSI_DATA,seq,mac,rssi,rate,sig_mode,mcs,bandwidth,smoothing,
 //            not_sounding,aggregation,stbc,fec_coding,sgi,noise_floor,
@@ -12,6 +13,10 @@
 //            sig_len,rx_state,len,first_word,data
 //
 // `data` is a JSON int8 array of (Im, Re) pairs.
+//
+// UDP output format (when CSI_RX_WIFI_SSID is set): see csi_udp_header_t
+// below. Little-endian, packed, header followed by `len` bytes of int8
+// IQ data. Host parses by `version`.
 
 #include <string.h>
 #include <stdint.h>
@@ -27,11 +32,38 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
 
 static const char *TAG = "csi_rx";
 
 static uint8_t s_filter_mac[6];
 static bool s_filter_active = false;
+
+// UDP forwarding state. s_udp_sock is < 0 until the STA gets an IP and
+// the socket is created. UART output continues regardless.
+static int s_udp_sock = -1;
+static struct sockaddr_in s_udp_dest;
+static uint8_t s_rx_mac[6];
+
+// Wire format of the UDP packet header. Little-endian, packed; total
+// 34 bytes, followed by `len` bytes of int8 IQ samples.
+typedef struct __attribute__((packed)) csi_udp_header {
+    uint8_t  version;       // 1
+    uint8_t  reserved;
+    uint8_t  rx_mac[6];     // factory MAC of this RX
+    uint8_t  tx_mac[6];     // source MAC of the captured frame (TX)
+    uint32_t seq;
+    int64_t  ts_us;
+    int8_t   rssi;
+    int8_t   noise_floor;
+    uint8_t  channel;
+    uint8_t  sig_mode;
+    uint8_t  mcs;
+    uint8_t  bandwidth;
+    uint16_t len;
+} csi_udp_header_t;
+_Static_assert(sizeof(csi_udp_header_t) == 34, "csi_udp_header_t must be 34 bytes");
 
 static int hex_nibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -61,14 +93,45 @@ static bool parse_filter_mac(const char *s, uint8_t out[6]) {
     return nibbles == 12;
 }
 
+static void udp_send_sample(uint32_t seq, int64_t ts, const wifi_csi_info_t *info) {
+    if (s_udp_sock < 0) return;
+    // Stack-allocated packet: header + IQ. info->len is bounded by the
+    // CSI engine to a few hundred bytes, well under MTU.
+    uint8_t pkt[sizeof(csi_udp_header_t) + 384];
+    if (info->len > (int)(sizeof(pkt) - sizeof(csi_udp_header_t))) return;
+
+    csi_udp_header_t *h = (csi_udp_header_t *)pkt;
+    h->version = 1;
+    h->reserved = 0;
+    memcpy(h->rx_mac, s_rx_mac, 6);
+    memcpy(h->tx_mac, info->mac, 6);
+    h->seq = seq;
+    h->ts_us = ts;
+    h->rssi = info->rx_ctrl.rssi;
+    h->noise_floor = info->rx_ctrl.noise_floor;
+    h->channel = info->rx_ctrl.channel;
+    h->sig_mode = info->rx_ctrl.sig_mode;
+    h->mcs = info->rx_ctrl.mcs;
+    h->bandwidth = info->rx_ctrl.cwb;
+    h->len = (uint16_t)info->len;
+    memcpy(pkt + sizeof(csi_udp_header_t), info->buf, info->len);
+
+    // Non-blocking; drops on full TX queue rather than stalling capture.
+    sendto(s_udp_sock, pkt, sizeof(csi_udp_header_t) + info->len, MSG_DONTWAIT,
+           (struct sockaddr *)&s_udp_dest, sizeof(s_udp_dest));
+}
+
 static void csi_callback(void *ctx, wifi_csi_info_t *info) {
     if (!info || !info->buf || info->len <= 0) return;
     if (s_filter_active && memcmp(info->mac, s_filter_mac, 6) != 0) return;
 
     static uint32_t seq = 0;
+    uint32_t this_seq = seq++;
     wifi_pkt_rx_ctrl_t *rx = &info->rx_ctrl;
     int64_t ts = esp_timer_get_time();
     int8_t *buf = (int8_t *)info->buf;
+
+    udp_send_sample(this_seq, ts, info);
 
     // Header columns match esp-csi conventions; emitting them up front lets
     // a single fwrite per row stay atomic.
@@ -78,7 +141,7 @@ static void csi_callback(void *ctx, wifi_csi_info_t *info) {
            "%d,%d,%d,"                      // sgi,noise_floor,ampdu_cnt
            "%d,%d,%lld,"                    // channel,secondary_channel,local_timestamp
            "%d,%d,%d,%d,%d,",               // ant,sig_len,rx_state,len,first_word
-           (unsigned long)seq++,
+           (unsigned long)this_seq,
            info->mac[0], info->mac[1], info->mac[2],
            info->mac[3], info->mac[4], info->mac[5],
            rx->rssi, rx->rate, rx->sig_mode, rx->mcs, rx->cwb,
@@ -98,15 +161,62 @@ static void csi_callback(void *ctx, wifi_csi_info_t *info) {
     putchar('\n');
 }
 
+static void open_udp_socket(esp_ip4_addr_t ip) {
+    s_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s_udp_sock < 0) {
+        ESP_LOGE(TAG, "socket() failed: errno %d", errno);
+        return;
+    }
+    s_udp_dest.sin_family = AF_INET;
+    s_udp_dest.sin_port = htons(CONFIG_CSI_RX_HOST_PORT);
+    if (inet_pton(AF_INET, CONFIG_CSI_RX_HOST_IP, &s_udp_dest.sin_addr) != 1) {
+        ESP_LOGE(TAG, "bad CSI_RX_HOST_IP=%s", CONFIG_CSI_RX_HOST_IP);
+        close(s_udp_sock);
+        s_udp_sock = -1;
+        return;
+    }
+    ESP_LOGI(TAG, "UDP forwarding to %s:%d (this RX " IPSTR ")",
+             CONFIG_CSI_RX_HOST_IP, CONFIG_CSI_RX_HOST_PORT, IP2STR(&ip));
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "STA disconnected, reconnecting");
+        s_udp_sock = -1;
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
+        open_udp_socket(event->ip_info.ip);
+    }
+}
+
 static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    if (CONFIG_CSI_RX_WIFI_SSID[0] != '\0') {
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(
+            WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(
+            IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+        wifi_config_t sta_cfg = {0};
+        strlcpy((char *)sta_cfg.sta.ssid, CONFIG_CSI_RX_WIFI_SSID, sizeof(sta_cfg.sta.ssid));
+        strlcpy((char *)sta_cfg.sta.password, CONFIG_CSI_RX_WIFI_PASS, sizeof(sta_cfg.sta.password));
+        // Pin the channel so association doesn't drag the radio off the
+        // capture channel — saves time and avoids a CSI gap.
+        sta_cfg.sta.channel = CONFIG_CSI_RX_CHANNEL;
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
+    }
+
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     // 11B|11G|11N|LR + HT40, permissive promisc filter so CSI fires for
@@ -118,6 +228,10 @@ static void wifi_init(void) {
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
+
+    // Cache our MAC for stamping outgoing UDP packets (the host uses it
+    // to demux per-RX streams).
+    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, s_rx_mac));
 }
 
 static void espnow_init(void) {

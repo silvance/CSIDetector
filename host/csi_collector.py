@@ -30,7 +30,7 @@ import numpy as np
 class CSISample:
     seq: int
     ts_us: int
-    mac: str
+    mac: str       # source MAC of the captured frame (TX, in our setup)
     rssi: int
     noise: int
     channel: int
@@ -39,6 +39,7 @@ class CSISample:
     mcs: int
     ant: int
     csi: np.ndarray  # complex64, one entry per subcarrier
+    rx_id: Optional[str] = None  # which receiver produced this sample (UDP path)
 
     @property
     def amplitude(self) -> np.ndarray:
@@ -129,9 +130,54 @@ def iter_stdin() -> Iterator[CSISample]:
             yield sample
 
 
+# Wire format of csi_udp_header_t in firmware/csi_receiver/main/main.c.
+# Little-endian, packed; 34 bytes header followed by `length` bytes of int8 IQ.
+_UDP_HEADER = __import__("struct").Struct("<BB6s6sIqbbBBBBH")
+assert _UDP_HEADER.size == 34
+
+
+def parse_udp_packet(data: bytes) -> Optional[CSISample]:
+    if len(data) < _UDP_HEADER.size:
+        return None
+    (version, _reserved, rx_mac, tx_mac, seq, ts_us, rssi, noise,
+     channel, sig_mode, mcs, bandwidth, length) = _UDP_HEADER.unpack_from(data)
+    if version != 1:
+        return None
+    if len(data) - _UDP_HEADER.size < length or length % 2 != 0:
+        return None
+    iq = np.frombuffer(data, dtype=np.int8,
+                       offset=_UDP_HEADER.size, count=length).astype(np.float32)
+    imag = iq[0::2]
+    real = iq[1::2]
+    csi = (real + 1j * imag).astype(np.complex64)
+    fmt = lambda b: ":".join(f"{x:02x}" for x in b)
+    return CSISample(
+        seq=seq, ts_us=ts_us, mac=fmt(tx_mac), rssi=rssi, noise=noise,
+        channel=channel, bandwidth=bandwidth, sig_mode=sig_mode,
+        mcs=mcs, ant=0, csi=csi, rx_id=fmt(rx_mac),
+    )
+
+
+def iter_udp(port: int, bind: str = "0.0.0.0") -> Iterator[CSISample]:
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((bind, port))
+    try:
+        while True:
+            data, _addr = sock.recvfrom(2048)
+            sample = parse_udp_packet(data)
+            if sample is not None:
+                yield sample
+    finally:
+        sock.close()
+
+
 def open_source(source: str) -> Iterator[CSISample]:
     if source == "-":
         return iter_stdin()
+    if source.startswith("udp:"):
+        return iter_udp(int(source[4:]))
     if source.startswith("/dev/") or source.lower().startswith("com"):
         return iter_serial(source)
     return iter_file(source)
