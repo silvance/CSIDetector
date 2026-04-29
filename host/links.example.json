@@ -1,0 +1,11 @@
+{
+  "_comment": "Edit MACs to match your boards (run.py heatmap prints them on first packet) and (x_m, y_m) to match your room. Coordinates in meters; origin doesn't matter — only relative positions.",
+  "room": { "width_m": 5.0, "height_m": 4.0 },
+  "tx": { "x": 2.5, "y": 2.0, "label": "TX" },
+  "rxs": [
+    { "mac": "1c:db:d4:78:57:70", "x": 0.0, "y": 2.0, "label": "west"  },
+    { "mac": "e0:72:a1:aa:2c:88", "x": 5.0, "y": 2.0, "label": "east"  },
+    { "mac": "ac:a7:04:2c:24:cc", "x": 2.5, "y": 0.0, "label": "south" },
+    { "mac": "e0:72:a1:aa:1c:0c", "x": 2.5, "y": 4.0, "label": "north" }
+  ]
+}
