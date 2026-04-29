@@ -17,6 +17,12 @@ Subcommands:
     view <source> [--history N] [--window W]
         Open a live matplotlib heatmap (subcarrier x time, color = |H| in
         dB) with a motion-score line below it.
+
+    heatmap <source> --links links.json [--history N] [--window W]
+        Multi-RX floor-plan view: per TX-RX line tinted by current
+        motion-σ. Source is typically `udp:<port>`; the host listens
+        for binary CSI packets from receivers running with
+        CSI_RX_WIFI_SSID configured.
 """
 
 from __future__ import annotations
@@ -150,6 +156,12 @@ def cmd_view(args: argparse.Namespace) -> int:
     return viewer.run_viewer(args.source, history=args.history, motion_window=args.window)
 
 
+def cmd_heatmap(args: argparse.Namespace) -> int:
+    import heatmap
+    return heatmap.run_heatmap(args.source, args.links,
+                               history=args.history, motion_window=args.window)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="csi-detector")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -187,6 +199,14 @@ def build_parser() -> argparse.ArgumentParser:
     view_p.add_argument("--window", type=int, default=50,
                         help="motion-score sliding window (samples)")
     view_p.set_defaults(func=cmd_view)
+
+    hm = sub.add_parser("heatmap", help="multi-RX floor-plan motion overlay (UDP)")
+    hm.add_argument("source", help="udp:<port> typically")
+    hm.add_argument("--links", required=True,
+                    help="JSON config with room, TX, and RX positions (see links.example.json)")
+    hm.add_argument("--history", type=int, default=500)
+    hm.add_argument("--window", type=int, default=50)
+    hm.set_defaults(func=cmd_heatmap)
 
     return p
 
