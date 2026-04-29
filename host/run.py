@@ -159,7 +159,43 @@ def cmd_view(args: argparse.Namespace) -> int:
 def cmd_heatmap(args: argparse.Namespace) -> int:
     import heatmap
     return heatmap.run_heatmap(args.source, args.links,
-                               history=args.history, motion_window=args.window)
+                               history=args.history, motion_window=args.window,
+                               baselines_path=args.baselines)
+
+
+def cmd_calibrate_links(args: argparse.Namespace) -> int:
+    """Multi-RX still-room calibration. Writes {rx_mac: baseline} as JSON."""
+    import json
+    src = csi_collector.open_source(args.source)
+    per_rx: dict[str, list[np.ndarray]] = {}
+    start = time.time()
+    settle_until = start + args.settle
+    deadline = settle_until + args.seconds
+    skipped = 0
+    print(f"calibrating for {args.seconds}s after {args.settle}s AGC settle...",
+          file=sys.stderr)
+    for sample in src:
+        now = time.time()
+        if now < settle_until:
+            skipped += 1
+            continue
+        if now >= deadline:
+            break
+        rx = sample.rx_id
+        if rx is None:
+            continue
+        per_rx.setdefault(rx, []).append(sample.amplitude)
+    baselines = detector.compute_link_baselines(per_rx, window=args.window)
+    if not baselines:
+        raise SystemExit("no usable baselines — did any RX deliver enough samples?")
+    print(f"dropped {skipped} settle samples; per-RX counts: "
+          f"{ {k: len(v) for k, v in per_rx.items()} }", file=sys.stderr)
+    for mac, b in sorted(baselines.items()):
+        print(f"  {mac}  baseline={b:.6f}", file=sys.stderr)
+    with open(args.out, "w") as f:
+        json.dump(baselines, f, indent=2)
+    print(f"wrote {args.out}", file=sys.stderr)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -204,9 +240,20 @@ def build_parser() -> argparse.ArgumentParser:
     hm.add_argument("source", help="udp:<port> typically")
     hm.add_argument("--links", required=True,
                     help="JSON config with room, TX, and RX positions (see links.example.json)")
+    hm.add_argument("--baselines", default=None,
+                    help="JSON file from `calibrate-links`; enables ratio-based coloring")
     hm.add_argument("--history", type=int, default=500)
     hm.add_argument("--window", type=int, default=50)
     hm.set_defaults(func=cmd_heatmap)
+
+    cl = sub.add_parser("calibrate-links",
+                        help="per-RX still-room baseline (writes JSON for `heatmap --baselines`)")
+    cl.add_argument("source", help="udp:<port> typically")
+    cl.add_argument("--out", default="baselines.json")
+    cl.add_argument("--seconds", type=float, default=30.0)
+    cl.add_argument("--settle", type=float, default=detector.AGC_SETTLE_SECONDS_DEFAULT)
+    cl.add_argument("--window", type=int, default=50)
+    cl.set_defaults(func=cmd_calibrate_links)
 
     return p
 

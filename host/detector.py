@@ -106,3 +106,25 @@ def compute_baseline(amplitudes: np.ndarray, window: int) -> float:
     for i in range(n_windows):
         scores[i] = np.mean(np.std(filtered[i : i + window], axis=0))
     return float(np.median(scores))
+
+
+def compute_link_baselines(samples_by_rx: dict[str, list[np.ndarray]],
+                            window: int) -> dict[str, float]:
+    """Per-RX baseline from a multi-RX still-room capture.
+
+    `samples_by_rx` maps RX MAC to a list of amplitude vectors collected
+    in the still room. Each RX needs at least 2*window samples; RXs with
+    fewer are skipped (likely received nothing during the capture).
+    Returns {mac: baseline}.
+    """
+    out: dict[str, float] = {}
+    for mac, rows in samples_by_rx.items():
+        if len(rows) < window * 2:
+            continue
+        amps = np.stack(rows)
+        # Drop guard subcarriers (always 0) — same convention as the viewer.
+        idx = np.flatnonzero(np.any(amps > 0, axis=0))
+        if idx.size == 0:
+            continue
+        out[mac] = compute_baseline(amps[:, idx], window)
+    return out

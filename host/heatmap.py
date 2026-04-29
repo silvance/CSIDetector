@@ -84,7 +84,8 @@ def _reader_thread(source: str, buffers: dict[str, _LinkBuffer],
 
 
 def run_heatmap(source: str, links_path: str,
-                history: int = 500, motion_window: int = 50) -> int:
+                history: int = 500, motion_window: int = 50,
+                baselines_path: Optional[str] = None) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     from matplotlib.cm import get_cmap
@@ -93,6 +94,10 @@ def run_heatmap(source: str, links_path: str,
     room = cfg["room"]
     tx = cfg["tx"]
     buffers = {rx.mac: _LinkBuffer(history) for rx in rxs}
+    baselines: dict[str, float] = {}
+    if baselines_path:
+        with open(baselines_path) as f:
+            baselines = {k.lower(): float(v) for k, v in json.load(f).items()}
     unknown = set()
     stop = threading.Event()
     reader = threading.Thread(target=_reader_thread,
@@ -123,23 +128,37 @@ def run_heatmap(source: str, links_path: str,
     ax.text(tx["x"], tx["y"] + 0.15, tx.get("label", "TX"),
             ha="center", va="bottom", fontsize=10, fontweight="bold")
 
+    # Two coloring modes:
+    # - With baselines: color by ratio to per-link still-room baseline.
+    #   1× = no motion, RATIO_FULL_BRIGHT× = saturated. Stable across runs.
+    # - Without: fall back to running-max normalization (dimmer over time
+    #   when nothing's happening, but no calibration needed).
+    RATIO_FULL_BRIGHT = 5.0
+    use_ratio = bool(baselines)
+    label = "motion ratio (× still-room)" if use_ratio else "motion σ (normalized)"
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=1))
-    cbar = fig.colorbar(sm, ax=ax, label="motion σ (normalized)")
+    cbar = fig.colorbar(sm, ax=ax, label=label)
     del cbar
 
-    # Auto-scale: the motion-σ floor depends on noise; track running max
-    # and normalize lines against it so weak/strong motion both render.
     running_max = [1e-3]
 
     def update(_frame):
         scores = [buffers[rx.mac].motion_score(motion_window) for rx in rxs]
-        if scores:
-            running_max[0] = max(running_max[0] * 0.99, max(scores), 1e-3)
-        denom = running_max[0]
-        for line, lbl, rx, score in zip(line_artists, label_artists, rxs, scores):
-            tint = min(score / denom, 1.0)
+        if use_ratio:
+            metrics = [score / max(baselines.get(rx.mac, 1e-3), 1e-6)
+                       for rx, score in zip(rxs, scores)]
+            tints = [min(m / RATIO_FULL_BRIGHT, 1.0) for m in metrics]
+            text_fmt = lambda rx, score, m: f"{rx.label}\n{m:.2f}×"
+        else:
+            if scores:
+                running_max[0] = max(running_max[0] * 0.99, max(scores), 1e-3)
+            tints = [min(score / running_max[0], 1.0) for score in scores]
+            metrics = scores
+            text_fmt = lambda rx, score, m: f"{rx.label}\n{score:.4f}"
+        for line, lbl, rx, score, tint, m in zip(
+                line_artists, label_artists, rxs, scores, tints, metrics):
             line.set_color(cmap(tint))
-            lbl.set_text(f"{rx.label}\n{score:.4f}")
+            lbl.set_text(text_fmt(rx, score, m))
         if unknown:
             ax.set_title(f"unknown MACs streaming (add to links.json): {', '.join(sorted(unknown))}",
                          fontsize=8, color="tab:red")
