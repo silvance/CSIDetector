@@ -38,17 +38,14 @@ config CSI_RX_WIFI_SSID
 config CSI_RX_WIFI_PASS
     string "Hotspot password"
     default ""
-    depends on CSI_RX_WIFI_SSID != ""
 
 config CSI_RX_HOST_IP
     string "Host IP address (UDP destination)"
     default "10.42.0.1"
-    depends on CSI_RX_WIFI_SSID != ""
 
 config CSI_RX_HOST_PORT
     int "Host UDP port"
     range 1 65535
     default 5566
-    depends on CSI_RX_WIFI_SSID != ""
 
 endmenu
