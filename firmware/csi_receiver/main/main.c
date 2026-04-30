@@ -214,10 +214,16 @@ static void open_udp_socket(esp_ip4_addr_t ip) {
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+    // STA_START is intentionally NOT handled here — we call
+    // esp_wifi_connect() explicitly from wifi_init() after promisc
+    // setup so the order is deterministic. Auto-connecting from the
+    // STA_START handler races the main thread's promiscuous setup and
+    // the connect silently fails on some IDF versions.
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "STA associated to AP");
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "STA disconnected, reconnecting");
+        wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "STA disconnected (reason=%d), reconnecting", e ? e->reason : 0);
         s_udp_sock = -1;
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -271,6 +277,16 @@ static void wifi_init(void) {
     // Cache our MAC for stamping outgoing UDP packets (the host uses it
     // to demux per-RX streams).
     ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, s_rx_mac));
+
+    // Kick off STA association last, after promiscuous + channel are
+    // fully set up. Running this from a STA_START event handler races
+    // the main thread's setup and the connect silently does nothing.
+    if (CONFIG_CSI_RX_WIFI_SSID[0] != '\0') {
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+        }
+    }
 }
 
 static void espnow_init(void) {
