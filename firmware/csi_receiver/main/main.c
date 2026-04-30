@@ -271,40 +271,28 @@ static void wifi_init(void) {
 
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Critical ordering: associate FIRST, then enable promiscuous.
-    // Doing it the other way silently kills the connection on every
-    // IDF version we've tested — the radio enters monitor mode and
-    // the in-flight or pending association just stops.
+    // Set protocol + bandwidth BEFORE connecting. Calling these on an
+    // already-associated STA forces a renegotiation and the AP drops
+    // us (reason 8, LEAVING). Pre-connect they're harmless.
+    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
+        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
+
     if (wifi_enabled) {
+        // Associate after protocol/bandwidth are set so the connection
+        // doesn't have to renegotiate them.
         esp_err_t err = esp_wifi_connect();
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
         }
-        // Block up to 10s for the IP. If it doesn't come, fall back to
-        // capture-only mode rather than hanging the boot.
         EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_EVT_GOT_IP,
                                                pdFALSE, pdTRUE,
                                                pdMS_TO_TICKS(10000));
         if (!(bits & WIFI_EVT_GOT_IP)) {
             ESP_LOGW(TAG, "STA didn't get IP within 10s — continuing in "
-                          "promiscuous-only mode (no UDP forwarding)");
+                          "capture-only mode (no UDP forwarding)");
         }
-    }
-
-    // We deliberately do NOT enable promiscuous mode in the
-    // STA-associated path. Enabling it after association forcibly
-    // disconnects the STA in IDF 5.x (reason=8 LEAVING), and that
-    // breaks the UDP forwarding the demo depends on.
-    //
-    // CSI still fires for ESP-NOW broadcasts: their destination is
-    // ff:ff:ff:ff:ff:ff, every STA on the channel accepts broadcasts,
-    // and the CSI engine runs on every accepted frame. We only need
-    // promiscuous mode for the standalone (UART-only) case where we
-    // never join an AP.
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
-        WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
-    if (!wifi_enabled) {
+    } else {
         // Standalone mode: no AP, so we need promiscuous to capture
         // anything, and we have to pin the channel manually.
         ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
@@ -312,6 +300,10 @@ static void wifi_init(void) {
         ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
         ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
     }
+    // CSI still fires for ESP-NOW broadcasts in the associated path:
+    // their destination is ff:ff:ff:ff:ff:ff, every STA on the channel
+    // accepts broadcasts, and the CSI engine runs on every accepted
+    // frame. So we don't need promiscuous mode when associated.
 
     // Cache our MAC for stamping outgoing UDP packets (the host uses it
     // to demux per-RX streams).
