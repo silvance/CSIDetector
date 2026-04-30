@@ -172,29 +172,46 @@ def cmd_calibrate_links(args: argparse.Namespace) -> int:
     settle_until = start + args.settle
     deadline = settle_until + args.seconds
     skipped = 0
-    print(f"calibrating for {args.seconds}s after {args.settle}s AGC settle...",
-          file=sys.stderr)
+    print(f"\n>>> LEAVE THE ROOM NOW <<<  starting capture in {args.settle:.0f}s "
+          f"(then recording for {args.seconds:.0f}s)\n", file=sys.stderr, flush=True)
+    next_tick = start + 1.0
+    capture_announced = False
     for sample in src:
         now = time.time()
         if now < settle_until:
             skipped += 1
+            if now >= next_tick:
+                remaining = int(settle_until - now + 0.5)
+                print(f"  ...{remaining}s until recording starts",
+                      file=sys.stderr, flush=True)
+                next_tick = now + 1.0
             continue
+        if not capture_announced:
+            print(f"\n>>> RECORDING <<<  hold still for {args.seconds:.0f}s\n",
+                  file=sys.stderr, flush=True)
+            capture_announced = True
+            next_tick = now + 5.0
         if now >= deadline:
             break
         rx = sample.rx_id
         if rx is None:
             continue
         per_rx.setdefault(rx, []).append(sample.amplitude)
+        if now >= next_tick:
+            counts = ", ".join(f"{k[-5:]}={len(v)}" for k, v in sorted(per_rx.items()))
+            print(f"  +{int(now - settle_until)}s  {counts}",
+                  file=sys.stderr, flush=True)
+            next_tick = now + 5.0
     baselines = detector.compute_link_baselines(per_rx, window=args.window)
     if not baselines:
         raise SystemExit("no usable baselines — did any RX deliver enough samples?")
-    print(f"dropped {skipped} settle samples; per-RX counts: "
-          f"{ {k: len(v) for k, v in per_rx.items()} }", file=sys.stderr)
+    print(f"\ndropped {skipped} settle samples", file=sys.stderr)
     for mac, b in sorted(baselines.items()):
-        print(f"  {mac}  baseline={b:.6f}", file=sys.stderr)
+        print(f"  {mac}  baseline={b:.6f}  ({len(per_rx[mac])} samples)",
+              file=sys.stderr)
     with open(args.out, "w") as f:
         json.dump(baselines, f, indent=2)
-    print(f"wrote {args.out}", file=sys.stderr)
+    print(f"\nwrote {args.out}", file=sys.stderr)
     return 0
 
 
@@ -250,8 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="per-RX still-room baseline (writes JSON for `heatmap --baselines`)")
     cl.add_argument("source", help="udp:<port> typically")
     cl.add_argument("--out", default="baselines.json")
-    cl.add_argument("--seconds", type=float, default=30.0)
-    cl.add_argument("--settle", type=float, default=detector.AGC_SETTLE_SECONDS_DEFAULT)
+    cl.add_argument("--seconds", type=float, default=30.0,
+                    help="recording duration after the settle delay (default 30s)")
+    cl.add_argument("--settle", type=float, default=detector.AGC_SETTLE_SECONDS_DEFAULT,
+                    help="seconds to wait before recording starts. "
+                         "Doubles as your walk-out timer; bump it (e.g. --settle 30) "
+                         "to give yourself time to leave the room.")
     cl.add_argument("--window", type=int, default=50)
     cl.set_defaults(func=cmd_calibrate_links)
 
