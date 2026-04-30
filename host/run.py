@@ -19,10 +19,13 @@ Subcommands:
         dB) with a motion-score line below it.
 
     heatmap <source> --links links.json [--history N] [--window W]
-        Multi-RX floor-plan view: per TX-RX line tinted by current
-        motion-σ. Source is typically `udp:<port>`; the host listens
-        for binary CSI packets from receivers running with
-        CSI_RX_WIFI_SSID configured.
+            [--baselines b.json] [--full-bright R]
+        Multi-RX, multi-TX floor-plan view: per TX-RX line tinted by
+        current motion. Source is typically `udp:<port>`; the host
+        listens for binary CSI packets from receivers running with
+        CSI_RX_WIFI_SSID configured. Pass --baselines (RX MAC -> still-
+        room σ JSON) to color links by ratio against a calibrated
+        baseline; --full-bright sets the ratio that saturates the cmap.
 """
 
 from __future__ import annotations
@@ -159,7 +162,9 @@ def cmd_view(args: argparse.Namespace) -> int:
 def cmd_heatmap(args: argparse.Namespace) -> int:
     import heatmap
     return heatmap.run_heatmap(args.source, args.links,
-                               history=args.history, motion_window=args.window)
+                               history=args.history, motion_window=args.window,
+                               baselines_path=args.baselines,
+                               full_bright=args.full_bright)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -203,9 +208,17 @@ def build_parser() -> argparse.ArgumentParser:
     hm = sub.add_parser("heatmap", help="multi-RX floor-plan motion overlay (UDP)")
     hm.add_argument("source", help="udp:<port> typically")
     hm.add_argument("--links", required=True,
-                    help="JSON config with room, TX, and RX positions (see links.example.json)")
+                    help="JSON config with room, TXs, and RX positions (see links.example.json)")
     hm.add_argument("--history", type=int, default=500)
     hm.add_argument("--window", type=int, default=50)
+    hm.add_argument("--baselines", default=None,
+                    help="JSON map of RX MAC -> still-room σ. When given, "
+                         "links are colored by ratio (× baseline) instead of "
+                         "auto-scaled raw σ.")
+    hm.add_argument("--full-bright", type=float, default=3.0,
+                    help="ratio at which links saturate to the brightest "
+                         "cmap value (default 3.0; only used with --baselines). "
+                         "Lower this if motion looks washed-out as 'all dark'.")
     hm.set_defaults(func=cmd_heatmap)
 
     return p
