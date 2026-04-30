@@ -6,6 +6,9 @@ CONFIG_ESP_TASK_WDT_INIT=n
 # ESP-NOW does not need an association, so STA mode with no AP is fine.
 CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 
-# Route console through the native USB-Serial-JTAG controller so logs
-# stay on /dev/ttyACM0 after boot on dev kits without a USB-UART bridge.
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# Console: UART0 primary (so boards with only a USB-UART bridge — e.g.
+# bare WROOM-1U dev boards — show app logs on /dev/ttyUSBx) plus the
+# native USB-Serial-JTAG as a secondary mirror (so boards with native
+# USB-CDC also still show logs on /dev/ttyACMx). Either port works.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
