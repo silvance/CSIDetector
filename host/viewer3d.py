@@ -43,9 +43,17 @@ def _load_links(path: str) -> tuple[np.ndarray, list[_Node], list[_Node]]:
         w, h = float(room["width_m"]), float(room["height_m"])
         polygon = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=float)
     txs_cfg = cfg["txs"] if "txs" in cfg else [cfg["tx"]]
-    txs = [_Node(mac=t["mac"].lower(), x=float(t["x"]), y=float(t["y"]),
-                 label=t.get("label", "TX"))
-           for t in txs_cfg]
+    txs = []
+    for i, t in enumerate(txs_cfg):
+        if "mac" not in t:
+            raise SystemExit(
+                f"links config: TX entry {i} is missing 'mac' — every "
+                f"transmitter needs its factory MAC so source-tagged samples "
+                f"can be routed to the right link. Add e.g. "
+                f'"mac": "ac:a7:04:2c:42:54" to that entry.'
+            )
+        txs.append(_Node(mac=t["mac"].lower(), x=float(t["x"]), y=float(t["y"]),
+                         label=t.get("label", f"TX{i+1}")))
     rxs = [_Node(mac=r["mac"].lower(), x=float(r["x"]), y=float(r["y"]),
                  label=r.get("label", r["mac"][-5:]))
            for r in cfg["rxs"]]
