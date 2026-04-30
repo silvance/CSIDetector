@@ -92,7 +92,15 @@ def run_heatmap(source: str, links_path: str,
 
     cfg, rxs = _load_links(links_path)
     room = cfg["room"]
-    tx = cfg["tx"]
+    txs_cfg = cfg["txs"] if "txs" in cfg else [cfg["tx"]]
+    # The flat heatmap draws one line per RX from the *first* TX. With
+    # multi-TX setups (more than one transmitter) use `view3d` instead —
+    # it handles all TX×RX links. Here we just keep the existing single-
+    # fan visualization working under the new schema.
+    tx = txs_cfg[0]
+    if len(txs_cfg) > 1:
+        print(f"warning: heatmap shows links from TX[0]={tx.get('label', tx.get('mac', '?'))} "
+              f"only ({len(txs_cfg)} TXs configured); use `view3d` for all TXs.")
     buffers = {rx.mac: _LinkBuffer(history) for rx in rxs}
     baselines: dict[str, float] = {}
     if baselines_path:
@@ -104,15 +112,22 @@ def run_heatmap(source: str, links_path: str,
                               args=(source, buffers, unknown, stop), daemon=True)
     reader.start()
 
+    if "polygon" in room:
+        polygon = np.array(room["polygon"], dtype=float)
+        bbox_min, bbox_max = polygon.min(axis=0), polygon.max(axis=0)
+    else:
+        w, h = float(room["width_m"]), float(room["height_m"])
+        polygon = np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=float)
+        bbox_min, bbox_max = np.array([0.0, 0.0]), np.array([w, h])
+
     fig, ax = plt.subplots(figsize=(8, 7))
     fig.suptitle(f"CSI link heatmap — {source}")
-    ax.set_xlim(-0.2, room["width_m"] + 0.2)
-    ax.set_ylim(-0.2, room["height_m"] + 0.2)
+    ax.set_xlim(bbox_min[0] - 0.2, bbox_max[0] + 0.2)
+    ax.set_ylim(bbox_min[1] - 0.2, bbox_max[1] + 0.2)
     ax.set_aspect("equal")
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
-    ax.add_patch(plt.Rectangle((0, 0), room["width_m"], room["height_m"],
-                               fill=False, edgecolor="black", linewidth=1.5))
+    ax.add_patch(plt.Polygon(polygon, fill=False, edgecolor="black", linewidth=1.5))
 
     cmap = get_cmap("magma")
     line_artists = []
