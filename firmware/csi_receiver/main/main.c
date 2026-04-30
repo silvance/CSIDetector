@@ -291,19 +291,25 @@ static void wifi_init(void) {
         }
     }
 
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
-    // 11B|11G|11N|LR + HT40, permissive promisc filter so CSI fires for
-    // data frames too. HT20 was tried (to match the TX's HT20 broadcasts)
-    // and wedged the chip — no frames decoded at all. Stay HT40.
+    // We deliberately do NOT enable promiscuous mode in the
+    // STA-associated path. Enabling it after association forcibly
+    // disconnects the STA in IDF 5.x (reason=8 LEAVING), and that
+    // breaks the UDP forwarding the demo depends on.
+    //
+    // CSI still fires for ESP-NOW broadcasts: their destination is
+    // ff:ff:ff:ff:ff:ff, every STA on the channel accepts broadcasts,
+    // and the CSI engine runs on every accepted frame. We only need
+    // promiscuous mode for the standalone (UART-only) case where we
+    // never join an AP.
     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
         WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
-    wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
-    ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
-    // Only pin the channel manually when not associated — once we're
-    // on an AP, the AP's channel is the radio's channel automatically.
-    // Calling set_channel after association can disrupt the link.
     if (!wifi_enabled) {
+        // Standalone mode: no AP, so we need promiscuous to capture
+        // anything, and we have to pin the channel manually.
+        ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+        wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
+        ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
         ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
     }
 
