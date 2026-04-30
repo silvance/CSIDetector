@@ -23,6 +23,15 @@ Subcommands:
         motion-σ. Source is typically `udp:<port>`; the host listens
         for binary CSI packets from receivers running with
         CSI_RX_WIFI_SSID configured.
+
+    view3d <source> --links links.json [--baselines b.json] [--grid-step G]
+        2.5D room view: walls extruded, floor as a likelihood heatmap
+        from per-link motion-σ, person pin at the brightest cell.
+        Use --baselines for ratio-vs-still-room scoring.
+
+    calibrate-links <source> [--out baselines.json] [--settle S] [--seconds N]
+        Multi-RX still-room calibration. --settle doubles as walk-out
+        time; the script counts down before recording.
 """
 
 from __future__ import annotations
@@ -163,6 +172,17 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
                                baselines_path=args.baselines)
 
 
+def cmd_view3d(args: argparse.Namespace) -> int:
+    import viewer3d
+    return viewer3d.run_viewer3d(
+        args.source, args.links,
+        history=args.history, motion_window=args.window,
+        baselines_path=args.baselines,
+        grid_step=args.grid_step, link_sigma_m=args.link_sigma,
+        wall_height_m=args.wall_height,
+    )
+
+
 def cmd_calibrate_links(args: argparse.Namespace) -> int:
     """Multi-RX still-room calibration. Writes {rx_mac: baseline} as JSON."""
     import json
@@ -297,6 +317,19 @@ def build_parser() -> argparse.ArgumentParser:
     hm.add_argument("--history", type=int, default=500)
     hm.add_argument("--window", type=int, default=50)
     hm.set_defaults(func=cmd_heatmap)
+
+    v3 = sub.add_parser("view3d", help="2.5D room view: floor heatmap + person pin")
+    v3.add_argument("source", help="udp:<port> typically")
+    v3.add_argument("--links", required=True)
+    v3.add_argument("--baselines", default=None)
+    v3.add_argument("--history", type=int, default=500)
+    v3.add_argument("--window", type=int, default=50)
+    v3.add_argument("--grid-step", type=float, default=0.1,
+                    help="grid resolution in meters (default 0.1 = 10 cm)")
+    v3.add_argument("--link-sigma", type=float, default=0.3,
+                    help="kernel σ for per-link influence on cells (default 0.3 m)")
+    v3.add_argument("--wall-height", type=float, default=2.5)
+    v3.set_defaults(func=cmd_view3d)
 
     cl = sub.add_parser("calibrate-links",
                         help="per-RX still-room baseline (writes JSON for `heatmap --baselines`)")
