@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -48,6 +49,13 @@ static int s_filter_count = 0;
 static int s_udp_sock = -1;
 static struct sockaddr_in s_udp_dest;
 static uint8_t s_rx_mac[6];
+
+// Signaled when STA acquires an IP. wifi_init() blocks on this so
+// promiscuous mode is only enabled after association completes — the
+// alternative (enable promisc first, then connect) silently kills the
+// in-progress connection on every IDF version we've tried.
+static EventGroupHandle_t s_wifi_events;
+#define WIFI_EVT_GOT_IP BIT0
 
 // Wire format of the UDP packet header. Little-endian, packed; total
 // 34 bytes, followed by `len` bytes of int8 IQ samples.
@@ -229,6 +237,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
         open_udp_socket(event->ip_info.ip);
+        if (s_wifi_events) xEventGroupSetBits(s_wifi_events, WIFI_EVT_GOT_IP);
     }
 }
 
@@ -243,7 +252,9 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-    if (CONFIG_CSI_RX_WIFI_SSID[0] != '\0') {
+    bool wifi_enabled = (CONFIG_CSI_RX_WIFI_SSID[0] != '\0');
+    if (wifi_enabled) {
+        s_wifi_events = xEventGroupCreate();
         ESP_ERROR_CHECK(esp_event_handler_instance_register(
             WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
         ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -251,18 +262,35 @@ static void wifi_init(void) {
         wifi_config_t sta_cfg = {0};
         strlcpy((char *)sta_cfg.sta.ssid, CONFIG_CSI_RX_WIFI_SSID, sizeof(sta_cfg.sta.ssid));
         strlcpy((char *)sta_cfg.sta.password, CONFIG_CSI_RX_WIFI_PASS, sizeof(sta_cfg.sta.password));
-        // Pin the channel and force fast-scan so association doesn't
-        // sweep all channels (which fails when we've locked the radio
-        // to the capture channel for promiscuous mode). With FAST_SCAN
-        // and an explicit channel, the STA tries that one channel,
-        // associates, and stays there — never tugs the radio off the
-        // capture channel.
+        // Fast-scan on the configured channel so association doesn't
+        // sweep all 13 channels.
         sta_cfg.sta.channel = CONFIG_CSI_RX_CHANNEL;
         sta_cfg.sta.scan_method = WIFI_FAST_SCAN;
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Critical ordering: associate FIRST, then enable promiscuous.
+    // Doing it the other way silently kills the connection on every
+    // IDF version we've tested — the radio enters monitor mode and
+    // the in-flight or pending association just stops.
+    if (wifi_enabled) {
+        esp_err_t err = esp_wifi_connect();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+        }
+        // Block up to 10s for the IP. If it doesn't come, fall back to
+        // capture-only mode rather than hanging the boot.
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_events, WIFI_EVT_GOT_IP,
+                                               pdFALSE, pdTRUE,
+                                               pdMS_TO_TICKS(10000));
+        if (!(bits & WIFI_EVT_GOT_IP)) {
+            ESP_LOGW(TAG, "STA didn't get IP within 10s — continuing in "
+                          "promiscuous-only mode (no UDP forwarding)");
+        }
+    }
+
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     // 11B|11G|11N|LR + HT40, permissive promisc filter so CSI fires for
     // data frames too. HT20 was tried (to match the TX's HT20 broadcasts)
@@ -272,21 +300,16 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
     wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
-    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
+    // Only pin the channel manually when not associated — once we're
+    // on an AP, the AP's channel is the radio's channel automatically.
+    // Calling set_channel after association can disrupt the link.
+    if (!wifi_enabled) {
+        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
+    }
 
     // Cache our MAC for stamping outgoing UDP packets (the host uses it
     // to demux per-RX streams).
     ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, s_rx_mac));
-
-    // Kick off STA association last, after promiscuous + channel are
-    // fully set up. Running this from a STA_START event handler races
-    // the main thread's setup and the connect silently does nothing.
-    if (CONFIG_CSI_RX_WIFI_SSID[0] != '\0') {
-        esp_err_t err = esp_wifi_connect();
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
-        }
-    }
 }
 
 static void espnow_init(void) {
