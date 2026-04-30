@@ -166,46 +166,81 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
 def cmd_calibrate_links(args: argparse.Namespace) -> int:
     """Multi-RX still-room calibration. Writes {rx_mac: baseline} as JSON."""
     import json
-    src = csi_collector.open_source(args.source)
+    import queue
+    import threading
+
+    samples_q: queue.Queue = queue.Queue()
+    stop = threading.Event()
+
+    def reader():
+        try:
+            for sample in csi_collector.open_source(args.source):
+                if stop.is_set():
+                    return
+                samples_q.put(sample)
+        except Exception as exc:
+            samples_q.put(exc)
+
+    threading.Thread(target=reader, daemon=True).start()
+
     per_rx: dict[str, list[np.ndarray]] = {}
     start = time.time()
     settle_until = start + args.settle
     deadline = settle_until + args.seconds
-    skipped = 0
+
     print(f"\n>>> LEAVE THE ROOM NOW <<<  starting capture in {args.settle:.0f}s "
           f"(then recording for {args.seconds:.0f}s)\n", file=sys.stderr, flush=True)
+
+    # Settle phase: tick every second, drop any samples that arrive.
+    received_during_settle = 0
     next_tick = start + 1.0
-    capture_announced = False
-    for sample in src:
+    while time.time() < settle_until:
+        try:
+            item = samples_q.get(timeout=0.2)
+            if isinstance(item, Exception):
+                raise item
+            received_during_settle += 1
+        except queue.Empty:
+            pass
         now = time.time()
-        if now < settle_until:
-            skipped += 1
-            if now >= next_tick:
-                remaining = int(settle_until - now + 0.5)
-                print(f"  ...{remaining}s until recording starts",
-                      file=sys.stderr, flush=True)
-                next_tick = now + 1.0
-            continue
-        if not capture_announced:
-            print(f"\n>>> RECORDING <<<  hold still for {args.seconds:.0f}s\n",
-                  file=sys.stderr, flush=True)
-            capture_announced = True
-            next_tick = now + 5.0
-        if now >= deadline:
-            break
-        rx = sample.rx_id
-        if rx is None:
-            continue
-        per_rx.setdefault(rx, []).append(sample.amplitude)
         if now >= next_tick:
-            counts = ", ".join(f"{k[-5:]}={len(v)}" for k, v in sorted(per_rx.items()))
-            print(f"  +{int(now - settle_until)}s  {counts}",
+            remaining = max(0, int(settle_until - now + 0.5))
+            note = "" if received_during_settle else "  [WARNING: no packets yet]"
+            print(f"  ...{remaining}s until recording starts{note}",
                   file=sys.stderr, flush=True)
-            next_tick = now + 5.0
+            next_tick = now + 1.0
+
+    if received_during_settle == 0:
+        stop.set()
+        raise SystemExit(
+            "no packets received during settle — receivers are not streaming. "
+            "check `sudo tcpdump -ni <hotspot_iface> udp port 5566` and the "
+            "firewall zone for the hotspot interface.")
+
+    print(f"\n>>> RECORDING <<<  hold still for {args.seconds:.0f}s\n",
+          file=sys.stderr, flush=True)
+
+    next_tick = time.time() + 5.0
+    while time.time() < deadline:
+        try:
+            item = samples_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if isinstance(item, Exception):
+            raise item
+        if item.rx_id is not None:
+            per_rx.setdefault(item.rx_id, []).append(item.amplitude)
+        if time.time() >= next_tick:
+            counts = ", ".join(f"{k[-5:]}={len(v)}" for k, v in sorted(per_rx.items()))
+            print(f"  +{int(time.time() - settle_until)}s  {counts}",
+                  file=sys.stderr, flush=True)
+            next_tick = time.time() + 5.0
+
+    stop.set()
     baselines = detector.compute_link_baselines(per_rx, window=args.window)
     if not baselines:
         raise SystemExit("no usable baselines — did any RX deliver enough samples?")
-    print(f"\ndropped {skipped} settle samples", file=sys.stderr)
+    print(f"\nper-RX:", file=sys.stderr)
     for mac, b in sorted(baselines.items()):
         print(f"  {mac}  baseline={b:.6f}  ({len(per_rx[mac])} samples)",
               file=sys.stderr)
