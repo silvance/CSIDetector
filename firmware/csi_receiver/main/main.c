@@ -37,8 +37,11 @@
 
 static const char *TAG = "csi_rx";
 
-static uint8_t s_filter_mac[6];
-static bool s_filter_active = false;
+// Up to 4 TX MACs in the filter — enough for any reasonable multi-TX
+// localization setup. Comma- or semicolon-separated in Kconfig.
+#define MAX_FILTER_MACS 4
+static uint8_t s_filter_macs[MAX_FILTER_MACS][6];
+static int s_filter_count = 0;
 
 // UDP forwarding state. s_udp_sock is < 0 until the STA gets an IP and
 // the socket is created. UART output continues regardless.
@@ -72,15 +75,16 @@ static int hex_nibble(char c) {
     return -1;
 }
 
-// Accept colon/hyphen separators too: the TX firmware logs its MAC as
-// aa:bb:cc:dd:ee:ff, and rejecting that form silently disables the filter.
-static bool parse_filter_mac(const char *s, uint8_t out[6]) {
-    if (!s) return false;
+// Accept colon/hyphen separators inside a MAC, comma/semicolon between
+// MACs. The TX firmware logs its MAC as aa:bb:cc:dd:ee:ff, so users
+// paste that form; rejecting it silently disables the filter.
+static bool parse_one_mac(const char *s, int len, uint8_t out[6]) {
     int nibbles = 0;
     int acc = 0;
-    for (const char *p = s; *p; p++) {
-        if (*p == ':' || *p == '-' || *p == ' ') continue;
-        int n = hex_nibble(*p);
+    for (int i = 0; i < len; i++) {
+        char c = s[i];
+        if (c == ':' || c == '-' || c == ' ' || c == '\t') continue;
+        int n = hex_nibble(c);
         if (n < 0) return false;
         acc = (acc << 4) | n;
         if ((nibbles & 1) == 1) {
@@ -91,6 +95,36 @@ static bool parse_filter_mac(const char *s, uint8_t out[6]) {
         nibbles++;
     }
     return nibbles == 12;
+}
+
+// Parses the Kconfig string into s_filter_macs / s_filter_count. Returns
+// number of valid MACs parsed; returns -1 on any unparseable token so
+// the caller can warn loudly (silent partial filters are the trap that
+// motivated the original parser cleanup).
+static int parse_filter_macs(const char *s) {
+    s_filter_count = 0;
+    if (!s) return 0;
+    const char *p = s;
+    while (*p && s_filter_count < MAX_FILTER_MACS) {
+        // Skip leading separators / whitespace.
+        while (*p && (*p == ',' || *p == ';' || *p == ' ' || *p == '\t')) p++;
+        if (!*p) break;
+        const char *end = p;
+        while (*end && *end != ',' && *end != ';') end++;
+        if (!parse_one_mac(p, end - p, s_filter_macs[s_filter_count])) {
+            return -1;
+        }
+        s_filter_count++;
+        p = end;
+    }
+    return s_filter_count;
+}
+
+static bool mac_in_filter(const uint8_t mac[6]) {
+    for (int i = 0; i < s_filter_count; i++) {
+        if (memcmp(mac, s_filter_macs[i], 6) == 0) return true;
+    }
+    return false;
 }
 
 static void udp_send_sample(uint32_t seq, int64_t ts, const wifi_csi_info_t *info) {
@@ -123,7 +157,7 @@ static void udp_send_sample(uint32_t seq, int64_t ts, const wifi_csi_info_t *inf
 
 static void csi_callback(void *ctx, wifi_csi_info_t *info) {
     if (!info || !info->buf || info->len <= 0) return;
-    if (s_filter_active && memcmp(info->mac, s_filter_mac, 6) != 0) return;
+    if (s_filter_count > 0 && !mac_in_filter(info->mac)) return;
 
     static uint32_t seq = 0;
     uint32_t this_seq = seq++;
@@ -276,16 +310,20 @@ void app_main(void) {
     ESP_ERROR_CHECK(ret);
 
     const char *cfg_mac = CONFIG_CSI_RX_FILTER_TX_MAC;
-    s_filter_active = parse_filter_mac(cfg_mac, s_filter_mac);
-    if (s_filter_active) {
-        ESP_LOGI(TAG, "filtering on TX MAC %02x:%02x:%02x:%02x:%02x:%02x",
-                 s_filter_mac[0], s_filter_mac[1], s_filter_mac[2],
-                 s_filter_mac[3], s_filter_mac[4], s_filter_mac[5]);
-    } else if (cfg_mac && cfg_mac[0]) {
-        // Non-empty but unparseable: surface this loudly so the user
-        // doesn't think they're filtering when they aren't.
-        ESP_LOGE(TAG, "CSI_RX_FILTER_TX_MAC=\"%s\" is not a valid MAC; "
-                      "filter DISABLED. Use aa:bb:cc:dd:ee:ff or aabbccddeeff.",
+    int parsed = parse_filter_macs(cfg_mac);
+    if (parsed > 0) {
+        for (int i = 0; i < s_filter_count; i++) {
+            ESP_LOGI(TAG, "filtering on TX MAC[%d] %02x:%02x:%02x:%02x:%02x:%02x",
+                     i,
+                     s_filter_macs[i][0], s_filter_macs[i][1], s_filter_macs[i][2],
+                     s_filter_macs[i][3], s_filter_macs[i][4], s_filter_macs[i][5]);
+        }
+    } else if (parsed < 0) {
+        // Non-empty but unparseable somewhere — surface this loudly so the
+        // user doesn't think they're filtering when they aren't.
+        ESP_LOGE(TAG, "CSI_RX_FILTER_TX_MAC=\"%s\" is not a valid MAC list; "
+                      "filter DISABLED. Use aa:bb:cc:dd:ee:ff or comma-separated "
+                      "for multiple TXs.",
                  cfg_mac);
     } else {
         ESP_LOGW(TAG, "no TX MAC filter set — emitting CSI for every frame "
