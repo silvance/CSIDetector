@@ -245,9 +245,14 @@ static void wifi_init(void) {
         wifi_config_t sta_cfg = {0};
         strlcpy((char *)sta_cfg.sta.ssid, CONFIG_CSI_RX_WIFI_SSID, sizeof(sta_cfg.sta.ssid));
         strlcpy((char *)sta_cfg.sta.password, CONFIG_CSI_RX_WIFI_PASS, sizeof(sta_cfg.sta.password));
-        // Pin the channel so association doesn't drag the radio off the
-        // capture channel — saves time and avoids a CSI gap.
+        // Pin the channel and force fast-scan so association doesn't
+        // sweep all channels (which fails when we've locked the radio
+        // to the capture channel for promiscuous mode). With FAST_SCAN
+        // and an explicit channel, the STA tries that one channel,
+        // associates, and stays there — never tugs the radio off the
+        // capture channel.
         sta_cfg.sta.channel = CONFIG_CSI_RX_CHANNEL;
+        sta_cfg.sta.scan_method = WIFI_FAST_SCAN;
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     }
 
