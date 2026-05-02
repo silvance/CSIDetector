@@ -108,23 +108,27 @@ def compute_baseline(amplitudes: np.ndarray, window: int) -> float:
     return float(np.median(scores))
 
 
-def compute_link_baselines(samples_by_rx: dict[str, list[np.ndarray]],
-                            window: int) -> dict[str, float]:
-    """Per-RX baseline from a multi-RX still-room capture.
+def compute_link_baselines(samples_by_link: dict[tuple[str, str], list[np.ndarray]],
+                            window: int) -> dict[tuple[str, str], float]:
+    """Per-(tx_mac, rx_mac) baseline from a multi-link still-room capture.
 
-    `samples_by_rx` maps RX MAC to a list of amplitude vectors collected
-    in the still room. Each RX needs at least 2*window samples; RXs with
-    fewer are skipped (likely received nothing during the capture).
-    Returns {mac: baseline}.
+    Keyed by link tuple, not RX-only: TX1↔RX_n and TX2↔RX_n have
+    genuinely different still-room σ because their multipath paths
+    differ, and applying a single per-RX baseline mis-normalizes one
+    of them. Each link needs at least 2*window samples; links with
+    fewer are skipped (likely never received during the capture).
+
+    Active subcarriers are derived from the union of "non-zero in any
+    sample" rather than locked from the first sample, so a flaky
+    first frame can't permanently exclude a subcarrier.
     """
-    out: dict[str, float] = {}
-    for mac, rows in samples_by_rx.items():
+    out: dict[tuple[str, str], float] = {}
+    for key, rows in samples_by_link.items():
         if len(rows) < window * 2:
             continue
         amps = np.stack(rows)
-        # Drop guard subcarriers (always 0) — same convention as the viewer.
         idx = np.flatnonzero(np.any(amps > 0, axis=0))
         if idx.size == 0:
             continue
-        out[mac] = compute_baseline(amps[:, idx], window)
+        out[key] = compute_baseline(amps[:, idx], window)
     return out

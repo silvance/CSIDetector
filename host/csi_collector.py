@@ -165,7 +165,11 @@ def iter_udp(port: int, bind: str = "0.0.0.0") -> Iterator[CSISample]:
     sock.bind((bind, port))
     try:
         while True:
-            data, _addr = sock.recvfrom(2048)
+            # 8192 leaves margin for HT40 / multi-segment CSI growth even
+            # though current packets are ≤ 418 B (34-byte header + 384
+            # max IQ). Cheap insurance against silent truncation if the
+            # firmware payload changes.
+            data, _addr = sock.recvfrom(8192)
             sample = parse_udp_packet(data)
             if sample is not None:
                 yield sample

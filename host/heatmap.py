@@ -65,22 +65,47 @@ def _load_links(path: str) -> tuple[dict, list[_Node], list[_Node]]:
 
 
 class _LinkBuffer:
-    """Per-(TX, RX) rolling amplitude buffer."""
+    """Per-(TX, RX) rolling amplitude buffer.
+
+    Active-subcarrier mask is derived from the first MASK_PROBE samples
+    (union of nonzero-anywhere) instead of being locked from the very
+    first sample. A flaky first frame would otherwise permanently drop
+    a subcarrier from this link's view.
+    """
+
+    MASK_PROBE = 32
 
     def __init__(self, capacity: int):
         self._buf: collections.deque[np.ndarray] = collections.deque(maxlen=capacity)
         self._idx: Optional[np.ndarray] = None
+        # Pre-mask buffer of raw amplitudes for the probe phase.
+        self._probe: list[np.ndarray] = []
         self._lock = threading.Lock()
 
     def push(self, sample: csi_collector.CSISample) -> None:
         amp = sample.amplitude
         with self._lock:
             if self._idx is None:
-                idx = np.flatnonzero(amp > 0)
+                self._probe.append(amp)
+                if len(self._probe) < self.MASK_PROBE:
+                    return
+                # Take the union of nonzero subcarriers across the probe
+                # window — guards against a single all-zero frame.
+                stacked = np.stack(self._probe)
+                idx = np.flatnonzero(np.any(stacked > 0, axis=0))
                 if idx.size == 0:
+                    # Probe came back all-zero (link is dead). Drop the
+                    # probe and try again — eventually we either get
+                    # data or stay stuck (which is what we'd want).
+                    self._probe.clear()
                     return
                 self._idx = idx
-            self._buf.append(amp[self._idx])
+                # Backfill the probe samples with the chosen mask.
+                for a in self._probe:
+                    self._buf.append(a[idx])
+                self._probe = []  # release the references
+            else:
+                self._buf.append(amp[self._idx])
 
     def motion_score(self, window: int) -> float:
         with self._lock:
@@ -93,7 +118,8 @@ class _LinkBuffer:
 def _reader_thread(source: str,
                    buffers: dict[tuple[str, str], _LinkBuffer],
                    tx_macs: set[str],
-                   unknown: set[str],
+                   unknown_rx: set[str],
+                   unknown_tx: set[str],
                    stop: threading.Event) -> None:
     for sample in csi_collector.open_source(source):
         if stop.is_set():
@@ -103,13 +129,49 @@ def _reader_thread(source: str,
         rx = sample.rx_id.lower()
         tx = sample.mac.lower()
         if tx not in tx_macs:
+            unknown_tx.add(tx)
             continue
         key = (tx, rx)
         buf = buffers.get(key)
         if buf is None:
-            unknown.add(rx)
+            unknown_rx.add(rx)
             continue
         buf.push(sample)
+
+
+def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], float]:
+    """Read baselines.json and return per-(tx_mac, rx_mac) values.
+
+    Two formats accepted:
+      - New: keys are "tx_mac|rx_mac" → float (one entry per link).
+      - Legacy: keys are "rx_mac" → float (per-RX). Replicated across
+        every TX from that RX so old files still work; logged as
+        "applying same baseline to multiple TXs from <RX>" so users
+        know to recalibrate when accuracy matters.
+    """
+    if not path:
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    out: dict[tuple[str, str], float] = {}
+    legacy_rx_macs: set[str] = set()
+    tx_macs = [t.mac for t in txs]
+    for k, v in raw.items():
+        k = k.lower()
+        if "|" in k:
+            tx, rx = k.split("|", 1)
+            out[(tx, rx)] = float(v)
+        else:
+            # Legacy per-RX entry — fan out to every TX.
+            legacy_rx_macs.add(k)
+            for tx in tx_macs:
+                out[(tx, k)] = float(v)
+    if legacy_rx_macs:
+        print(f"heatmap: baselines.json uses legacy per-RX schema for "
+              f"{len(legacy_rx_macs)} entries; same baseline applied to all "
+              f"TX→RX links from each. Re-run `calibrate-links` for a "
+              f"per-link baseline.")
+    return out
 
 
 def run_heatmap(source: str, links_path: str,
@@ -135,14 +197,13 @@ def run_heatmap(source: str, links_path: str,
     buffers: dict[tuple[str, str], _LinkBuffer] = {
         (t.mac, r.mac): _LinkBuffer(history) for t in txs for r in rxs
     }
-    baselines: dict[str, float] = {}
-    if baselines_path:
-        with open(baselines_path) as f:
-            baselines = {k.lower(): float(v) for k, v in json.load(f).items()}
-    unknown: set[str] = set()
+    baselines = _load_baselines(baselines_path, txs, rxs)
+    unknown_rx: set[str] = set()
+    unknown_tx: set[str] = set()
     stop = threading.Event()
     threading.Thread(target=_reader_thread,
-                     args=(source, buffers, tx_macs, unknown, stop),
+                     args=(source, buffers, tx_macs,
+                           unknown_rx, unknown_tx, stop),
                      daemon=True).start()
 
     fig, ax = plt.subplots(figsize=(9, 7))
@@ -190,15 +251,10 @@ def run_heatmap(source: str, links_path: str,
                 fontsize=10, fontweight="bold",
                 color=tx_shades[i % len(tx_shades)], zorder=6)
 
-    # Coloring modes match the 3D viewer:
-    # - With baselines: color by ratio to per-link still-room baseline
-    #   (1× = idle, RATIO_FULL_BRIGHT× = saturated). Stable across runs.
-    # - Without: fall back to running-max normalization.
-    RATIO_FULL_BRIGHT = 5.0
-    use_ratio = bool(baselines)
-    label = "motion ratio (× still-room)" if use_ratio else "motion σ (normalized)"
-    sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=1))
-    cbar = fig.colorbar(sm, ax=ax, label=label)
+    # Coloring: with baselines, ratio = current_σ / per-link baseline,
+    # tint anchored so RATIO_FLOOR (=1×, still-room) maps to black and
+    # full_bright (e.g. 3×) saturates. Without baselines, fall back to
+    # running-max normalization.
     use_ratio = bool(baselines)
     if use_ratio:
         if full_bright <= RATIO_FLOOR:
@@ -219,22 +275,11 @@ def run_heatmap(source: str, links_path: str,
     span = full_bright - RATIO_FLOOR
 
     def update(_frame):
-        # Compute per-link motion score, then per-link metric (ratio or
-        # raw σ) for tint and label.
         sigmas = [buffers[k].motion_score(motion_window) for k in pair_keys]
         if use_ratio:
-            # Same baseline applies to every TX from a given RX (still-
-            # room noise is RX-side, not link-specific).
             metrics = []
             for (tx_mac, rx_mac), sigma in zip(pair_keys, sigmas):
-                base = max(baselines.get(rx_mac, 1e-3), 1e-6)
-                metrics.append(sigma / base)
-            tints = [min(m / RATIO_FULL_BRIGHT, 1.0) for m in metrics]
-        sigmas = [buffers[k].motion_score(motion_window) for k in pair_keys]
-        if use_ratio:
-            metrics = []
-            for (_tx_mac, rx_mac), sigma in zip(pair_keys, sigmas):
-                base = max(baselines.get(rx_mac, 1e-3), 1e-6)
+                base = max(baselines.get((tx_mac, rx_mac), 1e-3), 1e-6)
                 metrics.append(sigma / base)
             # Anchor "no motion" at RATIO_FLOOR so the still-room
             # baseline maps to black, and saturate at full_bright.
@@ -250,10 +295,13 @@ def run_heatmap(source: str, links_path: str,
                 line_artists, label_artists, tints, metrics, sigmas):
             line.set_color(cmap(tint))
             lbl.set_text(text_fmt(m, s))
-        if unknown:
-            ax.set_title(f"unknown RX MACs (add to links.json): "
-                         f"{', '.join(sorted(unknown))}",
-                         fontsize=8, color="tab:red")
+        notes = []
+        if unknown_rx:
+            notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
+        if unknown_tx:
+            notes.append(f"unknown TX: {', '.join(sorted(unknown_tx))}")
+        if notes:
+            ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
         return [*line_artists, *label_artists]
 
     anim = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)

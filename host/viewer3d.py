@@ -61,22 +61,39 @@ def _load_links(path: str) -> tuple[np.ndarray, list[_Node], list[_Node]]:
 
 
 class _LinkBuffer:
-    """Per-(TX, RX) rolling amplitude buffer for one link."""
+    """Per-(TX, RX) rolling amplitude buffer.
+
+    Active-subcarrier mask from the first MASK_PROBE samples (union of
+    nonzero-anywhere) so a flaky first frame can't permanently drop a
+    subcarrier. Same pattern as heatmap._LinkBuffer.
+    """
+
+    MASK_PROBE = 32
 
     def __init__(self, capacity: int):
         self._buf: collections.deque[np.ndarray] = collections.deque(maxlen=capacity)
         self._idx: Optional[np.ndarray] = None
+        self._probe: list[np.ndarray] = []
         self._lock = threading.Lock()
 
     def push(self, sample: csi_collector.CSISample) -> None:
         amp = sample.amplitude
         with self._lock:
             if self._idx is None:
-                idx = np.flatnonzero(amp > 0)
+                self._probe.append(amp)
+                if len(self._probe) < self.MASK_PROBE:
+                    return
+                stacked = np.stack(self._probe)
+                idx = np.flatnonzero(np.any(stacked > 0, axis=0))
                 if idx.size == 0:
+                    self._probe.clear()
                     return
                 self._idx = idx
-            self._buf.append(amp[self._idx])
+                for a in self._probe:
+                    self._buf.append(a[idx])
+                self._probe = []
+            else:
+                self._buf.append(amp[self._idx])
 
     def motion_score(self, window: int) -> float:
         with self._lock:
@@ -89,7 +106,8 @@ class _LinkBuffer:
 def _reader_thread(source: str,
                    buffers: dict[tuple[str, str], _LinkBuffer],
                    tx_macs: set[str],
-                   unknown: set[str],
+                   unknown_rx: set[str],
+                   unknown_tx: set[str],
                    stop: threading.Event) -> None:
     for sample in csi_collector.open_source(source):
         if stop.is_set():
@@ -99,13 +117,41 @@ def _reader_thread(source: str,
         rx = sample.rx_id.lower()
         tx = sample.mac.lower()
         if tx not in tx_macs:
+            unknown_tx.add(tx)
             continue
         key = (tx, rx)
         buf = buffers.get(key)
         if buf is None:
-            unknown.add(rx)
+            unknown_rx.add(rx)
             continue
         buf.push(sample)
+
+
+def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], float]:
+    """Read baselines.json. Accepts either keys "tx_mac|rx_mac" (new,
+    per-link) or "rx_mac" (legacy, per-RX, fanned out to every TX).
+    """
+    if not path:
+        return {}
+    with open(path) as f:
+        raw = json.load(f)
+    out: dict[tuple[str, str], float] = {}
+    legacy = 0
+    tx_macs = [t.mac for t in txs]
+    for k, v in raw.items():
+        k = k.lower()
+        if "|" in k:
+            tx, rx = k.split("|", 1)
+            out[(tx, rx)] = float(v)
+        else:
+            legacy += 1
+            for tx in tx_macs:
+                out[(tx, k)] = float(v)
+    if legacy:
+        print(f"view3d: baselines.json has {legacy} legacy per-RX entries; "
+              f"each replicated across all TXs from that RX. Re-run "
+              f"`calibrate-links` for per-link baselines.")
+    return out
 
 
 def run_viewer3d(source: str, links_path: str,
@@ -126,26 +172,19 @@ def run_viewer3d(source: str, links_path: str,
     loc = localize.Localizer(polygon, tx_pos, rx_pos,
                              grid_step=grid_step, link_sigma_m=link_sigma_m)
 
-    baselines: dict[tuple[str, str], float] = {}
-    if baselines_path:
-        with open(baselines_path) as f:
-            raw = {k.lower(): float(v) for k, v in json.load(f).items()}
-        # Same baseline applies to every TX from a given RX (still-room
-        # noise is RX-side, not link-specific). When we add per-link
-        # baselines later this becomes a tuple lookup directly.
-        for r in rxs:
-            for t in txs:
-                if r.mac in raw:
-                    baselines[(t.mac, r.mac)] = raw[r.mac]
+    # baselines.json supports two key formats; see _load_baselines below.
+    baselines = _load_baselines(baselines_path, txs, rxs)
     use_ratio = bool(baselines)
 
     buffers: dict[tuple[str, str], _LinkBuffer] = {
         (t.mac, r.mac): _LinkBuffer(history) for t in txs for r in rxs
     }
-    unknown: set[str] = set()
+    unknown_rx: set[str] = set()
+    unknown_tx: set[str] = set()
     stop = threading.Event()
     threading.Thread(target=_reader_thread,
-                     args=(source, buffers, tx_macs, unknown, stop),
+                     args=(source, buffers, tx_macs,
+                           unknown_rx, unknown_tx, stop),
                      daemon=True).start()
 
     fig = plt.figure(figsize=(9, 7))
@@ -240,9 +279,13 @@ def run_viewer3d(source: str, links_path: str,
             person_line.set_alpha(0.0)
             person_dot.set_alpha(0.0)
 
-        if unknown:
-            ax.set_title(f"unknown RX MACs: {', '.join(sorted(unknown))}",
-                         fontsize=8, color="tab:red")
+        notes = []
+        if unknown_rx:
+            notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
+        if unknown_tx:
+            notes.append(f"unknown TX: {', '.join(sorted(unknown_tx))}")
+        if notes:
+            ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
         return [surf, person_line, person_dot]
 
     anim = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)

@@ -212,7 +212,10 @@ def cmd_calibrate_links(args: argparse.Namespace) -> int:
 
     threading.Thread(target=reader, daemon=True).start()
 
-    per_rx: dict[str, list[np.ndarray]] = {}
+    # Per-link sample accumulator. Keying by (tx_mac, rx_mac) gives a
+    # link-specific baseline — TX1↔west and TX2↔west have different
+    # multipath, so a single per-RX baseline misnormalizes one.
+    per_link: dict[tuple[str, str], list[np.ndarray]] = {}
     start = time.time()
     settle_until = start + args.settle
     deadline = settle_until + args.seconds
@@ -257,34 +260,43 @@ def cmd_calibrate_links(args: argparse.Namespace) -> int:
             continue
         if isinstance(item, Exception):
             raise item
-        if item.rx_id is not None:
-            per_rx.setdefault(item.rx_id, []).append(item.amplitude)
+        if item.rx_id is not None and item.mac is not None:
+            key = (item.mac.lower(), item.rx_id.lower())
+            per_link.setdefault(key, []).append(item.amplitude)
         if time.time() >= next_tick:
-            counts = ", ".join(f"{k[-5:]}={len(v)}" for k, v in sorted(per_rx.items()))
+            # Group counts by RX for readability.
+            by_rx: dict[str, int] = {}
+            for (tx, rx), rows in per_link.items():
+                by_rx[rx] = by_rx.get(rx, 0) + len(rows)
+            counts = ", ".join(f"{k[-5:]}={v}" for k, v in sorted(by_rx.items()))
             print(f"  +{int(time.time() - settle_until)}s  {counts}",
                   file=sys.stderr, flush=True)
             next_tick = time.time() + 5.0
 
     stop.set()
-    baselines = detector.compute_link_baselines(per_rx, window=args.window)
+    baselines = detector.compute_link_baselines(per_link, window=args.window)
     if not baselines:
-        raise SystemExit("no usable baselines — did any RX deliver enough samples?")
-    # Flag RXs that streamed but didn't hit the threshold; without this,
-    # a flaky RX silently vanishes from baselines.json and its links
-    # later render at 0× in the heatmap with no obvious cause.
+        raise SystemExit("no usable baselines — did any link deliver enough samples?")
+    # Flag links that streamed but didn't hit the threshold; without this,
+    # a flaky link silently vanishes from baselines.json and renders at 0×
+    # in the heatmap with no obvious cause.
     min_required = 2 * args.window
-    short = [(mac, len(rows)) for mac, rows in per_rx.items()
-             if mac not in baselines]
-    print(f"\nper-RX:", file=sys.stderr)
-    for mac, b in sorted(baselines.items()):
-        print(f"  {mac}  baseline={b:.6f}  ({len(per_rx[mac])} samples)",
+    short = [(key, len(rows)) for key, rows in per_link.items()
+             if key not in baselines]
+    print(f"\nper-link:", file=sys.stderr)
+    for (tx, rx), b in sorted(baselines.items()):
+        print(f"  TX={tx}  RX={rx}  baseline={b:.6f}  "
+              f"({len(per_link[(tx, rx)])} samples)", file=sys.stderr)
+    for (tx, rx), n in sorted(short):
+        print(f"  TX={tx}  RX={rx}  SKIPPED — only {n} samples, "
+              f"need >= {min_required}; this link will render at 0× in the heatmap",
               file=sys.stderr)
-    for mac, n in sorted(short):
-        print(f"  {mac}  SKIPPED — only {n} samples, need >= {min_required}; "
-              f"this RX's links will render at 0× in the heatmap",
-              file=sys.stderr)
+    # Write JSON keyed by "tx_mac|rx_mac" so the schema is unambiguous.
+    # Old per-RX files (single-MAC keys) are still readable by the
+    # viewers — see the loader in heatmap/viewer3d.
+    serializable = {f"{tx}|{rx}": b for (tx, rx), b in baselines.items()}
     with open(args.out, "w") as f:
-        json.dump(baselines, f, indent=2)
+        json.dump(serializable, f, indent=2)
     print(f"\nwrote {args.out}", file=sys.stderr)
     return 0
 
