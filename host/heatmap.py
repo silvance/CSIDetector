@@ -114,7 +114,6 @@ def _reader_thread(source: str,
 
 def run_heatmap(source: str, links_path: str,
                 history: int = 500, motion_window: int = 50,
-                baselines_path: Optional[str] = None) -> int:
                 baselines_path: Optional[str] = None,
                 full_bright: float = DEFAULT_RATIO_FULL_BRIGHT) -> int:
     import matplotlib.pyplot as plt

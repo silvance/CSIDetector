@@ -1,86 +1,124 @@
 # CSIDetector
 
-WiFi Channel State Information (CSI) based motion sensing on ESP32 hardware,
-with a host-side live viewer and binary detector.
-
-The current build covers a single transmitter / single receiver pair. The
-host shows a real-time waterfall of subcarrier amplitude vs. time — motion
-in front of the link appears as vertical color streaks across the heatmap.
+WiFi Channel State Information (CSI) based motion sensing on ESP32 hardware.
+A small mesh of ESP32-S3 transmitters and receivers cooperate over a
+hotspot to localize motion in a room; the host renders a live floor-plan
+heatmap and a 2.5D scene with a "person" pin tracking the brightest
+spot.
 
 ## Hardware
 
-- Two ESP32 boards (S3 recommended; the S2 / C3 / C5 should work too).
-- A USB cable for each board.
-- A host computer with Python 3.10+.
+- 1+ ESP32-S3 transmitter board (more = better localization).
+- 4+ ESP32-S3 receiver boards distributed around the room.
+- A host computer with Python 3.10+ and a 2.4 GHz WiFi adapter that
+  supports AP mode (built-in card or any cheap USB dongle).
+- USB chargers for the receivers (no host tether needed once flashed).
 
-A future milestone adds 1 transmitter ↔ N receivers and projects per-link
-motion intensity onto a room layout. See `# Roadmap` below.
+The S2 / C3 / C5 also work in principle but the firmware has only been
+exercised on S3.
 
 ## Architecture
 
 ```
-   ┌──────────────┐  ESP-NOW broadcast @ 100 Hz, ch 11   ┌──────────────┐
-   │   ESP32-TX   │ ────────────────────────────────────▶│   ESP32-RX   │
-   │ csi_transmit │                                      │  csi_receive │
-   └──────────────┘                                      └──────┬───────┘
-                                                                │ UART @ 921600
-                                                                ▼
-                                                         ┌──────────────┐
-                                                         │  host (PC)   │
-                                                         │  view/detect │
-                                                         └──────────────┘
+   ┌──────────┐  ESP-NOW broadcast (HT20 MCS0, ch 11)  ┌──────────┐
+   │ ESP32-TX │ ──────────────────────────────────────▶│ ESP32-RX │  × N
+   │   ×M     │                                        │ STA + CSI│
+   └──────────┘                                        └────┬─────┘
+                                                            │ UDP/WiFi
+                                                            ▼
+                                                     ┌────────────┐
+                                                     │  host (PC) │
+                                                     │ AP + viewer│
+                                                     └────────────┘
 ```
 
-The TX broadcasts a small ESP-NOW packet at a fixed rate on a fixed
-channel. The RX listens promiscuously on that channel; every received
-broadcast generates one CSI sample, which the firmware prints over UART
-in the [esp-csi](https://github.com/espressif/esp-csi) line format. The
-host parses each line into a complex subcarrier vector and renders or
-analyzes it.
+Each TX broadcasts a small ESP-NOW frame at a fixed rate on a fixed
+channel. Each RX listens for those broadcasts (filtered by source MAC),
+and for every received broadcast emits one CSI sample. The RX then
+sends each sample as a binary UDP packet to the host's hotspot IP. The
+host listens on UDP, demuxes per-RX, computes per-link motion-σ on a
+sliding window, and renders.
+
+Single-stream UART is still supported for development on one board (the
+firmware also prints CSI rows in the [esp-csi](https://github.com/espressif/esp-csi)
+text format), but the full demo runs over UDP.
 
 ## Firmware
 
-Both firmware projects target **ESP-IDF v5.3 or newer**. The CSI driver in
-v5.2.x has a bug where the receive callback never fires for some chip
-revisions; v5.3+ fixes it. Verify with `idf.py --version`.
+Both firmware projects target **ESP-IDF v5.3 or newer** (tested on
+v5.5). Set the target once on a fresh checkout:
 
-The boards stream over the ESP32-S3's native USB-Serial-JTAG, so each shows
-up as `/dev/ttyACMn` (Linux) or a COM port (Windows) — no external
-USB-UART bridge needed. If your dev kit has a separate UART bridge port,
-either side works.
+    idf.py set-target esp32s3
 
 ### Transmitter (`firmware/csi_transmitter/`)
 
 ```sh
 cd firmware/csi_transmitter
-idf.py set-target esp32s3
-idf.py menuconfig    # adjust CSI_TX_CHANNEL / CSI_TX_RATE_HZ if needed
-idf.py build flash monitor
+idf.py menuconfig    # CSI_TX_CHANNEL / CSI_TX_RATE_HZ
+idf.py -p /dev/ttyACM0 flash monitor   # or /dev/ttyUSB0 on USB-UART boards
 ```
 
-You should see a log line like:
+Boot log:
 
-    I (412) csi_tx: TX up: mac=aa:bb:cc:dd:ee:ff ch=11 rate=100Hz
+    I (412) csi_tx: TX up: mac=ac:a7:04:2c:42:54 ch=11 rate=100Hz
 
-Note the MAC — you can pin the receiver to it for clean filtering.
+The TX firmware pins broadcasts to 11n HT20 MCS0 via
+`esp_now_set_peer_rate_config`. Without this, ESP-NOW falls back to
+11b 1 Mbps DSSS (no HT-LTF), and the receiver's CSI engine never
+fires for the broadcasts. Note the MAC — every receiver needs it in
+its filter.
 
 ### Receiver (`firmware/csi_receiver/`)
 
 ```sh
 cd firmware/csi_receiver
-idf.py set-target esp32s3
-idf.py menuconfig    # set CSI_RX_CHANNEL = TX channel; optionally set
-                     # CSI_RX_FILTER_TX_MAC = "aabbccddeeff" (12 hex chars)
-idf.py build flash monitor
+idf.py menuconfig    # see required values below
+idf.py -p /dev/ttyACMx flash monitor
 ```
 
-Once running, the UART stream looks like:
+Required `menuconfig` values for the multi-RX UDP setup:
 
-    type,seq,mac,rssi,rate,...,first_word,data
-    CSI_DATA,0,aa:bb:cc:dd:ee:ff,-46,11,1,7,1,...,128,0,"[1,-2,0,3,...]"
-    CSI_DATA,1,...
+    CSI_RX_CHANNEL         = 11               # must match TX
+    CSI_RX_FILTER_TX_MAC   = <TX1 MAC>, <TX2 MAC>     # comma-separated
+    CSI_RX_WIFI_SSID       = CSIDetector
+    CSI_RX_WIFI_PASS       = (blank, see Hotspot section)
+    CSI_RX_HOST_IP         = 10.42.0.1        # host's hotspot IP
+    CSI_RX_HOST_PORT       = 5566
 
-at roughly 100 lines/second.
+Leaving `CSI_RX_WIFI_SSID` blank disables WiFi STA + UDP and falls back
+to the original UART-only single-RX flow, which is useful for a quick
+smoke test on one board.
+
+### Host hotspot
+
+NetworkManager creates a 2.4 GHz hotspot. Pick a USB dongle if you also
+need internet on the host's built-in card:
+
+```sh
+IFACE=wlp2s0u2   # whatever `nmcli device | grep wifi` shows
+nmcli connection add type wifi ifname "$IFACE" con-name Hotspot autoconnect no \
+    ssid CSIDetector \
+    802-11-wireless.mode ap \
+    802-11-wireless.band bg \
+    802-11-wireless.channel 11 \
+    ipv4.method shared \
+    ipv6.method ignore
+nmcli connection up Hotspot
+
+# Open the UDP port in the right firewalld zone (NM puts hotspot ifaces
+# in `nm-shared`, not the default `FedoraWorkstation`).
+sudo firewall-cmd --zone=nm-shared --add-port=5566/udp --permanent
+sudo firewall-cmd --reload
+```
+
+Verify with `iw dev "$IFACE" info | grep channel` and
+`ip addr show "$IFACE" | grep inet`. Channel 11 must match
+`CSI_TX_CHANNEL` and `CSI_RX_CHANNEL`.
+
+This recipe sets up an OPEN (no-password) hotspot. WPA2 also works, but
+some USB AP adapters can't reliably complete the 4-way handshake with
+multiple ESP32 STAs simultaneously, so for a closed demo network OPEN
+is the path of least resistance.
 
 ## Host pipeline
 
@@ -90,72 +128,117 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-All commands take a `<source>` that is either a serial port
-(`/dev/ttyUSB0`, `COM5`), a saved log file, or `-` for stdin.
+`<source>` is a serial port (`/dev/ttyUSB0`, `COM5`), a saved log file,
+`udp:<port>` for the hotspot setup, or `-` for stdin. Multi-RX
+subcommands (`heatmap`, `view3d`, `calibrate-links`) only make sense
+with a `udp:<port>` source.
 
-### Live heatmap
+### Quick sanity check on packet rates
 
 ```sh
-python run.py view /dev/ttyUSB0
+python -c "
+import socket, time, collections
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('0.0.0.0', 5566))
+counts = collections.Counter(); end = time.time() + 5
+while time.time() < end:
+    data, _ = s.recvfrom(2048); counts[(data[2:8].hex(':'), data[8:14].hex(':'))] += 1
+for (rx, tx), n in sorted(counts.items()):
+    print(f'TX={tx}  RX={rx}  {n//5}/s')"
 ```
 
-Top panel: subcarrier (y) × time (x), color = |H| in dB. Bottom panel:
-sliding-window standard deviation across active subcarriers (the motion
-score). Wave a hand between the two boards; the streaks should be
-unmistakable.
+Expect one row per (TX, RX) pair at ~100/s. With 2 TX × 4 RX you'll see
+8 pairs.
 
-### Capture a log for offline analysis
+### Calibrate per-link still-room baselines
+
+Leave the room. The script counts down before recording starts:
+
+```sh
+python run.py calibrate-links udp:5566 --settle 30 --seconds 30 --out baselines.json
+```
+
+`--settle` doubles as the walk-out timer. The output JSON maps each
+RX MAC to its baseline motion-σ. RXs that didn't deliver enough
+samples are flagged in stderr — silent drops would later show as
+dead links in the heatmap.
+
+### Live floor-plan heatmap
+
+```sh
+cp links.example.json links.json    # edit room polygon, TX/RX MACs, positions
+python run.py heatmap udp:5566 --links links.json --baselines baselines.json
+```
+
+Each TX-RX line is tinted by its current motion-σ divided by its
+still-room baseline (1× = idle, ≥5× = saturated). With multiple
+TXs you get multiple fans of links crossing the room.
+
+### 2.5D room viewer
+
+```sh
+python run.py view3d udp:5566 --links links.json --baselines baselines.json
+```
+
+Walls extruded from the polygon, floor surface coloured by per-cell
+motion likelihood (Gaussian-weighted sum of per-link motion-σ along
+each TX-RX line), red person pin at the brightest cell when
+likelihood exceeds a threshold.
+
+### Single-stream debug viewer
+
+```sh
+python run.py view /dev/ttyUSB0      # one RX, UART
+python run.py view udp:5566          # pins to the first rx_id seen, drops the rest
+```
+
+Subcarrier × time waterfall + motion-σ trace. Useful for verifying
+one board independently.
+
+### Capture a log
 
 ```sh
 python run.py capture /dev/ttyUSB0 still.log --seconds 30
 ```
 
-### Calibrate a still-room baseline
-
-Leave the room for the duration. The first 10 s of samples are dropped
-to let the radio's AGC lock.
+### Single-stream binary detector
 
 ```sh
 BASELINE=$(python run.py calibrate /dev/ttyUSB0 --seconds 30)
-echo "baseline=$BASELINE"
-```
-
-### Live binary detection
-
-```sh
 python run.py detect /dev/ttyUSB0 --baseline "$BASELINE"
 ```
 
-You'll see one event line per transition:
-
-    2026-04-26T18:21:04 MOTION score=0.0182 baseline=0.0041 ratio=4.43
-    2026-04-26T18:21:09 STILL  score=0.0049 baseline=0.0041 ratio=1.20
-
-Tune `--enter` and `--exit` to taste; the defaults (3.0×, 1.5×) are
-conservative.
+Prints `MOTION` / `STILL` events on transitions. `--enter` / `--exit`
+control the hysteresis ratio (defaults 3.0× / 1.5×).
 
 ## Tuning notes
 
-- **Channel**: pick whichever 2.4 GHz channel has the least traffic.
-  Channel 11 is a reasonable default for North America.
-- **Sample rate**: 100 Hz is the sweet spot — high enough to catch hand
-  motion, low enough that ESP-NOW transmission stays reliable.
-- **Antenna placement**: the boards' built-in chip antennas are
-  directional. Pointing them roughly at each other through the volume of
-  interest gives the cleanest signal.
-- **Metal in the line of sight**: kills it. Metal furniture, appliances,
-  and structural beams between TX and RX will mask any motion behind
-  them.
-- **Range**: usable up to ~10–15 m indoors at 100 Hz.
+- **Channel**: pick the 2.4 GHz channel with the least neighbouring
+  WiFi traffic. Channel 11 is a reasonable default in North America.
+  TX, RX, and the hotspot AP must all be on the same channel.
+- **TX placement**: corners are best. A TX in the middle of the room
+  makes every link's motion-σ rise on any motion (the long links
+  dominate), which kills directional information. Two TXs in
+  diagonally-opposite corners give the cleanest two-fan geometry.
+- **Sample rate**: 100 Hz per TX is the sweet spot — high enough to
+  catch hand motion, low enough that ESP-NOW airtime is comfortable
+  with multiple TXs.
+- **Antenna**: the WROOM-1U's u.fl connector takes any 2.4 GHz
+  antenna (WiFi Pineapple antennas, generic ESP32 dev-kit antennas).
+  LoRa antennas (sub-GHz) will not work.
+- **Metal in the line of sight**: still kills the link. Metal furniture,
+  appliances, and structural beams between TX and RX mask any motion
+  behind them.
 
 ## Roadmap
 
-- [x] Single TX / single RX pair, live heatmap, binary detector
-- [ ] Multi-RX (4–5 nodes) with per-link motion-intensity score
-- [ ] Floor-plan overlay viewer (per-link blobs on a 2D room sketch)
-- [ ] Aggregator firmware on ESP32-C5-with-screen for an
-      untethered display
+- [x] Single TX / single RX, live waterfall, single-stream binary detector
+- [x] Multi-RX over WiFi (UDP forwarding to host), per-link motion-σ heatmap
+- [x] Multi-TX support, per-link baselines, 2.5D floor-plan viewer with
+      person pin
+- [ ] Multi-person separation (top-K local maxima with non-max suppression)
+- [ ] Aggregator firmware on ESP32-C5-with-screen for an untethered display
 - [ ] Optional: NBVI subcarrier auto-selection (espectre's MVS)
+- [ ] Doppler/phase processing for sub-meter localization
 
 ## References
 

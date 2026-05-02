@@ -1,44 +1,45 @@
 """Command-line entry point for the CSI motion detector.
 
+`<source>` accepts a serial port (`/dev/ttyUSB0`, `COM5`), a saved log
+file, `udp:<port>` for the multi-RX hotspot setup, or `-` for stdin.
+Subcommands that key off rx_id (heatmap, view3d, calibrate-links) only
+make sense with a `udp:<port>` source.
+
 Subcommands:
 
-    capture <source> <out.log> [--seconds N]
-        Dump raw CSI_DATA lines to disk. Use this to record a still-room
+    capture <source> <out.log> [--seconds N] [--baud B]
+        Dump raw CSI_DATA lines to disk. Use to record a still-room
         baseline or a labeled session for offline analysis.
 
-    calibrate <log_or_source> [--seconds N] [--window W] [--settle S]
-        Read still-room samples and emit a baseline motion score. Drops
-        the first --settle seconds to let the radio's AGC lock.
+    calibrate <source> [--seconds N] [--settle S] [--window W] [--max-samples M]
+        Single-stream still-room baseline (one RX). Drops the first
+        --settle seconds to let the radio's AGC lock. For multi-RX
+        UDP setups use `calibrate-links` instead.
 
     detect <source> --baseline B [--window W] [--enter R] [--exit R]
-        Live detection. Prints an event line on every transition between
-        STILL and MOTION.
+        Live binary detection on a single stream. Prints an event line
+        on every transition between STILL and MOTION.
 
     view <source> [--history N] [--window W]
-        Open a live matplotlib heatmap (subcarrier x time, color = |H| in
-        dB) with a motion-score line below it.
+        Single-stream waterfall: subcarrier × time + motion-σ trace.
+        With a UDP source containing multiple RXs, pins to the first
+        rx_id seen and drops the rest.
 
-    heatmap <source> --links links.json [--history N] [--window W]
-        Multi-RX floor-plan view: per TX-RX line tinted by current
-        motion-σ. Source is typically `udp:<port>`; the host listens
-        for binary CSI packets from receivers running with
-        CSI_RX_WIFI_SSID configured.
+    heatmap <source> --links links.json [--baselines b.json] [--full-bright R]
+        Multi-RX, multi-TX 2D floor-plan view. Each TX-RX line is
+        tinted by its motion-σ ratio against the per-RX baseline.
+        Source must carry rx_id (i.e. `udp:<port>`). --full-bright
+        sets the ratio that saturates the colormap (default 3.0×).
 
     view3d <source> --links links.json [--baselines b.json] [--grid-step G]
         2.5D room view: walls extruded, floor as a likelihood heatmap
-        from per-link motion-σ, person pin at the brightest cell.
-        Use --baselines for ratio-vs-still-room scoring.
+        derived from per-link motion-σ, person pin at the brightest
+        cell.
 
     calibrate-links <source> [--out baselines.json] [--settle S] [--seconds N]
-        Multi-RX still-room calibration. --settle doubles as walk-out
-        time; the script counts down before recording.
-            [--baselines b.json] [--full-bright R]
-        Multi-RX, multi-TX floor-plan view: per TX-RX line tinted by
-        current motion. Source is typically `udp:<port>`; the host
-        listens for binary CSI packets from receivers running with
-        CSI_RX_WIFI_SSID configured. Pass --baselines (RX MAC -> still-
-        room σ JSON) to color links by ratio against a calibrated
-        baseline; --full-bright sets the ratio that saturates the cmap.
+        Multi-RX still-room calibration. Writes a {rx_mac: baseline}
+        JSON. --settle doubles as a walk-out timer; the script counts
+        down before recording starts.
 """
 
 from __future__ import annotations
@@ -176,7 +177,8 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
     import heatmap
     return heatmap.run_heatmap(args.source, args.links,
                                history=args.history, motion_window=args.window,
-                               baselines_path=args.baselines)
+                               baselines_path=args.baselines,
+                               full_bright=args.full_bright)
 
 
 def cmd_view3d(args: argparse.Namespace) -> int:
@@ -267,16 +269,24 @@ def cmd_calibrate_links(args: argparse.Namespace) -> int:
     baselines = detector.compute_link_baselines(per_rx, window=args.window)
     if not baselines:
         raise SystemExit("no usable baselines — did any RX deliver enough samples?")
+    # Flag RXs that streamed but didn't hit the threshold; without this,
+    # a flaky RX silently vanishes from baselines.json and its links
+    # later render at 0× in the heatmap with no obvious cause.
+    min_required = 2 * args.window
+    short = [(mac, len(rows)) for mac, rows in per_rx.items()
+             if mac not in baselines]
     print(f"\nper-RX:", file=sys.stderr)
     for mac, b in sorted(baselines.items()):
         print(f"  {mac}  baseline={b:.6f}  ({len(per_rx[mac])} samples)",
+              file=sys.stderr)
+    for mac, n in sorted(short):
+        print(f"  {mac}  SKIPPED — only {n} samples, need >= {min_required}; "
+              f"this RX's links will render at 0× in the heatmap",
               file=sys.stderr)
     with open(args.out, "w") as f:
         json.dump(baselines, f, indent=2)
     print(f"\nwrote {args.out}", file=sys.stderr)
     return 0
-                               baselines_path=args.baselines,
-                               full_bright=args.full_bright)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -320,9 +330,6 @@ def build_parser() -> argparse.ArgumentParser:
     hm = sub.add_parser("heatmap", help="multi-RX floor-plan motion overlay (UDP)")
     hm.add_argument("source", help="udp:<port> typically")
     hm.add_argument("--links", required=True,
-                    help="JSON config with room, TX, and RX positions (see links.example.json)")
-    hm.add_argument("--baselines", default=None,
-                    help="JSON file from `calibrate-links`; enables ratio-based coloring")
                     help="JSON config with room, TXs, and RX positions (see links.example.json)")
     hm.add_argument("--history", type=int, default=500)
     hm.add_argument("--window", type=int, default=50)
