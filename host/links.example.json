@@ -18,5 +18,16 @@
     { "mac": "e0:72:a1:aa:2c:88", "x": 4.0, "y": 4.0, "label": "north"  },
     { "mac": "ac:a7:04:2c:24:cc", "x": 2.5, "y": 0.0, "label": "south"  },
     { "mac": "e0:72:a1:aa:1c:0c", "x": 0.0, "y": 1.5, "label": "west"   }
+  "_comment": "Edit MACs to match your boards (run.py heatmap prints unknown ones on first packet) and (x_m, y_m) to match your room. Coordinates in meters; origin doesn't matter — only relative positions. 'txs' is a list; for a single transmitter use a one-element list. 'room' may be either width_m/height_m or a 'polygon' of [x,y] pairs.",
+  "room": { "width_m": 5.0, "height_m": 4.0 },
+  "txs": [
+    { "mac": "ac:a7:04:2c:42:54", "x": 0.3, "y": 0.3, "label": "TX1" },
+    { "mac": "ac:a7:04:2c:42:90", "x": 4.7, "y": 3.7, "label": "TX2" }
+  ],
+  "rxs": [
+    { "mac": "1c:db:d4:78:57:70", "x": 0.0,  "y": 1.25, "label": "west"  },
+    { "mac": "e0:72:a1:aa:2c:88", "x": 5.0,  "y": 2.0,  "label": "east"  },
+    { "mac": "ac:a7:04:2c:24:cc", "x": 2.5,  "y": 0.0,  "label": "south" },
+    { "mac": "e0:72:a1:aa:1c:0c", "x": 3.75, "y": 4.0,  "label": "north" }
   ]
 }

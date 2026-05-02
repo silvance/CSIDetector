@@ -32,6 +32,13 @@ Subcommands:
     calibrate-links <source> [--out baselines.json] [--settle S] [--seconds N]
         Multi-RX still-room calibration. --settle doubles as walk-out
         time; the script counts down before recording.
+            [--baselines b.json] [--full-bright R]
+        Multi-RX, multi-TX floor-plan view: per TX-RX line tinted by
+        current motion. Source is typically `udp:<port>`; the host
+        listens for binary CSI packets from receivers running with
+        CSI_RX_WIFI_SSID configured. Pass --baselines (RX MAC -> still-
+        room σ JSON) to color links by ratio against a calibrated
+        baseline; --full-bright sets the ratio that saturates the cmap.
 """
 
 from __future__ import annotations
@@ -268,6 +275,8 @@ def cmd_calibrate_links(args: argparse.Namespace) -> int:
         json.dump(baselines, f, indent=2)
     print(f"\nwrote {args.out}", file=sys.stderr)
     return 0
+                               baselines_path=args.baselines,
+                               full_bright=args.full_bright)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -314,8 +323,17 @@ def build_parser() -> argparse.ArgumentParser:
                     help="JSON config with room, TX, and RX positions (see links.example.json)")
     hm.add_argument("--baselines", default=None,
                     help="JSON file from `calibrate-links`; enables ratio-based coloring")
+                    help="JSON config with room, TXs, and RX positions (see links.example.json)")
     hm.add_argument("--history", type=int, default=500)
     hm.add_argument("--window", type=int, default=50)
+    hm.add_argument("--baselines", default=None,
+                    help="JSON map of RX MAC -> still-room σ. When given, "
+                         "links are colored by ratio (× baseline) instead of "
+                         "auto-scaled raw σ.")
+    hm.add_argument("--full-bright", type=float, default=3.0,
+                    help="ratio at which links saturate to the brightest "
+                         "cmap value (default 3.0; only used with --baselines). "
+                         "Lower this if motion looks washed-out as 'all dark'.")
     hm.set_defaults(func=cmd_heatmap)
 
     v3 = sub.add_parser("view3d", help="2.5D room view: floor heatmap + person pin")

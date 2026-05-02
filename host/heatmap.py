@@ -27,6 +27,17 @@ import numpy as np
 import csi_collector
 
 
+# Ratios at and below this anchor mean "no motion" (output equals or
+# falls below the still-room baseline) and render as black. Anything
+# above is the dynamic range we color across.
+RATIO_FLOOR = 1.0
+# Default ratio at which links saturate to the brightest cmap value.
+# Real CSI motion ratios rarely exceed ~2-3×; saturating at 5× as the
+# old default did pushed every realistic motion into magma's near-
+# black lower third.
+DEFAULT_RATIO_FULL_BRIGHT = 3.0
+
+
 @dataclass
 class _Node:
     mac: str
@@ -104,6 +115,8 @@ def _reader_thread(source: str,
 def run_heatmap(source: str, links_path: str,
                 history: int = 500, motion_window: int = 50,
                 baselines_path: Optional[str] = None) -> int:
+                baselines_path: Optional[str] = None,
+                full_bright: float = DEFAULT_RATIO_FULL_BRIGHT) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     from matplotlib.cm import get_cmap
@@ -187,9 +200,24 @@ def run_heatmap(source: str, links_path: str,
     label = "motion ratio (× still-room)" if use_ratio else "motion σ (normalized)"
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(vmin=0, vmax=1))
     cbar = fig.colorbar(sm, ax=ax, label=label)
+    use_ratio = bool(baselines)
+    if use_ratio:
+        if full_bright <= RATIO_FLOOR:
+            raise SystemExit(
+                f"--full-bright must exceed {RATIO_FLOOR} (got {full_bright}); "
+                f"otherwise the dynamic range collapses.")
+        cbar_label = (f"motion ratio (× still-room) — "
+                      f"floor {RATIO_FLOOR:g}×, full {full_bright:g}×")
+        norm = plt.Normalize(vmin=RATIO_FLOOR, vmax=full_bright)
+    else:
+        cbar_label = "motion σ (normalized)"
+        norm = plt.Normalize(vmin=0, vmax=1)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    cbar = fig.colorbar(sm, ax=ax, label=cbar_label)
     del cbar
 
     running_max = [1e-3]
+    span = full_bright - RATIO_FLOOR
 
     def update(_frame):
         # Compute per-link motion score, then per-link metric (ratio or
@@ -203,6 +231,15 @@ def run_heatmap(source: str, links_path: str,
                 base = max(baselines.get(rx_mac, 1e-3), 1e-6)
                 metrics.append(sigma / base)
             tints = [min(m / RATIO_FULL_BRIGHT, 1.0) for m in metrics]
+        sigmas = [buffers[k].motion_score(motion_window) for k in pair_keys]
+        if use_ratio:
+            metrics = []
+            for (_tx_mac, rx_mac), sigma in zip(pair_keys, sigmas):
+                base = max(baselines.get(rx_mac, 1e-3), 1e-6)
+                metrics.append(sigma / base)
+            # Anchor "no motion" at RATIO_FLOOR so the still-room
+            # baseline maps to black, and saturate at full_bright.
+            tints = [min(max(m - RATIO_FLOOR, 0.0) / span, 1.0) for m in metrics]
             text_fmt = lambda m, s: f"{m:.2f}×"
         else:
             if sigmas:
