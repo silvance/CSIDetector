@@ -161,7 +161,7 @@ def run_viewer3d(source: str, links_path: str,
                  wall_height_m: float = 2.5) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
-    from matplotlib.cm import get_cmap
+    import matplotlib as mpl
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
     polygon, txs, rxs = _load_links(links_path)
@@ -190,7 +190,7 @@ def run_viewer3d(source: str, links_path: str,
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
     fig.suptitle(f"CSI 2.5D — {source}")
-    cmap = get_cmap("magma")
+    cmap = mpl.colormaps["magma"]
 
     # Walls: extrude each polygon edge into a vertical quad.
     wall_polys = []
@@ -288,10 +288,12 @@ def run_viewer3d(source: str, links_path: str,
             ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
         return [surf, person_line, person_dot]
 
+    # `anim` is intentionally bound for the duration of plt.show(); without
+    # a live reference, matplotlib garbage-collects FuncAnimation and the
+    # animation freezes silently.
     anim = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)
     try:
         plt.show()
     finally:
         stop.set()
-    del anim
     return 0

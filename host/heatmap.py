@@ -180,7 +180,7 @@ def run_heatmap(source: str, links_path: str,
                 full_bright: float = DEFAULT_RATIO_FULL_BRIGHT) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
-    from matplotlib.cm import get_cmap
+    import matplotlib as mpl
 
     cfg, txs, rxs = _load_links(links_path)
     room = cfg["room"]
@@ -215,7 +215,7 @@ def run_heatmap(source: str, links_path: str,
     ax.set_ylabel("y (m)")
     ax.add_patch(plt.Polygon(polygon, fill=False, edgecolor="black", linewidth=1.5))
 
-    cmap = get_cmap("magma")
+    cmap = mpl.colormaps["magma"]
     # One line + value-label per (TX, RX) pair.
     line_artists: list = []
     label_artists: list = []
@@ -268,8 +268,7 @@ def run_heatmap(source: str, links_path: str,
         cbar_label = "motion σ (normalized)"
         norm = plt.Normalize(vmin=0, vmax=1)
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    cbar = fig.colorbar(sm, ax=ax, label=cbar_label)
-    del cbar
+    fig.colorbar(sm, ax=ax, label=cbar_label)
 
     running_max = [1e-3]
     span = full_bright - RATIO_FLOOR
@@ -305,9 +304,11 @@ def run_heatmap(source: str, links_path: str,
         return [*line_artists, *label_artists]
 
     anim = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)
+    # `anim` is intentionally bound for the duration of plt.show(); without
+    # a live reference, matplotlib garbage-collects FuncAnimation and the
+    # animation freezes silently.
     try:
         plt.show()
     finally:
         stop.set()
-    del anim
     return 0

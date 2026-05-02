@@ -19,6 +19,7 @@ import csv
 import dataclasses
 import io
 import json
+import struct
 import sys
 import time
 from typing import Iterable, Iterator, Optional
@@ -132,8 +133,16 @@ def iter_stdin() -> Iterator[CSISample]:
 
 # Wire format of csi_udp_header_t in firmware/csi_receiver/main/main.c.
 # Little-endian, packed; 34 bytes header followed by `length` bytes of int8 IQ.
-_UDP_HEADER = __import__("struct").Struct("<BB6s6sIqbbBBBBH")
+_UDP_HEADER = struct.Struct("<BB6s6sIqbbBBBBH")
 assert _UDP_HEADER.size == 34
+
+# Sanity bounds on the IQ payload length. The CSI engine emits
+# 64-byte (LLTF only) up to 384-byte (HT-LTF + STBC) payloads in
+# practice; rejecting outside this range protects against truncated
+# UDP packets and (modestly) against spoofed garbage from elsewhere
+# on the hotspot subnet.
+_UDP_IQ_MIN = 2
+_UDP_IQ_MAX = 384
 
 
 def parse_udp_packet(data: bytes) -> Optional[CSISample]:
@@ -143,7 +152,9 @@ def parse_udp_packet(data: bytes) -> Optional[CSISample]:
      channel, sig_mode, mcs, bandwidth, length) = _UDP_HEADER.unpack_from(data)
     if version != 1:
         return None
-    if len(data) - _UDP_HEADER.size < length or length % 2 != 0:
+    if not (_UDP_IQ_MIN <= length <= _UDP_IQ_MAX) or length % 2 != 0:
+        return None
+    if len(data) - _UDP_HEADER.size < length:
         return None
     iq = np.frombuffer(data, dtype=np.int8,
                        offset=_UDP_HEADER.size, count=length).astype(np.float32)

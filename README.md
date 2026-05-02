@@ -89,6 +89,14 @@ Leaving `CSI_RX_WIFI_SSID` blank disables WiFi STA + UDP and falls back
 to the original UART-only single-RX flow, which is useful for a quick
 smoke test on one board.
 
+> **Note on WiFi credentials**: `CSI_RX_WIFI_SSID` and `CSI_RX_WIFI_PASS`
+> are baked into the receiver's `sdkconfig` and flashed in plain text to
+> the chip's flash. For a closed demo network this is fine; for any
+> other deployment, treat the receivers as having a recoverable
+> password and don't reuse a credential you care about elsewhere.
+> The recipe in the next section uses an open hotspot, which sidesteps
+> this entirely.
+
 ### Host hotspot
 
 NetworkManager creates a 2.4 GHz hotspot. Pick a USB dongle if you also
@@ -201,6 +209,11 @@ python run.py capture /dev/ttyUSB0 still.log --seconds 30
 ```
 
 ### Single-stream binary detector
+
+For a single-board (UART) setup. `calibrate` here emits one scalar
+baseline σ; the multi-RX path uses `calibrate-links` instead, which
+writes a per-RX JSON consumed by `heatmap` / `view3d`. The two
+subcommands are not interchangeable.
 
 ```sh
 BASELINE=$(python run.py calibrate /dev/ttyUSB0 --seconds 30)

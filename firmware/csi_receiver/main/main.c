@@ -175,8 +175,10 @@ static void csi_callback(void *ctx, wifi_csi_info_t *info) {
 
     udp_send_sample(this_seq, ts, info);
 
-    // Header columns match esp-csi conventions; emitting them up front lets
-    // a single fwrite per row stay atomic.
+    // Header columns match esp-csi conventions so existing tooling can
+    // parse this format unchanged. The printf+putchar sequence isn't
+    // atomic — concurrent log lines can interleave — but stdout is line-
+    // buffered and the host parser tolerates the rare garbled row.
     printf("CSI_DATA,%lu,"                 // seq
            "%02x:%02x:%02x:%02x:%02x:%02x," // mac
            "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d," // rssi,rate,sig_mode,mcs,bw,smoothing,not_sounding,aggregation,stbc,fec_coding

@@ -93,10 +93,19 @@ class MotionDetector:
 
 
 def compute_baseline(amplitudes: np.ndarray, window: int) -> float:
-    """Median per-subcarrier sliding-window std across a still-room capture."""
-    if amplitudes.shape[0] < window * 2:
+    """Median per-subcarrier sliding-window std across a still-room capture.
+
+    Trims `window` samples from each end, then takes a sliding window of
+    size `window` over the remainder — so the minimum input is
+    `3*window` samples to produce a single sliding window. The previous
+    `2*window` check was off by one and let the body shrink to zero
+    rows, which crashed numpy on `np.empty(-window+1)`.
+    """
+    min_required = 3 * window
+    if amplitudes.shape[0] < min_required:
         raise ValueError(
-            f"need at least {window * 2} samples for a stable baseline, got {amplitudes.shape[0]}"
+            f"need at least {min_required} samples for a stable baseline, "
+            f"got {amplitudes.shape[0]}"
         )
     trim = window
     body = amplitudes[trim:-trim]
@@ -124,7 +133,7 @@ def compute_link_baselines(samples_by_link: dict[tuple[str, str], list[np.ndarra
     """
     out: dict[tuple[str, str], float] = {}
     for key, rows in samples_by_link.items():
-        if len(rows) < window * 2:
+        if len(rows) < window * 3:  # matches compute_baseline's minimum
             continue
         amps = np.stack(rows)
         idx = np.flatnonzero(np.any(amps > 0, axis=0))

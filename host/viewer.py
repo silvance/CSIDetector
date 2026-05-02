@@ -104,8 +104,7 @@ def run_viewer(source: str, history: int = 500, motion_window: int = 50) -> int:
     )
     ax_heat.set_ylabel("active subcarrier")
     ax_heat.set_xlabel("samples (newest →)")
-    cbar = fig.colorbar(img, ax=ax_heat, label="|H| (dB)")
-    del cbar  # keep reference alive without lint warning
+    fig.colorbar(img, ax=ax_heat, label="|H| (dB)")
 
     score_line, = ax_score.plot([], [], color="tab:red")
     ax_score.set_xlim(0, history)
@@ -135,9 +134,11 @@ def run_viewer(source: str, history: int = 500, motion_window: int = 50) -> int:
         return img, score_line
 
     anim = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)
+    # `anim` is intentionally bound for the duration of plt.show(); without
+    # a live reference, matplotlib garbage-collects FuncAnimation and the
+    # animation freezes silently.
     try:
         plt.show()
     finally:
         stop.set()
-    del anim
     return 0

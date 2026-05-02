@@ -95,6 +95,10 @@ def _collect_amplitudes(source: str, seconds: float | None,
                         max_samples: int | None,
                         settle_seconds: float = 0.0
                         ) -> tuple[np.ndarray, np.ndarray]:
+    if seconds is None and max_samples is None:
+        raise SystemExit(
+            "calibrate: at least one of --seconds or --max-samples is "
+            "required (otherwise it would run forever).")
     src = csi_collector.open_source(source)
     rows: list[np.ndarray] = []
     idx = None
@@ -280,7 +284,7 @@ def cmd_calibrate_links(args: argparse.Namespace) -> int:
     # Flag links that streamed but didn't hit the threshold; without this,
     # a flaky link silently vanishes from baselines.json and renders at 0×
     # in the heatmap with no obvious cause.
-    min_required = 2 * args.window
+    min_required = 3 * args.window
     short = [(key, len(rows)) for key, rows in per_link.items()
              if key not in baselines]
     print(f"\nper-link:", file=sys.stderr)
