@@ -38,6 +38,11 @@ class _SampleBuffer:
                 if idx.size == 0:
                     return
                 self._idx = idx
+            # Drop samples whose subcarrier count differs from the
+            # locked-in mask — guards against IndexError when a
+            # mid-stream MCS / bandwidth shift shrinks the array.
+            if self._idx[-1] >= amp.size:
+                return
             self._buf.append(amp[self._idx])
 
     def snapshot(self) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:

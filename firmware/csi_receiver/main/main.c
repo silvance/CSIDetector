@@ -108,15 +108,18 @@ static bool parse_one_mac(const char *s, int len, uint8_t out[6]) {
 // Parses the Kconfig string into s_filter_macs / s_filter_count. Returns
 // number of valid MACs parsed; returns -1 on any unparseable token so
 // the caller can warn loudly (silent partial filters are the trap that
-// motivated the original parser cleanup).
+// motivated the original parser cleanup). Returns -2 if there are more
+// than MAX_FILTER_MACS tokens — silent truncation would also be a
+// silent partial filter.
 static int parse_filter_macs(const char *s) {
     s_filter_count = 0;
     if (!s) return 0;
     const char *p = s;
-    while (*p && s_filter_count < MAX_FILTER_MACS) {
+    while (*p) {
         // Skip leading separators / whitespace.
         while (*p && (*p == ',' || *p == ';' || *p == ' ' || *p == '\t')) p++;
         if (!*p) break;
+        if (s_filter_count >= MAX_FILTER_MACS) return -2;
         const char *end = p;
         while (*end && *end != ',' && *end != ';') end++;
         if (!parse_one_mac(p, end - p, s_filter_macs[s_filter_count])) {
@@ -234,6 +237,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_event_sta_disconnected_t *e = (wifi_event_sta_disconnected_t *)data;
         ESP_LOGW(TAG, "STA disconnected (reason=%d), reconnecting", e ? e->reason : 0);
+        // Close the socket before clearing the handle — otherwise every
+        // reconnect leaks an FD and lwIP's small socket pool eventually
+        // refuses new sockets on the next GOT_IP.
+        if (s_udp_sock >= 0) {
+            close(s_udp_sock);
+        }
         s_udp_sock = -1;
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -362,6 +371,11 @@ void app_main(void) {
                      s_filter_macs[i][0], s_filter_macs[i][1], s_filter_macs[i][2],
                      s_filter_macs[i][3], s_filter_macs[i][4], s_filter_macs[i][5]);
         }
+    } else if (parsed == -2) {
+        ESP_LOGE(TAG, "CSI_RX_FILTER_TX_MAC=\"%s\" lists more than %d MACs; "
+                      "filter DISABLED. Increase MAX_FILTER_MACS and rebuild.",
+                 cfg_mac, MAX_FILTER_MACS);
+        s_filter_count = 0;
     } else if (parsed < 0) {
         // Non-empty but unparseable somewhere — surface this loudly so the
         // user doesn't think they're filtering when they aren't.

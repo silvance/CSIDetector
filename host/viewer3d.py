@@ -93,6 +93,11 @@ class _LinkBuffer:
                     self._buf.append(a[idx])
                 self._probe = []
             else:
+                # Drop samples whose subcarrier count differs from the
+                # locked-in mask — guards against IndexError when a
+                # mid-stream MCS / bandwidth shift shrinks the array.
+                if self._idx[-1] >= amp.size:
+                    return
                 self._buf.append(amp[self._idx])
 
     def motion_score(self, window: int) -> float:
@@ -254,9 +259,15 @@ def run_viewer3d(source: str, links_path: str,
         for (tx_mac, rx_mac), buf in buffers.items():
             sigma = buf.motion_score(motion_window)
             if use_ratio:
-                base = baselines.get((tx_mac, rx_mac), 1e-3)
-                # Subtract baseline so still-room links contribute ~0.
-                metric = max(sigma / max(base, 1e-6) - 1.0, 0.0)
+                base = baselines.get((tx_mac, rx_mac))
+                if base is None or base <= 0:
+                    # No baseline for this link — don't fabricate a 1e-3
+                    # divisor (would saturate this link's kernel and
+                    # produce a phantom person pin). Drop to 0.
+                    metric = 0.0
+                else:
+                    # Subtract baseline so still-room links contribute ~0.
+                    metric = max(sigma / base - 1.0, 0.0)
             else:
                 metric = sigma
             scores[(tx_mac, rx_mac)] = metric

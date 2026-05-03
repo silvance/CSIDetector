@@ -105,6 +105,12 @@ class _LinkBuffer:
                     self._buf.append(a[idx])
                 self._probe = []  # release the references
             else:
+                # Drop samples whose subcarrier count differs from the
+                # mask we locked in. Happens on a mid-stream MCS or
+                # bandwidth shift; without this, indexing IndexErrors
+                # and silently kills the reader thread.
+                if self._idx[-1] >= amp.size:
+                    return
                 self._buf.append(amp[self._idx])
 
     def motion_score(self, window: int) -> float:
@@ -277,23 +283,35 @@ def run_heatmap(source: str, links_path: str,
         sigmas = [buffers[k].motion_score(motion_window) for k in pair_keys]
         if use_ratio:
             metrics = []
+            has_baseline = []
             for (tx_mac, rx_mac), sigma in zip(pair_keys, sigmas):
-                base = max(baselines.get((tx_mac, rx_mac), 1e-3), 1e-6)
-                metrics.append(sigma / base)
-            # Anchor "no motion" at RATIO_FLOOR so the still-room
-            # baseline maps to black, and saturate at full_bright.
-            tints = [min(max(m - RATIO_FLOOR, 0.0) / span, 1.0) for m in metrics]
-            text_fmt = lambda m, s: f"{m:.2f}×"
+                base = baselines.get((tx_mac, rx_mac))
+                if base is None or base <= 0:
+                    # No (or zero) baseline for this link: don't fabricate
+                    # a 1e-3 divisor — that produced phantom huge ratios
+                    # and a saturated colormap. Render dim with a "—"
+                    # label so the missing baseline is visible.
+                    metrics.append(0.0)
+                    has_baseline.append(False)
+                else:
+                    metrics.append(sigma / base)
+                    has_baseline.append(True)
+            tints = [
+                0.0 if not ok else min(max(m - RATIO_FLOOR, 0.0) / span, 1.0)
+                for m, ok in zip(metrics, has_baseline)
+            ]
+            text_fmt = lambda m, s, ok: f"{m:.2f}×" if ok else "—"
         else:
             if sigmas:
                 running_max[0] = max(running_max[0] * 0.99, max(sigmas), 1e-3)
             tints = [min(s / running_max[0], 1.0) for s in sigmas]
             metrics = sigmas
-            text_fmt = lambda m, s: f"{s:.3f}"
-        for line, lbl, tint, m, s in zip(
-                line_artists, label_artists, tints, metrics, sigmas):
+            has_baseline = [True] * len(sigmas)
+            text_fmt = lambda m, s, ok: f"{s:.3f}"
+        for line, lbl, tint, m, s, ok in zip(
+                line_artists, label_artists, tints, metrics, sigmas, has_baseline):
             line.set_color(cmap(tint))
-            lbl.set_text(text_fmt(m, s))
+            lbl.set_text(text_fmt(m, s, ok))
         notes = []
         if unknown_rx:
             notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
