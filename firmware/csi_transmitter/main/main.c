@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "esp_idf_version.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_netif.h"
@@ -44,11 +45,22 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_TX_CHANNEL, WIFI_SECOND_CHAN_NONE));
 }
 
+// IDF 5.4+ changed the ESP-NOW send callback's first arg from `const
+// uint8_t *mac` to `const wifi_tx_info_t *info`. Pick the right
+// signature so the same source compiles on both 5.3 and 5.5.
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 4, 0)
+static void on_send_done(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+    (void)info;
+    (void)status;
+    xSemaphoreGive(s_send_complete);
+}
+#else
 static void on_send_done(const uint8_t *mac, esp_now_send_status_t status) {
     (void)mac;
     (void)status;
     xSemaphoreGive(s_send_complete);
 }
+#endif
 
 static void espnow_init(void) {
     s_send_complete = xSemaphoreCreateBinary();

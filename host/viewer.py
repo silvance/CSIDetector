@@ -49,9 +49,31 @@ class _SampleBuffer:
 
 
 def _reader_thread(source: str, buf: _SampleBuffer, stop: threading.Event) -> None:
+    # The single-stream viewer can only render one RX at a time. UDP
+    # sources tag samples with rx_id; we pin to the first one seen and
+    # drop the rest so two RXs' streams don't get mixed into one buffer
+    # (which would produce garbage). For the multi-RX case use `heatmap`
+    # or `view3d` instead.
+    pinned_rx: Optional[str] = None
+    dropped_other = 0
+    last_warn = 0.0
     for sample in csi_collector.open_source(source):
         if stop.is_set():
             break
+        if sample.rx_id is not None:
+            if pinned_rx is None:
+                pinned_rx = sample.rx_id
+                print(f"viewer: pinned to rx_id={pinned_rx} "
+                      f"(use `heatmap` or `view3d` for multi-RX)")
+            elif sample.rx_id != pinned_rx:
+                import time as _t
+                dropped_other += 1
+                now = _t.time()
+                if now - last_warn > 5.0:
+                    print(f"viewer: dropped {dropped_other} samples from "
+                          f"other RXs (showing only {pinned_rx})")
+                    last_warn = now
+                continue
         buf.push(sample)
 
 
@@ -82,8 +104,7 @@ def run_viewer(source: str, history: int = 500, motion_window: int = 50) -> int:
     )
     ax_heat.set_ylabel("active subcarrier")
     ax_heat.set_xlabel("samples (newest →)")
-    cbar = fig.colorbar(img, ax=ax_heat, label="|H| (dB)")
-    del cbar  # keep reference alive without lint warning
+    fig.colorbar(img, ax=ax_heat, label="|H| (dB)")
 
     score_line, = ax_score.plot([], [], color="tab:red")
     ax_score.set_xlim(0, history)
@@ -113,9 +134,11 @@ def run_viewer(source: str, history: int = 500, motion_window: int = 50) -> int:
         return img, score_line
 
     anim = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)
+    # `anim` is intentionally bound for the duration of plt.show(); without
+    # a live reference, matplotlib garbage-collects FuncAnimation and the
+    # animation freezes silently.
     try:
         plt.show()
     finally:
         stop.set()
-    del anim
     return 0

@@ -6,19 +6,22 @@ config CSI_RX_CHANNEL
     default 11
 
 config CSI_RX_FILTER_TX_MAC
-    string "Transmitter MAC filter (blank = accept all)"
+    string "Transmitter MAC filter(s) (blank = accept all)"
     default ""
     help
-        If set, only CSI samples whose source MAC matches this address
-        are emitted. Both forms are accepted:
+        Source-MAC allowlist. Only CSI samples whose source MAC matches
+        one of these addresses are emitted. Single MAC:
 
-            aa:bb:cc:dd:ee:ff   (as logged by the TX firmware at boot)
-            aabbccddeeff        (12 hex chars, no separators)
+            aa:bb:cc:dd:ee:ff
+            aabbccddeeff
 
-        Recommended once you know the transmitter MAC, to avoid mixing
-        CSI from neighboring traffic. If the value is non-empty but does
-        not parse, the receiver logs an error at boot and disables the
-        filter rather than silently passing everything.
+        Multiple MACs (multi-TX setups), comma- or semicolon-separated:
+
+            aa:bb:cc:dd:ee:ff, 11:22:33:44:55:66
+
+        Up to 4 MACs supported. If any token is malformed, the receiver
+        logs an error at boot and disables the filter rather than
+        silently passing partial filters.
 
 config CSI_RX_WIFI_SSID
     string "Hotspot SSID for UDP forwarding (blank = UART-only)"
@@ -35,17 +38,14 @@ config CSI_RX_WIFI_SSID
 config CSI_RX_WIFI_PASS
     string "Hotspot password"
     default ""
-    depends on CSI_RX_WIFI_SSID != ""
 
 config CSI_RX_HOST_IP
     string "Host IP address (UDP destination)"
     default "10.42.0.1"
-    depends on CSI_RX_WIFI_SSID != ""
 
 config CSI_RX_HOST_PORT
     int "Host UDP port"
     range 1 65535
     default 5566
-    depends on CSI_RX_WIFI_SSID != ""
 
 endmenu
