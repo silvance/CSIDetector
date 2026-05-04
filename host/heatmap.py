@@ -49,6 +49,37 @@ BADGE_FLASH_DURATION_S = 0.6
 # physically overlap. Cycles for >4 TXs.
 TX_LINESTYLES = ["-", "--", "-.", ":"]
 
+# In-app live recalibration: press [C], stand still, baseline gets
+# replaced from the current σ stream. Settle drains the rolling window
+# of any pre-press motion; record averages σ over a clean still period.
+CALIB_SETTLE_S = 5.0
+CALIB_RECORD_S = 15.0
+CALIB_DONE_FLASH_S = 2.0
+
+
+def _save_baselines_envelope(path: str,
+                             baselines: dict[tuple[str, str], float],
+                             settle_s: float, record_s: float,
+                             window: int,
+                             samples_per_link: dict[tuple[str, str], int]) -> None:
+    """Write the wrapped {_meta, links} envelope so _load_baselines reads it."""
+    import datetime
+    payload = {
+        "_meta": {
+            "format": 1,
+            "created": datetime.datetime.utcnow().isoformat() + "Z",
+            "source": "heatmap-live",
+            "settle": settle_s,
+            "record": record_s,
+            "window": window,
+            "samples_per_link": {f"{k[0]}|{k[1]}": n
+                                 for k, n in samples_per_link.items()},
+        },
+        "links": {f"{k[0]}|{k[1]}": v for k, v in baselines.items()},
+    }
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+
 
 @dataclass
 class _Node:
@@ -459,6 +490,41 @@ def run_heatmap(source: str, links_path: str,
         "MOTION": ("MOTION DETECTED", "#d94545"),
     }
 
+    # Live-recalibration state. Press [C] in the figure to start.
+    # Phases: IDLE → SETTLE → RECORD → DONE → IDLE.
+    calib = {
+        "phase": "IDLE",
+        "started": 0.0,
+        "samples": {k: [] for k in pair_keys},
+    }
+
+    def on_key(event):
+        if event.key not in ("c", "C"):
+            return
+        if not use_ratio:
+            print("heatmap: live recalibration requires --baselines on startup")
+            return
+        if calib["phase"] != "IDLE":
+            return
+        calib["phase"] = "SETTLE"
+        calib["started"] = time.monotonic()
+        calib["samples"] = {k: [] for k in pair_keys}
+        print(f"heatmap: live recalibration started "
+              f"(settle {CALIB_SETTLE_S:.0f}s, record {CALIB_RECORD_S:.0f}s) — stand still")
+
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    # Discoverability hint pinned to bottom-left.
+    if use_ratio:
+        fig.text(0.01, 0.01,
+                 "press [C] to recalibrate baselines from current still-room state",
+                 color="#888", fontsize=8, ha="left", va="bottom",
+                 family="monospace")
+    else:
+        fig.text(0.01, 0.01,
+                 "live recalibration disabled — start with --baselines to enable",
+                 color="#666", fontsize=8, ha="left", va="bottom",
+                 family="monospace")
+
     running_max = [1e-3]
     span = full_bright - RATIO_FLOOR
 
@@ -525,42 +591,107 @@ def run_heatmap(source: str, links_path: str,
             bar.set_height(r)
             bar.set_color("#d94545" if r < 0.5 else "#3a8fb7")
 
+        # Live recalibration tick. While not IDLE, the badge shows the
+        # calibration phase instead of the presence state.
+        phase = calib["phase"]
+        now_t = time.monotonic()
+        elapsed = now_t - calib["started"]
+        if phase == "SETTLE":
+            remain = max(0.0, CALIB_SETTLE_S - elapsed)
+            badge_text.set_text(f"CALIBRATING — STAND STILL — {remain:.0f}s")
+            patch = badge_text.get_bbox_patch()
+            patch.set_facecolor("#dca035")
+            patch.set_edgecolor("none")
+            patch.set_linewidth(0.0)
+            if elapsed >= CALIB_SETTLE_S:
+                calib["phase"] = "RECORD"
+                calib["started"] = now_t
+        elif phase == "RECORD":
+            for k, sigma in zip(pair_keys, sigmas):
+                if sigma > 0:
+                    calib["samples"][k].append(sigma)
+            remain = max(0.0, CALIB_RECORD_S - elapsed)
+            badge_text.set_text(f"CALIBRATING — RECORDING — {remain:.0f}s")
+            patch = badge_text.get_bbox_patch()
+            patch.set_facecolor("#1c7eb6")
+            patch.set_edgecolor("none")
+            patch.set_linewidth(0.0)
+            if elapsed >= CALIB_RECORD_S:
+                # Median (not mean) so a single transient spike doesn't
+                # poison a whole link's baseline.
+                updated = 0
+                samples_per_link: dict[tuple[str, str], int] = {}
+                for k, samples in calib["samples"].items():
+                    if len(samples) >= 5:
+                        baselines[k] = float(np.median(samples))
+                        samples_per_link[k] = len(samples)
+                        updated += 1
+                if baselines_path:
+                    try:
+                        _save_baselines_envelope(
+                            baselines_path, baselines,
+                            CALIB_SETTLE_S, CALIB_RECORD_S, motion_window,
+                            samples_per_link)
+                        print(f"heatmap: live-calibrated {updated} links "
+                              f"→ {baselines_path}")
+                    except OSError as e:
+                        print(f"heatmap: calibration done but save failed: {e}")
+                else:
+                    print(f"heatmap: live-calibrated {updated} links (in-memory only; "
+                          f"pass --baselines next time to persist)")
+                calib["phase"] = "DONE"
+                calib["started"] = now_t
+        elif phase == "DONE":
+            badge_text.set_text("BASELINE UPDATED")
+            patch = badge_text.get_bbox_patch()
+            patch.set_facecolor("#2faa55")
+            patch.set_edgecolor("white")
+            patch.set_linewidth(3.0)
+            if elapsed >= CALIB_DONE_FLASH_S:
+                calib["phase"] = "IDLE"
+                # Force the badge to re-evaluate against current state on
+                # the very next frame, not stay stuck on the green flash.
+                state_change_ts[0] = now_t
+
         # Update presence/motion badge using hysteresis on the median
         # link metric. Median (not max) so a single noisy link can't
         # drive the demo state; (not mean) so a few zeroed-out
-        # missing-baseline links don't drag the signal down.
-        if use_ratio:
-            valid = [m for m, ok in zip(metrics, has_baseline) if ok]
-        else:
-            valid = list(metrics)
-        if valid:
-            valid.sort()
-            mid = valid[len(valid) // 2]
-            prev = presence_state[0]
-            cur = prev
-            if cur == "INIT" and status.get("pkt_count", 0) > motion_window:
-                cur = "EMPTY" if mid < motion_enter else "MOTION"
-            elif cur == "EMPTY" and mid >= motion_enter:
-                cur = "MOTION"
-            elif cur == "MOTION" and mid <= motion_exit:
-                cur = "EMPTY"
-            if cur != prev:
-                state_change_ts[0] = time.monotonic()
-            presence_state[0] = cur
-            label, color = BADGE_STYLE[cur]
-            if cur != "INIT":
-                label = f"{label}   (median {mid:.2f}×)"
-            badge_text.set_text(label)
-            patch = badge_text.get_bbox_patch()
-            patch.set_facecolor(color)
-            # Brief flash on transition: white border + extra padding.
-            since_change = time.monotonic() - state_change_ts[0]
-            if since_change < BADGE_FLASH_DURATION_S:
-                patch.set_edgecolor("white")
-                patch.set_linewidth(3.0)
+        # missing-baseline links don't drag the signal down. Skipped
+        # while a calibration is in progress — the calib tick above
+        # owns the badge.
+        if calib["phase"] == "IDLE":
+            if use_ratio:
+                valid = [m for m, ok in zip(metrics, has_baseline) if ok]
             else:
-                patch.set_edgecolor("none")
-                patch.set_linewidth(0.0)
+                valid = list(metrics)
+            if valid:
+                valid.sort()
+                mid = valid[len(valid) // 2]
+                prev = presence_state[0]
+                cur = prev
+                if cur == "INIT" and status.get("pkt_count", 0) > motion_window:
+                    cur = "EMPTY" if mid < motion_enter else "MOTION"
+                elif cur == "EMPTY" and mid >= motion_enter:
+                    cur = "MOTION"
+                elif cur == "MOTION" and mid <= motion_exit:
+                    cur = "EMPTY"
+                if cur != prev:
+                    state_change_ts[0] = time.monotonic()
+                presence_state[0] = cur
+                label, color = BADGE_STYLE[cur]
+                if cur != "INIT":
+                    label = f"{label}   (median {mid:.2f}×)"
+                badge_text.set_text(label)
+                patch = badge_text.get_bbox_patch()
+                patch.set_facecolor(color)
+                # Brief flash on transition: white border + extra padding.
+                since_change = time.monotonic() - state_change_ts[0]
+                if since_change < BADGE_FLASH_DURATION_S:
+                    patch.set_edgecolor("white")
+                    patch.set_linewidth(3.0)
+                else:
+                    patch.set_edgecolor("none")
+                    patch.set_linewidth(0.0)
         notes = []
         # Reader-thread health on the title so a dead stream is obvious.
         if status.get("fatal_error"):
