@@ -49,10 +49,11 @@ BADGE_FLASH_DURATION_S = 0.6
 # physically overlap. Cycles for >4 TXs.
 TX_LINESTYLES = ["-", "--", "-.", ":"]
 
-# In-app live recalibration: press [C], stand still, baseline gets
-# replaced from the current σ stream. Settle drains the rolling window
-# of any pre-press motion; record averages σ over a clean still period.
-CALIB_SETTLE_S = 5.0
+# In-app live recalibration: press [C], leave the room, baseline gets
+# replaced from the current σ stream. Settle is sized to give the user
+# time to walk out (and for the rolling motion window to drain); record
+# averages σ over the still period that follows.
+CALIB_SETTLE_S = 20.0
 CALIB_RECORD_S = 15.0
 CALIB_DONE_FLASH_S = 2.0
 
@@ -279,7 +280,9 @@ def run_heatmap(source: str, links_path: str,
                 baselines_path: Optional[str] = None,
                 full_bright: float = DEFAULT_RATIO_FULL_BRIGHT,
                 motion_enter: float = 2.0,
-                motion_exit: float = 1.5) -> int:
+                motion_exit: float = 1.5,
+                calibrate_settle_s: float = CALIB_SETTLE_S,
+                calibrate_record_s: float = CALIB_RECORD_S) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     import matplotlib as mpl
@@ -509,14 +512,15 @@ def run_heatmap(source: str, links_path: str,
         calib["phase"] = "SETTLE"
         calib["started"] = time.monotonic()
         calib["samples"] = {k: [] for k in pair_keys}
-        print(f"heatmap: live recalibration started "
-              f"(settle {CALIB_SETTLE_S:.0f}s, record {CALIB_RECORD_S:.0f}s) — stand still")
+        print(f"heatmap: live recalibration started — leave the room "
+              f"(settle {calibrate_settle_s:.0f}s, record {calibrate_record_s:.0f}s)")
 
     fig.canvas.mpl_connect("key_press_event", on_key)
     # Discoverability hint pinned to bottom-left.
     if use_ratio:
         fig.text(0.01, 0.01,
-                 "press [C] to recalibrate baselines from current still-room state",
+                 f"press [C] to recalibrate — gives you {calibrate_settle_s:.0f}s to "
+                 f"leave the room, then records for {calibrate_record_s:.0f}s",
                  color="#888", fontsize=8, ha="left", va="bottom",
                  family="monospace")
     else:
@@ -597,26 +601,26 @@ def run_heatmap(source: str, links_path: str,
         now_t = time.monotonic()
         elapsed = now_t - calib["started"]
         if phase == "SETTLE":
-            remain = max(0.0, CALIB_SETTLE_S - elapsed)
-            badge_text.set_text(f"CALIBRATING — STAND STILL — {remain:.0f}s")
+            remain = max(0.0, calibrate_settle_s - elapsed)
+            badge_text.set_text(f"CALIBRATING — LEAVE THE ROOM — {remain:.0f}s")
             patch = badge_text.get_bbox_patch()
             patch.set_facecolor("#dca035")
             patch.set_edgecolor("none")
             patch.set_linewidth(0.0)
-            if elapsed >= CALIB_SETTLE_S:
+            if elapsed >= calibrate_settle_s:
                 calib["phase"] = "RECORD"
                 calib["started"] = now_t
         elif phase == "RECORD":
             for k, sigma in zip(pair_keys, sigmas):
                 if sigma > 0:
                     calib["samples"][k].append(sigma)
-            remain = max(0.0, CALIB_RECORD_S - elapsed)
+            remain = max(0.0, calibrate_record_s - elapsed)
             badge_text.set_text(f"CALIBRATING — RECORDING — {remain:.0f}s")
             patch = badge_text.get_bbox_patch()
             patch.set_facecolor("#1c7eb6")
             patch.set_edgecolor("none")
             patch.set_linewidth(0.0)
-            if elapsed >= CALIB_RECORD_S:
+            if elapsed >= calibrate_record_s:
                 # Median (not mean) so a single transient spike doesn't
                 # poison a whole link's baseline.
                 updated = 0
@@ -630,8 +634,8 @@ def run_heatmap(source: str, links_path: str,
                     try:
                         _save_baselines_envelope(
                             baselines_path, baselines,
-                            CALIB_SETTLE_S, CALIB_RECORD_S, motion_window,
-                            samples_per_link)
+                            calibrate_settle_s, calibrate_record_s,
+                            motion_window, samples_per_link)
                         print(f"heatmap: live-calibrated {updated} links "
                               f"→ {baselines_path}")
                     except OSError as e:
