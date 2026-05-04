@@ -101,3 +101,44 @@ class Localizer:
         flat = grid.argmax()
         iy, ix = np.unravel_index(flat, grid.shape)
         return float(self.x_axis[ix]), float(self.y_axis[iy]), float(grid[iy, ix])
+
+    def topk_local_maxima(self, grid: np.ndarray, k: int,
+                          min_separation_m: float = 1.0
+                          ) -> list[tuple[float, float, float]]:
+        """Up to k local maxima with non-max suppression.
+
+        Iteratively picks the brightest cell, blanks out a disk of
+        radius `min_separation_m` around it, repeats. Returned in
+        descending value order; fewer than k returned if remaining
+        peaks fall to zero. Used by the multi-pin viewer so two
+        people don't collapse into one phantom pin between them.
+        """
+        if k <= 0:
+            return []
+        # Work on a copy — caller may want to display the grid afterwards.
+        scratch = grid.copy()
+        peaks: list[tuple[float, float, float]] = []
+        # Pre-compute the suppression mask offsets in cell units.
+        # The grid step is uniform per axis but x_axis and y_axis may
+        # have slightly different deltas after np.linspace; pick the
+        # smaller so the mask never under-suppresses.
+        dx = self.x_axis[1] - self.x_axis[0] if self.x_axis.size > 1 else 1.0
+        dy = self.y_axis[1] - self.y_axis[0] if self.y_axis.size > 1 else 1.0
+        step = float(min(dx, dy))
+        radius_cells = max(1, int(np.ceil(min_separation_m / step)))
+        for _ in range(k):
+            iy, ix = np.unravel_index(scratch.argmax(), scratch.shape)
+            v = float(scratch[iy, ix])
+            if v <= 0.0:
+                break
+            peaks.append((float(self.x_axis[ix]),
+                          float(self.y_axis[iy]),
+                          v))
+            # Zero a disk around the peak so the next argmax can't land
+            # inside the same blob.
+            y_lo, y_hi = max(0, iy - radius_cells), min(scratch.shape[0], iy + radius_cells + 1)
+            x_lo, x_hi = max(0, ix - radius_cells), min(scratch.shape[1], ix + radius_cells + 1)
+            yy, xx = np.ogrid[y_lo:y_hi, x_lo:x_hi]
+            disk = ((yy - iy) ** 2 + (xx - ix) ** 2) <= (radius_cells ** 2)
+            scratch[y_lo:y_hi, x_lo:x_hi][disk] = 0.0
+        return peaks

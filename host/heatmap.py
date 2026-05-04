@@ -19,6 +19,7 @@ from __future__ import annotations
 import collections
 import json
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -81,10 +82,14 @@ class _LinkBuffer:
         # Pre-mask buffer of raw amplitudes for the probe phase.
         self._probe: list[np.ndarray] = []
         self._lock = threading.Lock()
+        # Wallclock of the most recent successfully-pushed sample, used
+        # by the viewer to flag dead links in the title bar.
+        self.last_push_ts: float = 0.0
 
     def push(self, sample: csi_collector.CSISample) -> None:
         amp = sample.amplitude
         with self._lock:
+            self.last_push_ts = time.monotonic()
             if self._idx is None:
                 self._probe.append(amp)
                 if len(self._probe) < self.MASK_PROBE:
@@ -126,43 +131,78 @@ def _reader_thread(source: str,
                    tx_macs: set[str],
                    unknown_rx: set[str],
                    unknown_tx: set[str],
-                   stop: threading.Event) -> None:
-    for sample in csi_collector.open_source(source):
-        if stop.is_set():
-            break
-        if sample.rx_id is None:
-            continue
-        rx = sample.rx_id.lower()
-        tx = sample.mac.lower()
-        if tx not in tx_macs:
-            unknown_tx.add(tx)
-            continue
-        key = (tx, rx)
-        buf = buffers.get(key)
-        if buf is None:
-            unknown_rx.add(rx)
-            continue
-        buf.push(sample)
+                   stop: threading.Event,
+                   status: dict) -> None:
+    # Whole loop is wrapped in try/except so a malformed packet, a
+    # transient socket error, or a numpy edge case can't silently kill
+    # the thread (and freeze the viewer). The exception is recorded
+    # in `status` so the viewer can surface it in the title bar.
+    try:
+        for sample in csi_collector.open_source(source):
+            if stop.is_set():
+                break
+            try:
+                if sample.rx_id is None:
+                    continue
+                rx = sample.rx_id.lower()
+                tx = sample.mac.lower()
+                if tx not in tx_macs:
+                    unknown_tx.add(tx)
+                    continue
+                key = (tx, rx)
+                buf = buffers.get(key)
+                if buf is None:
+                    unknown_rx.add(rx)
+                    continue
+                buf.push(sample)
+                status["last_packet_ts"] = time.monotonic()
+                status["pkt_count"] = status.get("pkt_count", 0) + 1
+            except Exception as exc:
+                # One bad sample shouldn't kill the stream. Track the
+                # count so a steady stream of garbage is visible.
+                status["bad_samples"] = status.get("bad_samples", 0) + 1
+                status["last_error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        # Source itself died (socket closed, file ended, etc).
+        status["fatal_error"] = f"{type(exc).__name__}: {exc}"
 
 
 def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], float]:
     """Read baselines.json and return per-(tx_mac, rx_mac) values.
 
-    Two formats accepted:
-      - New: keys are "tx_mac|rx_mac" → float (one entry per link).
-      - Legacy: keys are "rx_mac" → float (per-RX). Replicated across
-        every TX from that RX so old files still work; logged as
-        "applying same baseline to multiple TXs from <RX>" so users
-        know to recalibrate when accuracy matters.
+    Three formats accepted (in order of preference):
+      - Wrapped: {"_meta": {...}, "links": {"tx|rx": float, ...}}.
+        Metadata enables stale-file warnings.
+      - Flat link-keyed: {"tx_mac|rx_mac": float, ...}.
+      - Legacy per-RX: {"rx_mac": float, ...}. Replicated across every
+        TX from that RX so old files still work; logged so users know
+        to recalibrate when accuracy matters.
     """
     if not path:
         return {}
+    import os
     with open(path) as f:
         raw = json.load(f)
+    meta = raw.get("_meta") if isinstance(raw, dict) else None
+    if meta is not None and "links" in raw:
+        link_map = raw["links"]
+        # Stale-file warning: file mtime > 1 hour suggests environment
+        # has likely drifted enough that the baselines aren't valid.
+        try:
+            age_s = time.time() - os.path.getmtime(path)
+            if age_s > 3600:
+                age_h = age_s / 3600.0
+                print(f"heatmap: WARNING — baselines.json is {age_h:.1f}h old; "
+                      f"consider re-running `calibrate-links` (RF environments "
+                      f"drift on this timescale).")
+        except OSError:
+            pass
+    else:
+        link_map = raw
     out: dict[tuple[str, str], float] = {}
     legacy_rx_macs: set[str] = set()
     tx_macs = [t.mac for t in txs]
-    for k, v in raw.items():
+    for k, v in link_map.items():
         k = k.lower()
         if "|" in k:
             tx, rx = k.split("|", 1)
@@ -206,10 +246,11 @@ def run_heatmap(source: str, links_path: str,
     baselines = _load_baselines(baselines_path, txs, rxs)
     unknown_rx: set[str] = set()
     unknown_tx: set[str] = set()
+    status: dict = {"pkt_count": 0, "bad_samples": 0, "last_packet_ts": 0.0}
     stop = threading.Event()
     threading.Thread(target=_reader_thread,
                      args=(source, buffers, tx_macs,
-                           unknown_rx, unknown_tx, stop),
+                           unknown_rx, unknown_tx, stop, status),
                      daemon=True).start()
 
     fig, ax = plt.subplots(figsize=(9, 7))
@@ -313,12 +354,41 @@ def run_heatmap(source: str, links_path: str,
             line.set_color(cmap(tint))
             lbl.set_text(text_fmt(m, s, ok))
         notes = []
+        # Reader-thread health on the title so a dead stream is obvious.
+        if status.get("fatal_error"):
+            notes.append(f"READER DIED: {status['fatal_error']}")
+        else:
+            now = time.monotonic()
+            since = now - status.get("last_packet_ts", 0.0)
+            if status.get("last_packet_ts", 0.0) == 0.0:
+                notes.append("waiting for first packet…")
+            elif since > 2.0:
+                notes.append(f"no packets for {since:.1f}s")
+        if status.get("bad_samples", 0):
+            notes.append(f"{status['bad_samples']} bad samples")
+        # Per-link staleness: any link whose last push is > 3s old is
+        # almost certainly dead (an associated RX that stopped sending
+        # this particular TX, e.g. due to RF, or a TX that died). Names
+        # them by label, not MAC.
+        now = time.monotonic()
+        link_label = {(t.mac, r.mac): f"{t.label}↔{r.label}" for t in txs for r in rxs}
+        dead = []
+        for k, buf in buffers.items():
+            ts = buf.last_push_ts
+            if ts == 0.0 or (now - ts) > 3.0:
+                dead.append(link_label.get(k, "?"))
+        if dead and status.get("pkt_count", 0) > 0:
+            # Only flag dead links once at least some packets have arrived
+            # — pre-startup, every link looks dead.
+            notes.append(f"dead link(s): {', '.join(sorted(dead))}")
         if unknown_rx:
             notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
         if unknown_tx:
             notes.append(f"unknown TX: {', '.join(sorted(unknown_tx))}")
         if notes:
             ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
+        else:
+            ax.set_title("")
         return [*line_artists, *label_artists]
 
     anim = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)

@@ -15,6 +15,7 @@ from __future__ import annotations
 import collections
 import json
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -113,37 +114,64 @@ def _reader_thread(source: str,
                    tx_macs: set[str],
                    unknown_rx: set[str],
                    unknown_tx: set[str],
-                   stop: threading.Event) -> None:
-    for sample in csi_collector.open_source(source):
-        if stop.is_set():
-            break
-        if sample.rx_id is None:
-            continue
-        rx = sample.rx_id.lower()
-        tx = sample.mac.lower()
-        if tx not in tx_macs:
-            unknown_tx.add(tx)
-            continue
-        key = (tx, rx)
-        buf = buffers.get(key)
-        if buf is None:
-            unknown_rx.add(rx)
-            continue
-        buf.push(sample)
+                   stop: threading.Event,
+                   status: dict) -> None:
+    # See heatmap._reader_thread — same try/except pattern. One bad
+    # packet shouldn't kill the thread; a dead source should be visible.
+    try:
+        for sample in csi_collector.open_source(source):
+            if stop.is_set():
+                break
+            try:
+                if sample.rx_id is None:
+                    continue
+                rx = sample.rx_id.lower()
+                tx = sample.mac.lower()
+                if tx not in tx_macs:
+                    unknown_tx.add(tx)
+                    continue
+                key = (tx, rx)
+                buf = buffers.get(key)
+                if buf is None:
+                    unknown_rx.add(rx)
+                    continue
+                buf.push(sample)
+                status["last_packet_ts"] = time.monotonic()
+                status["pkt_count"] = status.get("pkt_count", 0) + 1
+            except Exception as exc:
+                status["bad_samples"] = status.get("bad_samples", 0) + 1
+                status["last_error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        status["fatal_error"] = f"{type(exc).__name__}: {exc}"
 
 
 def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], float]:
-    """Read baselines.json. Accepts either keys "tx_mac|rx_mac" (new,
-    per-link) or "rx_mac" (legacy, per-RX, fanned out to every TX).
+    """Read baselines.json. Accepts the wrapped {_meta, links} envelope,
+    flat keys "tx_mac|rx_mac" (per-link), or legacy "rx_mac" keys (per-RX,
+    fanned out to every TX).
     """
     if not path:
         return {}
+    import os
     with open(path) as f:
         raw = json.load(f)
+    if isinstance(raw, dict) and "links" in raw and "_meta" in raw:
+        link_map = raw["links"]
+        try:
+            age_s = time.time() - os.path.getmtime(path)
+            if age_s > 3600:
+                age_h = age_s / 3600.0
+                print(f"view3d: WARNING — baselines.json is {age_h:.1f}h old; "
+                      f"re-run `calibrate-links` if motion looks off "
+                      f"(RF drift on this timescale is common).")
+        except OSError:
+            pass
+    else:
+        link_map = raw
     out: dict[tuple[str, str], float] = {}
     legacy = 0
     tx_macs = [t.mac for t in txs]
-    for k, v in raw.items():
+    for k, v in link_map.items():
         k = k.lower()
         if "|" in k:
             tx, rx = k.split("|", 1)
@@ -163,7 +191,10 @@ def run_viewer3d(source: str, links_path: str,
                  history: int = 500, motion_window: int = 50,
                  baselines_path: Optional[str] = None,
                  grid_step: float = 0.1, link_sigma_m: float = 0.3,
-                 wall_height_m: float = 2.5) -> int:
+                 wall_height_m: float = 2.5,
+                 max_pins: int = 3,
+                 pin_separation_m: float = 1.0,
+                 pin_smoothing: float = 0.4) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     import matplotlib as mpl
@@ -186,10 +217,11 @@ def run_viewer3d(source: str, links_path: str,
     }
     unknown_rx: set[str] = set()
     unknown_tx: set[str] = set()
+    status: dict = {"pkt_count": 0, "bad_samples": 0, "last_packet_ts": 0.0}
     stop = threading.Event()
     threading.Thread(target=_reader_thread,
                      args=(source, buffers, tx_macs,
-                           unknown_rx, unknown_tx, stop),
+                           unknown_rx, unknown_tx, stop, status),
                      daemon=True).start()
 
     fig = plt.figure(figsize=(9, 7))
@@ -230,11 +262,21 @@ def run_viewer3d(source: str, links_path: str,
                    depthshade=False)
         ax.text(r.x, r.y, 0.05, r.label, color="tab:blue", fontsize=8)
 
-    # Person pin: vertical line from floor to ~head height at the argmax.
-    person_line, = ax.plot([0, 0], [0, 0], [0, 1.7], color="tab:red",
-                            linewidth=3, alpha=0.0)
-    person_dot, = ax.plot([0], [0], [1.7], "o", color="tab:red", markersize=10,
-                           alpha=0.0)
+    # Up to `max_pins` person pins (one per detected local maximum
+    # after non-max suppression). Each pin keeps its own EMA-smoothed
+    # position so it doesn't chatter cell-to-cell on a noisy grid.
+    pin_lines = []
+    pin_dots = []
+    pin_state: list[Optional[tuple[float, float]]] = [None] * max_pins
+    PIN_PALETTE = ["tab:red", "tab:cyan", "tab:green", "tab:purple", "tab:olive"]
+    for i in range(max_pins):
+        c = PIN_PALETTE[i % len(PIN_PALETTE)]
+        line, = ax.plot([0, 0], [0, 0], [0, 1.7], color=c,
+                        linewidth=3, alpha=0.0)
+        dot, = ax.plot([0], [0], [1.7], "o", color=c, markersize=10,
+                       alpha=0.0)
+        pin_lines.append(line)
+        pin_dots.append(dot)
 
     bbox_min = polygon.min(axis=0)
     bbox_max = polygon.max(axis=0)
@@ -279,25 +321,54 @@ def run_viewer3d(source: str, links_path: str,
         # frame is the documented workaround. Cheap at this grid size.
         surf.set_facecolors(cmap(np.clip(norm, 0, 1)).reshape(-1, 4))
 
-        argx, argy, argv = loc.argmax_xy(grid)
-        normv = argv / running_max[0]
-        if normv > PIN_THRESHOLD:
-            person_line.set_data_3d([argx, argx], [argy, argy], [0, 1.7])
-            person_dot.set_data_3d([argx], [argy], [1.7])
-            person_line.set_alpha(min(normv, 1.0))
-            person_dot.set_alpha(min(normv, 1.0))
-        else:
-            person_line.set_alpha(0.0)
-            person_dot.set_alpha(0.0)
+        peaks = loc.topk_local_maxima(grid, max_pins,
+                                      min_separation_m=pin_separation_m)
+        # Render up to max_pins peaks above PIN_THRESHOLD with EMA-smoothed
+        # positions so pins don't chatter cell-to-cell.
+        alpha = pin_smoothing
+        for i, (line, dot) in enumerate(zip(pin_lines, pin_dots)):
+            if i < len(peaks):
+                px, py, pv = peaks[i]
+                normv = pv / running_max[0]
+                if normv > PIN_THRESHOLD:
+                    prev = pin_state[i]
+                    if prev is None:
+                        sx, sy = px, py
+                    else:
+                        sx = alpha * px + (1.0 - alpha) * prev[0]
+                        sy = alpha * py + (1.0 - alpha) * prev[1]
+                    pin_state[i] = (sx, sy)
+                    line.set_data_3d([sx, sx], [sy, sy], [0, 1.7])
+                    dot.set_data_3d([sx], [sy], [1.7])
+                    line.set_alpha(min(normv, 1.0))
+                    dot.set_alpha(min(normv, 1.0))
+                    continue
+            # No peak (or below threshold) for this pin slot.
+            pin_state[i] = None
+            line.set_alpha(0.0)
+            dot.set_alpha(0.0)
 
         notes = []
+        if status.get("fatal_error"):
+            notes.append(f"READER DIED: {status['fatal_error']}")
+        else:
+            now = time.monotonic()
+            since = now - status.get("last_packet_ts", 0.0)
+            if status.get("last_packet_ts", 0.0) == 0.0:
+                notes.append("waiting for first packet…")
+            elif since > 2.0:
+                notes.append(f"no packets for {since:.1f}s")
+        if status.get("bad_samples", 0):
+            notes.append(f"{status['bad_samples']} bad samples")
         if unknown_rx:
             notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
         if unknown_tx:
             notes.append(f"unknown TX: {', '.join(sorted(unknown_tx))}")
         if notes:
             ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
-        return [surf, person_line, person_dot]
+        else:
+            ax.set_title("")
+        return [surf, *pin_lines, *pin_dots]
 
     # `anim` is intentionally bound for the duration of plt.show(); without
     # a live reference, matplotlib garbage-collects FuncAnimation and the
