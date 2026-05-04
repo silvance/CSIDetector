@@ -1,0 +1,14 @@
+CONFIG_IDF_TARGET="esp32c5"
+
+# Console on UART0 + native USB-Serial-JTAG mirror, same as csi_transmitter:
+# every CYD-style board has a USB port for power; whichever console
+# the user has wired up will see logs.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# Networking the same way csi_receiver expects: STA mode, IPv4 only.
+CONFIG_LWIP_IPV4=y
+CONFIG_LWIP_IPV6=n
+CONFIG_FREERTOS_HZ=1000
+CONFIG_ESP_TASK_WDT_INIT=n
+CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
