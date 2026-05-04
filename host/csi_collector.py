@@ -107,10 +107,10 @@ def iter_serial(port: str, baud: int = 921600) -> Iterator[CSISample]:
             raw = ser.readline()
             if not raw:
                 continue
-            try:
-                line = raw.decode("ascii", errors="replace")
-            except UnicodeDecodeError:
-                continue
+            # errors="replace" never raises; the previous UnicodeDecodeError
+            # arm was dead. Garbled bytes become U+FFFD and parse_line
+            # rejects them on the CSV/JSON parse below.
+            line = raw.decode("ascii", errors="replace")
             sample = parse_line(line)
             if sample is not None:
                 yield sample
