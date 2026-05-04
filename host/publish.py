@@ -94,10 +94,19 @@ def run_publisher(source: str, links_path: str,
                 continue
             next_emit = now + period
 
-            # Compute per-link motion ratios.
+            # Compute per-link motion ratios + packet rates. Filter out
+            # links whose pkt rate is far below the median: their σ
+            # estimate is dominated by noise variance, not real motion,
+            # and a flaky receiver would otherwise spoof MOTION when the
+            # other links all read ~1×.
             sigmas = [buffers[k].motion_score(motion_window) for k in pair_keys]
+            rates = [buffers[k].packet_rate() for k in pair_keys]
+            rate_thresh = max(_hm.MIN_LINK_HZ_FLOOR,
+                              _hm.MIN_LINK_HZ_FRAC * float(np.median(rates)))
             metrics = []
-            for (tx_mac, rx_mac), sigma in zip(pair_keys, sigmas):
+            for (tx_mac, rx_mac), sigma, r in zip(pair_keys, sigmas, rates):
+                if r < rate_thresh:
+                    continue
                 if use_ratio:
                     base = baselines.get((tx_mac, rx_mac))
                     if base is None or base <= 0:

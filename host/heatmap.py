@@ -49,6 +49,14 @@ BADGE_FLASH_DURATION_S = 0.6
 # physically overlap. Cycles for >4 TXs.
 TX_LINESTYLES = ["-", "--", "-.", ":"]
 
+# Aggregator filter: links whose packet rate is far below the median
+# rate are unreliable (a tiny number of samples in the σ window means
+# motion_score is mostly noise variance, not actual motion). Exclude
+# them from the percentile aggregator so a flaky receiver can't spoof
+# MOTION while every healthy link reads ~1×.
+MIN_LINK_HZ_FLOOR = 1.0   # absolute floor: <1 pkt/s is treated as dead
+MIN_LINK_HZ_FRAC = 0.3    # must clear 30% of the median rate to count
+
 # In-app live recalibration: press [C], leave the room, baseline gets
 # replaced from the current σ stream. Settle is sized to give the user
 # time to walk out (and for the rolling motion window to drain); record
@@ -668,10 +676,15 @@ def run_heatmap(source: str, links_path: str,
         # calibration is in progress — the calib tick above owns the
         # badge.
         if calib["phase"] == "IDLE":
+            # Filter out links whose pkt rate is far below the others —
+            # their σ estimate is dominated by noise variance, not motion.
+            rate_thresh = max(MIN_LINK_HZ_FLOOR,
+                              MIN_LINK_HZ_FRAC * float(np.median(rates)))
             if use_ratio:
-                valid = [m for m, ok in zip(metrics, has_baseline) if ok]
+                valid = [m for m, ok, r in zip(metrics, has_baseline, rates)
+                         if ok and r >= rate_thresh]
             else:
-                valid = list(metrics)
+                valid = [m for m, r in zip(metrics, rates) if r >= rate_thresh]
             if valid:
                 agg = float(np.quantile(valid, motion_quantile))
                 prev = presence_state[0]
