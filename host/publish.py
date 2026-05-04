@@ -52,6 +52,8 @@ def run_publisher(source: str, links_path: str,
                   history: int = 500, motion_window: int = 50,
                   motion_enter: float = 2.0, motion_exit: float = 1.5,
                   motion_quantile: float = 0.75,
+                  motion_max_enter: float = 3.5,
+                  motion_max_exit: float = 2.5,
                   publish_hz: float = 5.0,
                   verbose: bool = False) -> int:
     """Listen for CSI samples, compute presence state, broadcast UDP to C5."""
@@ -94,10 +96,19 @@ def run_publisher(source: str, links_path: str,
                 continue
             next_emit = now + period
 
-            # Compute per-link motion ratios.
+            # Compute per-link motion ratios + packet rates. Filter out
+            # links whose pkt rate is far below the median: their σ
+            # estimate is dominated by noise variance, not real motion,
+            # and a flaky receiver would otherwise spoof MOTION when the
+            # other links all read ~1×.
             sigmas = [buffers[k].motion_score(motion_window) for k in pair_keys]
+            rates = [buffers[k].packet_rate() for k in pair_keys]
+            rate_thresh = max(_hm.MIN_LINK_HZ_FLOOR,
+                              _hm.MIN_LINK_HZ_FRAC * float(np.median(rates)))
             metrics = []
-            for (tx_mac, rx_mac), sigma in zip(pair_keys, sigmas):
+            for (tx_mac, rx_mac), sigma, r in zip(pair_keys, sigmas, rates):
+                if r < rate_thresh:
+                    continue
                 if use_ratio:
                     base = baselines.get((tx_mac, rx_mac))
                     if base is None or base <= 0:
@@ -113,21 +124,28 @@ def run_publisher(source: str, links_path: str,
                 agg = 0.0
                 mx = 0.0
 
-            # Hysteresis state machine. Stays in INIT until enough packets
-            # have arrived for the motion-σ window to be meaningful.
+            # Hysteresis state machine with two OR'd entry conditions:
+            # quartile-of-links elevated OR a single link very loud.
+            # Exit requires both to drop (gives proper hysteresis on
+            # both ladders simultaneously).
+            q_motion = agg >= motion_enter
+            mx_motion = mx >= motion_max_enter
+            q_empty = agg <= motion_exit
+            mx_empty = mx <= motion_max_exit
             new_state = state
             if state == STATE_INIT and status.get("pkt_count", 0) > motion_window:
-                new_state = STATE_EMPTY if agg < motion_enter else STATE_MOTION
-            elif state == STATE_EMPTY and agg >= motion_enter:
+                new_state = STATE_MOTION if (q_motion or mx_motion) else STATE_EMPTY
+            elif state == STATE_EMPTY and (q_motion or mx_motion):
                 new_state = STATE_MOTION
-            elif state == STATE_MOTION and agg <= motion_exit:
+            elif state == STATE_MOTION and (q_empty and mx_empty):
                 new_state = STATE_EMPTY
             if new_state != state:
                 state_changes += 1
                 if verbose or True:   # always log transitions; they're rare
                     print(f"{csi_collector.now_iso()} {STATE_NAMES[state]} -> "
                           f"{STATE_NAMES[new_state]} "
-                          f"(p{motion_quantile*100:.0f} {agg:.2f}×)",
+                          f"(p{motion_quantile*100:.0f} {agg:.2f}×, "
+                          f"max {mx:.2f}×)",
                           flush=True)
                 state = new_state
 
