@@ -186,6 +186,8 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
                                motion_enter=args.motion_enter,
                                motion_exit=args.motion_exit,
                                motion_quantile=args.motion_quantile,
+                               motion_max_enter=args.motion_max_enter,
+                               motion_max_exit=args.motion_max_exit,
                                calibrate_settle_s=args.calibrate_settle,
                                calibrate_record_s=args.calibrate_record)
 
@@ -199,6 +201,8 @@ def cmd_publish(args: argparse.Namespace) -> int:
         history=args.history, motion_window=args.window,
         motion_enter=args.motion_enter, motion_exit=args.motion_exit,
         motion_quantile=args.motion_quantile,
+        motion_max_enter=args.motion_max_enter,
+        motion_max_exit=args.motion_max_exit,
         publish_hz=args.hz, verbose=args.verbose,
     )
 
@@ -403,6 +407,15 @@ def build_parser() -> argparse.ArgumentParser:
                          "MOTION/EMPTY (default 0.75). 0.5 = strict median "
                          "(misses partial-fan motion); 0.5–0.9 trades "
                          "sensitivity for false-positive resistance.")
+    hm.add_argument("--motion-max-enter", type=float, default=3.5,
+                    help="single-link ratio above which MOTION fires "
+                         "regardless of the quantile (default 3.5×). "
+                         "Catches body-on-LOS motion that lights up only "
+                         "one link while the rest stay near 1×.")
+    hm.add_argument("--motion-max-exit", type=float, default=2.5,
+                    help="single-link ratio below which the max-trigger "
+                         "ladder stops voting MOTION (default 2.5×). "
+                         "Hysteresis paired with --motion-max-enter.")
     hm.add_argument("--calibrate-settle", type=float, default=20.0,
                     help="seconds you have to leave the room after pressing [C] "
                          "in the heatmap window before live recalibration starts "
@@ -473,6 +486,12 @@ def build_parser() -> argparse.ArgumentParser:
     pub.add_argument("--motion-quantile", type=float, default=0.75,
                      help="quantile of per-link ratios used to decide MOTION/EMPTY "
                           "(default 0.75; same default as the heatmap).")
+    pub.add_argument("--motion-max-enter", type=float, default=3.5,
+                     help="single-link ratio above which MOTION fires "
+                          "regardless of the quantile (default 3.5×).")
+    pub.add_argument("--motion-max-exit", type=float, default=2.5,
+                     help="single-link ratio below which the max-trigger "
+                          "ladder stops voting MOTION (default 2.5×).")
     pub.add_argument("--verbose", action="store_true")
     pub.set_defaults(func=cmd_publish)
 

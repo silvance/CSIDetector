@@ -290,6 +290,8 @@ def run_heatmap(source: str, links_path: str,
                 motion_enter: float = 2.0,
                 motion_exit: float = 1.5,
                 motion_quantile: float = 0.75,
+                motion_max_enter: float = 3.5,
+                motion_max_exit: float = 2.5,
                 calibrate_settle_s: float = CALIB_SETTLE_S,
                 calibrate_record_s: float = CALIB_RECORD_S) -> int:
     import matplotlib.pyplot as plt
@@ -667,14 +669,16 @@ def run_heatmap(source: str, links_path: str,
                 state_change_ts[0] = now_t
 
         # Update presence/motion badge using hysteresis on a per-link
-        # ratio quantile. Median (50%) misses partial-fan motion: a
-        # body walking through a room typically lights up only the
-        # 2-3 LOS-adjacent links, so 5+ links stay quiet and the
-        # median sits below motion_enter. The 75th percentile (default)
-        # fires when ~25% of links agree something's going on, while
-        # still rejecting a single freak-noisy link. Skipped while a
-        # calibration is in progress — the calib tick above owns the
-        # badge.
+        # ratio aggregator. Two conditions OR'd together so we catch
+        # both kinds of motion:
+        #   - Partial-fan: 2-3 links light up moderately. p_quantile
+        #     captures this; a single freak link can't drag it past
+        #     motion_enter.
+        #   - Single-LOS: one link blazes (e.g. body standing on its
+        #     line-of-sight) while the rest stay near 1×. The max
+        #     threshold catches this case where the percentile alone
+        #     would dismiss it as outlier noise.
+        # Exit requires BOTH conditions to drop (and gives hysteresis).
         if calib["phase"] == "IDLE":
             # Filter out links whose pkt rate is far below the others —
             # their σ estimate is dominated by noise variance, not motion.
@@ -686,21 +690,28 @@ def run_heatmap(source: str, links_path: str,
             else:
                 valid = [m for m, r in zip(metrics, rates) if r >= rate_thresh]
             if valid:
-                agg = float(np.quantile(valid, motion_quantile))
+                agg_q = float(np.quantile(valid, motion_quantile))
+                agg_mx = float(max(valid))
+                q_motion = agg_q >= motion_enter
+                mx_motion = agg_mx >= motion_max_enter
+                q_empty = agg_q <= motion_exit
+                mx_empty = agg_mx <= motion_max_exit
                 prev = presence_state[0]
                 cur = prev
                 if cur == "INIT" and status.get("pkt_count", 0) > motion_window:
-                    cur = "EMPTY" if agg < motion_enter else "MOTION"
-                elif cur == "EMPTY" and agg >= motion_enter:
+                    cur = "MOTION" if (q_motion or mx_motion) else "EMPTY"
+                elif cur == "EMPTY" and (q_motion or mx_motion):
                     cur = "MOTION"
-                elif cur == "MOTION" and agg <= motion_exit:
+                elif cur == "MOTION" and (q_empty and mx_empty):
                     cur = "EMPTY"
                 if cur != prev:
                     state_change_ts[0] = time.monotonic()
                 presence_state[0] = cur
                 label, color = BADGE_STYLE[cur]
                 if cur != "INIT":
-                    label = f"{label}   (p{motion_quantile*100:.0f} {agg:.2f}×)"
+                    label = (f"{label}   "
+                             f"(p{motion_quantile*100:.0f} {agg_q:.2f}×, "
+                             f"max {agg_mx:.2f}×)")
                 badge_text.set_text(label)
                 patch = badge_text.get_bbox_patch()
                 patch.set_facecolor(color)
