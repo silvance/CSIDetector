@@ -191,6 +191,7 @@ def run_viewer3d(source: str, links_path: str,
                  history: int = 500, motion_window: int = 50,
                  baselines_path: Optional[str] = None,
                  grid_step: float = 0.1, link_sigma_m: float = 0.3,
+                 node_exclusion_m: float = 0.5,
                  wall_height_m: float = 2.5,
                  max_pins: int = 3,
                  pin_separation_m: float = 1.0,
@@ -206,7 +207,8 @@ def run_viewer3d(source: str, links_path: str,
     rx_pos = {r.mac: np.array([r.x, r.y]) for r in rxs}
 
     loc = localize.Localizer(polygon, tx_pos, rx_pos,
-                             grid_step=grid_step, link_sigma_m=link_sigma_m)
+                             grid_step=grid_step, link_sigma_m=link_sigma_m,
+                             node_exclusion_m=node_exclusion_m)
 
     # baselines.json supports two key formats; see _load_baselines below.
     baselines = _load_baselines(baselines_path, txs, rxs)
