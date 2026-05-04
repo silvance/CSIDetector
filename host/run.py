@@ -184,7 +184,9 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
                                baselines_path=args.baselines,
                                full_bright=args.full_bright,
                                motion_enter=args.motion_enter,
-                               motion_exit=args.motion_exit)
+                               motion_exit=args.motion_exit,
+                               calibrate_settle_s=args.calibrate_settle,
+                               calibrate_record_s=args.calibrate_record)
 
 
 def cmd_publish(args: argparse.Namespace) -> int:
@@ -394,6 +396,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="median per-link ratio below which the room is "
                          "declared EMPTY (default 1.5×). Hysteresis between "
                          "exit and enter prevents the badge from flickering.")
+    hm.add_argument("--calibrate-settle", type=float, default=20.0,
+                    help="seconds you have to leave the room after pressing [C] "
+                         "in the heatmap window before live recalibration starts "
+                         "recording (default 20).")
+    hm.add_argument("--calibrate-record", type=float, default=15.0,
+                    help="seconds of still-room σ recorded after the settle "
+                         "window during live recalibration (default 15).")
     hm.set_defaults(func=cmd_heatmap)
 
     v3 = sub.add_parser("view3d", help="2.5D room view: floor heatmap + person pin")
