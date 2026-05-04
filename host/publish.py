@@ -1,7 +1,7 @@
 """Host-side presence/motion publisher.
 
 Listens to the same CSI UDP feed as `heatmap` / `view3d`, runs the
-median-ratio + hysteresis logic from heatmap.py, and broadcasts a small
+quantile-ratio + hysteresis logic from heatmap.py, and broadcasts a small
 state packet to a target IP:port (e.g. an ESP32-C5 with a screen
 running on the same hotspot).
 
@@ -12,7 +12,9 @@ Wire format of outgoing state packet (little-endian, packed; 24 bytes):
     uint8   version          (1)
     uint8   state             (0=INIT, 1=EMPTY, 2=MOTION)
     uint8   reserved[2]
-    float32 median_ratio      (current median per-link motion ratio)
+    float32 agg_ratio         (per-link motion-ratio aggregator value
+                               used by the state machine — Pth-quantile
+                               by default; was named median_ratio in v1)
     float32 max_ratio         (current max per-link motion ratio)
     uint32  state_changes     (cumulative count since process start)
     uint64  ts_ms             (monotonic milliseconds since process start)
@@ -49,6 +51,7 @@ def run_publisher(source: str, links_path: str,
                   baselines_path: Optional[str] = None,
                   history: int = 500, motion_window: int = 50,
                   motion_enter: float = 2.0, motion_exit: float = 1.5,
+                  motion_quantile: float = 0.75,
                   publish_hz: float = 5.0,
                   verbose: bool = False) -> int:
     """Listen for CSI samples, compute presence state, broadcast UDP to C5."""
@@ -104,32 +107,32 @@ def run_publisher(source: str, links_path: str,
                     metrics.append(sigma)
 
             if metrics:
-                metrics.sort()
-                median = metrics[len(metrics) // 2]
-                mx = metrics[-1]
+                agg = float(np.quantile(metrics, motion_quantile))
+                mx = max(metrics)
             else:
-                median = 0.0
+                agg = 0.0
                 mx = 0.0
 
             # Hysteresis state machine. Stays in INIT until enough packets
             # have arrived for the motion-σ window to be meaningful.
             new_state = state
             if state == STATE_INIT and status.get("pkt_count", 0) > motion_window:
-                new_state = STATE_EMPTY if median < motion_enter else STATE_MOTION
-            elif state == STATE_EMPTY and median >= motion_enter:
+                new_state = STATE_EMPTY if agg < motion_enter else STATE_MOTION
+            elif state == STATE_EMPTY and agg >= motion_enter:
                 new_state = STATE_MOTION
-            elif state == STATE_MOTION and median <= motion_exit:
+            elif state == STATE_MOTION and agg <= motion_exit:
                 new_state = STATE_EMPTY
             if new_state != state:
                 state_changes += 1
                 if verbose or True:   # always log transitions; they're rare
                     print(f"{csi_collector.now_iso()} {STATE_NAMES[state]} -> "
-                          f"{STATE_NAMES[new_state]} (median {median:.2f}×)",
+                          f"{STATE_NAMES[new_state]} "
+                          f"(p{motion_quantile*100:.0f} {agg:.2f}×)",
                           flush=True)
                 state = new_state
 
             ts_ms = int((now - started) * 1000.0)
-            pkt = _STATE_PKT.pack(1, state, 0, float(median), float(mx),
+            pkt = _STATE_PKT.pack(1, state, 0, float(agg), float(mx),
                                   state_changes, ts_ms)
             try:
                 out_sock.sendto(pkt, target)
