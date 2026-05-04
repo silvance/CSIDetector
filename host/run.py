@@ -182,7 +182,9 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
     return heatmap.run_heatmap(args.source, args.links,
                                history=args.history, motion_window=args.window,
                                baselines_path=args.baselines,
-                               full_bright=args.full_bright)
+                               full_bright=args.full_bright,
+                               motion_enter=args.motion_enter,
+                               motion_exit=args.motion_exit)
 
 
 def cmd_view3d(args: argparse.Namespace) -> int:
@@ -373,6 +375,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="ratio at which links saturate to the brightest "
                          "cmap value (default 3.0; only used with --baselines). "
                          "Lower this if motion looks washed-out as 'all dark'.")
+    hm.add_argument("--motion-enter", type=float, default=2.0,
+                    help="median per-link ratio above which the room is "
+                         "declared MOTION DETECTED (default 2.0×).")
+    hm.add_argument("--motion-exit", type=float, default=1.5,
+                    help="median per-link ratio below which the room is "
+                         "declared EMPTY (default 1.5×). Hysteresis between "
+                         "exit and enter prevents the badge from flickering.")
     hm.set_defaults(func=cmd_heatmap)
 
     v3 = sub.add_parser("view3d", help="2.5D room view: floor heatmap + person pin")

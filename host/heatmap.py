@@ -223,7 +223,9 @@ def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], floa
 def run_heatmap(source: str, links_path: str,
                 history: int = 500, motion_window: int = 50,
                 baselines_path: Optional[str] = None,
-                full_bright: float = DEFAULT_RATIO_FULL_BRIGHT) -> int:
+                full_bright: float = DEFAULT_RATIO_FULL_BRIGHT,
+                motion_enter: float = 2.0,
+                motion_exit: float = 1.5) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     import matplotlib as mpl
@@ -317,6 +319,21 @@ def run_heatmap(source: str, links_path: str,
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     fig.colorbar(sm, ax=ax, label=cbar_label)
 
+    # Big presence/motion badge across the top of the figure. Driven
+    # by the median per-link motion ratio with hysteresis so the
+    # state doesn't flicker on noisy frames.
+    badge_text = fig.text(0.5, 0.96, "INITIALIZING", ha="center", va="center",
+                          fontsize=22, fontweight="bold",
+                          color="white",
+                          bbox=dict(facecolor="dimgray", edgecolor="none",
+                                    boxstyle="round,pad=0.6"))
+    presence_state = ["INIT"]   # mutable ref so the closure can update it
+    BADGE_STYLE = {
+        "INIT":   ("INITIALIZING",   "dimgray"),
+        "EMPTY":  ("EMPTY",          "tab:green"),
+        "MOTION": ("MOTION DETECTED", "tab:red"),
+    }
+
     running_max = [1e-3]
     span = full_bright - RATIO_FLOOR
 
@@ -353,6 +370,31 @@ def run_heatmap(source: str, links_path: str,
                 line_artists, label_artists, tints, metrics, sigmas, has_baseline):
             line.set_color(cmap(tint))
             lbl.set_text(text_fmt(m, s, ok))
+
+        # Update presence/motion badge using hysteresis on the median
+        # link metric. Median (not max) so a single noisy link can't
+        # drive the demo state; (not mean) so a few zeroed-out
+        # missing-baseline links don't drag the signal down.
+        if use_ratio:
+            valid = [m for m, ok in zip(metrics, has_baseline) if ok]
+        else:
+            valid = list(metrics)
+        if valid:
+            valid.sort()
+            mid = valid[len(valid) // 2]
+            cur = presence_state[0]
+            if cur == "INIT" and status.get("pkt_count", 0) > motion_window:
+                cur = "EMPTY" if mid < motion_enter else "MOTION"
+            elif cur == "EMPTY" and mid >= motion_enter:
+                cur = "MOTION"
+            elif cur == "MOTION" and mid <= motion_exit:
+                cur = "EMPTY"
+            presence_state[0] = cur
+            label, color = BADGE_STYLE[cur]
+            if cur != "INIT":
+                label = f"{label}   (median {mid:.2f}×)"
+            badge_text.set_text(label)
+            badge_text.get_bbox_patch().set_facecolor(color)
         notes = []
         # Reader-thread health on the title so a dead stream is obvious.
         if status.get("fatal_error"):
@@ -389,7 +431,7 @@ def run_heatmap(source: str, links_path: str,
             ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
         else:
             ax.set_title("")
-        return [*line_artists, *label_artists]
+        return [*line_artists, *label_artists, badge_text]
 
     anim = FuncAnimation(fig, update, interval=100, blit=False, cache_frame_data=False)
     # `anim` is intentionally bound for the duration of plt.show(); without
