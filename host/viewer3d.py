@@ -146,17 +146,32 @@ def _reader_thread(source: str,
 
 
 def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], float]:
-    """Read baselines.json. Accepts either keys "tx_mac|rx_mac" (new,
-    per-link) or "rx_mac" (legacy, per-RX, fanned out to every TX).
+    """Read baselines.json. Accepts the wrapped {_meta, links} envelope,
+    flat keys "tx_mac|rx_mac" (per-link), or legacy "rx_mac" keys (per-RX,
+    fanned out to every TX).
     """
     if not path:
         return {}
+    import os
     with open(path) as f:
         raw = json.load(f)
+    if isinstance(raw, dict) and "links" in raw and "_meta" in raw:
+        link_map = raw["links"]
+        try:
+            age_s = time.time() - os.path.getmtime(path)
+            if age_s > 3600:
+                age_h = age_s / 3600.0
+                print(f"view3d: WARNING — baselines.json is {age_h:.1f}h old; "
+                      f"re-run `calibrate-links` if motion looks off "
+                      f"(RF drift on this timescale is common).")
+        except OSError:
+            pass
+    else:
+        link_map = raw
     out: dict[tuple[str, str], float] = {}
     legacy = 0
     tx_macs = [t.mac for t in txs]
-    for k, v in raw.items():
+    for k, v in link_map.items():
         k = k.lower()
         if "|" in k:
             tx, rx = k.split("|", 1)

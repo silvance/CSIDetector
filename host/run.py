@@ -298,12 +298,24 @@ def cmd_calibrate_links(args: argparse.Namespace) -> int:
         print(f"  TX={tx}  RX={rx}  SKIPPED — only {n} samples, "
               f"need >= {min_required}; this link will render at 0× in the heatmap",
               file=sys.stderr)
-    # Write JSON keyed by "tx_mac|rx_mac" so the schema is unambiguous.
-    # Old per-RX files (single-MAC keys) are still readable by the
-    # viewers — see the loader in heatmap/viewer3d.
-    serializable = {f"{tx}|{rx}": b for (tx, rx), b in baselines.items()}
+    # JSON output now wraps the per-link map in a versioned envelope
+    # with diagnostic metadata. Old flat-key files are still accepted
+    # by the viewers' loaders.
+    links_obj = {f"{tx}|{rx}": b for (tx, rx), b in baselines.items()}
+    samples_obj = {f"{tx}|{rx}": len(rows) for (tx, rx), rows in per_link.items()}
+    out_obj = {
+        "_meta": {
+            "format": "csidetector-baselines/1",
+            "created": csi_collector.now_iso(),
+            "settle_seconds": args.settle,
+            "record_seconds": args.seconds,
+            "window": args.window,
+            "samples_per_link": samples_obj,
+        },
+        "links": links_obj,
+    }
     with open(args.out, "w") as f:
-        json.dump(serializable, f, indent=2)
+        json.dump(out_obj, f, indent=2)
     print(f"\nwrote {args.out}", file=sys.stderr)
     return 0
 

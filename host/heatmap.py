@@ -170,21 +170,39 @@ def _reader_thread(source: str,
 def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], float]:
     """Read baselines.json and return per-(tx_mac, rx_mac) values.
 
-    Two formats accepted:
-      - New: keys are "tx_mac|rx_mac" → float (one entry per link).
-      - Legacy: keys are "rx_mac" → float (per-RX). Replicated across
-        every TX from that RX so old files still work; logged as
-        "applying same baseline to multiple TXs from <RX>" so users
-        know to recalibrate when accuracy matters.
+    Three formats accepted (in order of preference):
+      - Wrapped: {"_meta": {...}, "links": {"tx|rx": float, ...}}.
+        Metadata enables stale-file warnings.
+      - Flat link-keyed: {"tx_mac|rx_mac": float, ...}.
+      - Legacy per-RX: {"rx_mac": float, ...}. Replicated across every
+        TX from that RX so old files still work; logged so users know
+        to recalibrate when accuracy matters.
     """
     if not path:
         return {}
+    import os
     with open(path) as f:
         raw = json.load(f)
+    meta = raw.get("_meta") if isinstance(raw, dict) else None
+    if meta is not None and "links" in raw:
+        link_map = raw["links"]
+        # Stale-file warning: file mtime > 1 hour suggests environment
+        # has likely drifted enough that the baselines aren't valid.
+        try:
+            age_s = time.time() - os.path.getmtime(path)
+            if age_s > 3600:
+                age_h = age_s / 3600.0
+                print(f"heatmap: WARNING — baselines.json is {age_h:.1f}h old; "
+                      f"consider re-running `calibrate-links` (RF environments "
+                      f"drift on this timescale).")
+        except OSError:
+            pass
+    else:
+        link_map = raw
     out: dict[tuple[str, str], float] = {}
     legacy_rx_macs: set[str] = set()
     tx_macs = [t.mac for t in txs]
-    for k, v in raw.items():
+    for k, v in link_map.items():
         k = k.lower()
         if "|" in k:
             tx, rx = k.split("|", 1)
