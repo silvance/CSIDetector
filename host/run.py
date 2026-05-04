@@ -182,7 +182,21 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
     return heatmap.run_heatmap(args.source, args.links,
                                history=args.history, motion_window=args.window,
                                baselines_path=args.baselines,
-                               full_bright=args.full_bright)
+                               full_bright=args.full_bright,
+                               motion_enter=args.motion_enter,
+                               motion_exit=args.motion_exit)
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    import publish
+    return publish.run_publisher(
+        args.source, args.links,
+        c5_addr=args.c5_addr, c5_port=args.c5_port,
+        baselines_path=args.baselines,
+        history=args.history, motion_window=args.window,
+        motion_enter=args.motion_enter, motion_exit=args.motion_exit,
+        publish_hz=args.hz, verbose=args.verbose,
+    )
 
 
 def cmd_view3d(args: argparse.Namespace) -> int:
@@ -373,6 +387,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="ratio at which links saturate to the brightest "
                          "cmap value (default 3.0; only used with --baselines). "
                          "Lower this if motion looks washed-out as 'all dark'.")
+    hm.add_argument("--motion-enter", type=float, default=2.0,
+                    help="median per-link ratio above which the room is "
+                         "declared MOTION DETECTED (default 2.0×).")
+    hm.add_argument("--motion-exit", type=float, default=1.5,
+                    help="median per-link ratio below which the room is "
+                         "declared EMPTY (default 1.5×). Hysteresis between "
+                         "exit and enter prevents the badge from flickering.")
     hm.set_defaults(func=cmd_heatmap)
 
     v3 = sub.add_parser("view3d", help="2.5D room view: floor heatmap + person pin")
@@ -415,6 +436,26 @@ def build_parser() -> argparse.ArgumentParser:
                          "to give yourself time to leave the room.")
     cl.add_argument("--window", type=int, default=50)
     cl.set_defaults(func=cmd_calibrate_links)
+
+    pub = sub.add_parser("publish",
+                         help="broadcast presence/motion state to a remote display "
+                              "(e.g. ESP32-C5 with screen)")
+    pub.add_argument("source", help="udp:<port> typically")
+    pub.add_argument("--links", required=True)
+    pub.add_argument("--baselines", default=None)
+    pub.add_argument("--c5-addr", required=True,
+                     help="IP of the receiving display (e.g. 10.42.0.42), or "
+                          "10.42.0.255 for hotspot subnet broadcast.")
+    pub.add_argument("--c5-port", type=int, default=5567,
+                     help="UDP port the C5 listens on (default 5567).")
+    pub.add_argument("--hz", type=float, default=5.0,
+                     help="state-update emit rate (default 5 Hz).")
+    pub.add_argument("--history", type=int, default=500)
+    pub.add_argument("--window", type=int, default=50)
+    pub.add_argument("--motion-enter", type=float, default=2.0)
+    pub.add_argument("--motion-exit", type=float, default=1.5)
+    pub.add_argument("--verbose", action="store_true")
+    pub.set_defaults(func=cmd_publish)
 
     return p
 

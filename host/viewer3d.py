@@ -264,19 +264,34 @@ def run_viewer3d(source: str, links_path: str,
                    depthshade=False)
         ax.text(r.x, r.y, 0.05, r.label, color="tab:blue", fontsize=8)
 
-    # Up to `max_pins` person pins (one per detected local maximum
-    # after non-max suppression). Each pin keeps its own EMA-smoothed
-    # position so it doesn't chatter cell-to-cell on a noisy grid.
+    # Up to `max_pins` person pins. Each pin is rendered as:
+    # - a vertical column from floor to head height (tall, easy to spot)
+    # - a "halo" disk on the floor itself (so the position is visible
+    #   even when the column is occluded by a wall — matplotlib's mplot3d
+    #   has notoriously bad depth-sorting and pins routinely disappear
+    #   behind walls or under the floor heatmap)
+    # - a head dot above the column
+    # Each pin keeps its own EMA-smoothed position so it doesn't chatter
+    # cell-to-cell on a noisy grid.
     pin_lines = []
     pin_dots = []
+    pin_halos = []
     pin_state: list[Optional[tuple[float, float]]] = [None] * max_pins
-    PIN_PALETTE = ["tab:red", "tab:cyan", "tab:green", "tab:purple", "tab:olive"]
+    PIN_PALETTE = ["red", "cyan", "lime", "magenta", "yellow"]
+    halo_theta = np.linspace(0, 2 * np.pi, 32)
+    halo_r = 0.25
     for i in range(max_pins):
         c = PIN_PALETTE[i % len(PIN_PALETTE)]
+        # Floor halo — a small ring at z=0.02 (just above the heatmap so
+        # depth sorting puts it on top). Always visible from any angle.
+        halo, = ax.plot(np.zeros_like(halo_theta), np.zeros_like(halo_theta),
+                        0.02 * np.ones_like(halo_theta),
+                        color=c, linewidth=4, alpha=0.0)
         line, = ax.plot([0, 0], [0, 0], [0, 1.7], color=c,
-                        linewidth=3, alpha=0.0)
-        dot, = ax.plot([0], [0], [1.7], "o", color=c, markersize=10,
-                       alpha=0.0)
+                        linewidth=4, alpha=0.0, solid_capstyle="round")
+        dot, = ax.plot([0], [0], [1.7], "o", color=c, markersize=14,
+                       alpha=0.0, markeredgecolor="black", markeredgewidth=1.5)
+        pin_halos.append(halo)
         pin_lines.append(line)
         pin_dots.append(dot)
 
@@ -288,7 +303,10 @@ def run_viewer3d(source: str, links_path: str,
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
     ax.set_zlabel("z (m)")
-    ax.view_init(elev=35, azim=-60)
+    # Steeper elevation: more top-down so pin position is readable from
+    # the camera angle without rotating, and walls don't occlude pins
+    # in the far half of the room.
+    ax.view_init(elev=55, azim=-65)
     ax.set_box_aspect((bbox_max[0] - bbox_min[0],
                        bbox_max[1] - bbox_min[1],
                        wall_height_m))
@@ -328,7 +346,7 @@ def run_viewer3d(source: str, links_path: str,
         # Render up to max_pins peaks above PIN_THRESHOLD with EMA-smoothed
         # positions so pins don't chatter cell-to-cell.
         alpha = pin_smoothing
-        for i, (line, dot) in enumerate(zip(pin_lines, pin_dots)):
+        for i, (line, dot, halo) in enumerate(zip(pin_lines, pin_dots, pin_halos)):
             if i < len(peaks):
                 px, py, pv = peaks[i]
                 normv = pv / running_max[0]
@@ -342,13 +360,19 @@ def run_viewer3d(source: str, links_path: str,
                     pin_state[i] = (sx, sy)
                     line.set_data_3d([sx, sx], [sy, sy], [0, 1.7])
                     dot.set_data_3d([sx], [sy], [1.7])
-                    line.set_alpha(min(normv, 1.0))
-                    dot.set_alpha(min(normv, 1.0))
+                    halo.set_data_3d(sx + halo_r * np.cos(halo_theta),
+                                     sy + halo_r * np.sin(halo_theta),
+                                     0.02 * np.ones_like(halo_theta))
+                    a = min(normv, 1.0)
+                    line.set_alpha(a)
+                    dot.set_alpha(a)
+                    halo.set_alpha(a)
                     continue
             # No peak (or below threshold) for this pin slot.
             pin_state[i] = None
             line.set_alpha(0.0)
             dot.set_alpha(0.0)
+            halo.set_alpha(0.0)
 
         notes = []
         if status.get("fatal_error"):
@@ -370,7 +394,7 @@ def run_viewer3d(source: str, links_path: str,
             ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
         else:
             ax.set_title("")
-        return [surf, *pin_lines, *pin_dots]
+        return [surf, *pin_lines, *pin_dots, *pin_halos]
 
     # `anim` is intentionally bound for the duration of plt.show(); without
     # a live reference, matplotlib garbage-collects FuncAnimation and the
