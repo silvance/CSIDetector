@@ -15,6 +15,7 @@ from __future__ import annotations
 import collections
 import json
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -113,37 +114,64 @@ def _reader_thread(source: str,
                    tx_macs: set[str],
                    unknown_rx: set[str],
                    unknown_tx: set[str],
-                   stop: threading.Event) -> None:
-    for sample in csi_collector.open_source(source):
-        if stop.is_set():
-            break
-        if sample.rx_id is None:
-            continue
-        rx = sample.rx_id.lower()
-        tx = sample.mac.lower()
-        if tx not in tx_macs:
-            unknown_tx.add(tx)
-            continue
-        key = (tx, rx)
-        buf = buffers.get(key)
-        if buf is None:
-            unknown_rx.add(rx)
-            continue
-        buf.push(sample)
+                   stop: threading.Event,
+                   status: dict) -> None:
+    # See heatmap._reader_thread — same try/except pattern. One bad
+    # packet shouldn't kill the thread; a dead source should be visible.
+    try:
+        for sample in csi_collector.open_source(source):
+            if stop.is_set():
+                break
+            try:
+                if sample.rx_id is None:
+                    continue
+                rx = sample.rx_id.lower()
+                tx = sample.mac.lower()
+                if tx not in tx_macs:
+                    unknown_tx.add(tx)
+                    continue
+                key = (tx, rx)
+                buf = buffers.get(key)
+                if buf is None:
+                    unknown_rx.add(rx)
+                    continue
+                buf.push(sample)
+                status["last_packet_ts"] = time.monotonic()
+                status["pkt_count"] = status.get("pkt_count", 0) + 1
+            except Exception as exc:
+                status["bad_samples"] = status.get("bad_samples", 0) + 1
+                status["last_error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        status["fatal_error"] = f"{type(exc).__name__}: {exc}"
 
 
 def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], float]:
-    """Read baselines.json. Accepts either keys "tx_mac|rx_mac" (new,
-    per-link) or "rx_mac" (legacy, per-RX, fanned out to every TX).
+    """Read baselines.json. Accepts the wrapped {_meta, links} envelope,
+    flat keys "tx_mac|rx_mac" (per-link), or legacy "rx_mac" keys (per-RX,
+    fanned out to every TX).
     """
     if not path:
         return {}
+    import os
     with open(path) as f:
         raw = json.load(f)
+    if isinstance(raw, dict) and "links" in raw and "_meta" in raw:
+        link_map = raw["links"]
+        try:
+            age_s = time.time() - os.path.getmtime(path)
+            if age_s > 3600:
+                age_h = age_s / 3600.0
+                print(f"view3d: WARNING — baselines.json is {age_h:.1f}h old; "
+                      f"re-run `calibrate-links` if motion looks off "
+                      f"(RF drift on this timescale is common).")
+        except OSError:
+            pass
+    else:
+        link_map = raw
     out: dict[tuple[str, str], float] = {}
     legacy = 0
     tx_macs = [t.mac for t in txs]
-    for k, v in raw.items():
+    for k, v in link_map.items():
         k = k.lower()
         if "|" in k:
             tx, rx = k.split("|", 1)
@@ -163,7 +191,11 @@ def run_viewer3d(source: str, links_path: str,
                  history: int = 500, motion_window: int = 50,
                  baselines_path: Optional[str] = None,
                  grid_step: float = 0.1, link_sigma_m: float = 0.3,
-                 wall_height_m: float = 2.5) -> int:
+                 node_exclusion_m: float = 0.5,
+                 wall_height_m: float = 2.5,
+                 max_pins: int = 3,
+                 pin_separation_m: float = 1.0,
+                 pin_smoothing: float = 0.4) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     import matplotlib as mpl
@@ -175,7 +207,8 @@ def run_viewer3d(source: str, links_path: str,
     rx_pos = {r.mac: np.array([r.x, r.y]) for r in rxs}
 
     loc = localize.Localizer(polygon, tx_pos, rx_pos,
-                             grid_step=grid_step, link_sigma_m=link_sigma_m)
+                             grid_step=grid_step, link_sigma_m=link_sigma_m,
+                             node_exclusion_m=node_exclusion_m)
 
     # baselines.json supports two key formats; see _load_baselines below.
     baselines = _load_baselines(baselines_path, txs, rxs)
@@ -186,10 +219,11 @@ def run_viewer3d(source: str, links_path: str,
     }
     unknown_rx: set[str] = set()
     unknown_tx: set[str] = set()
+    status: dict = {"pkt_count": 0, "bad_samples": 0, "last_packet_ts": 0.0}
     stop = threading.Event()
     threading.Thread(target=_reader_thread,
                      args=(source, buffers, tx_macs,
-                           unknown_rx, unknown_tx, stop),
+                           unknown_rx, unknown_tx, stop, status),
                      daemon=True).start()
 
     fig = plt.figure(figsize=(9, 7))
@@ -230,11 +264,36 @@ def run_viewer3d(source: str, links_path: str,
                    depthshade=False)
         ax.text(r.x, r.y, 0.05, r.label, color="tab:blue", fontsize=8)
 
-    # Person pin: vertical line from floor to ~head height at the argmax.
-    person_line, = ax.plot([0, 0], [0, 0], [0, 1.7], color="tab:red",
-                            linewidth=3, alpha=0.0)
-    person_dot, = ax.plot([0], [0], [1.7], "o", color="tab:red", markersize=10,
-                           alpha=0.0)
+    # Up to `max_pins` person pins. Each pin is rendered as:
+    # - a vertical column from floor to head height (tall, easy to spot)
+    # - a "halo" disk on the floor itself (so the position is visible
+    #   even when the column is occluded by a wall — matplotlib's mplot3d
+    #   has notoriously bad depth-sorting and pins routinely disappear
+    #   behind walls or under the floor heatmap)
+    # - a head dot above the column
+    # Each pin keeps its own EMA-smoothed position so it doesn't chatter
+    # cell-to-cell on a noisy grid.
+    pin_lines = []
+    pin_dots = []
+    pin_halos = []
+    pin_state: list[Optional[tuple[float, float]]] = [None] * max_pins
+    PIN_PALETTE = ["red", "cyan", "lime", "magenta", "yellow"]
+    halo_theta = np.linspace(0, 2 * np.pi, 32)
+    halo_r = 0.25
+    for i in range(max_pins):
+        c = PIN_PALETTE[i % len(PIN_PALETTE)]
+        # Floor halo — a small ring at z=0.02 (just above the heatmap so
+        # depth sorting puts it on top). Always visible from any angle.
+        halo, = ax.plot(np.zeros_like(halo_theta), np.zeros_like(halo_theta),
+                        0.02 * np.ones_like(halo_theta),
+                        color=c, linewidth=4, alpha=0.0)
+        line, = ax.plot([0, 0], [0, 0], [0, 1.7], color=c,
+                        linewidth=4, alpha=0.0, solid_capstyle="round")
+        dot, = ax.plot([0], [0], [1.7], "o", color=c, markersize=14,
+                       alpha=0.0, markeredgecolor="black", markeredgewidth=1.5)
+        pin_halos.append(halo)
+        pin_lines.append(line)
+        pin_dots.append(dot)
 
     bbox_min = polygon.min(axis=0)
     bbox_max = polygon.max(axis=0)
@@ -244,7 +303,10 @@ def run_viewer3d(source: str, links_path: str,
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
     ax.set_zlabel("z (m)")
-    ax.view_init(elev=35, azim=-60)
+    # Steeper elevation: more top-down so pin position is readable from
+    # the camera angle without rotating, and walls don't occlude pins
+    # in the far half of the room.
+    ax.view_init(elev=55, azim=-65)
     ax.set_box_aspect((bbox_max[0] - bbox_min[0],
                        bbox_max[1] - bbox_min[1],
                        wall_height_m))
@@ -279,25 +341,60 @@ def run_viewer3d(source: str, links_path: str,
         # frame is the documented workaround. Cheap at this grid size.
         surf.set_facecolors(cmap(np.clip(norm, 0, 1)).reshape(-1, 4))
 
-        argx, argy, argv = loc.argmax_xy(grid)
-        normv = argv / running_max[0]
-        if normv > PIN_THRESHOLD:
-            person_line.set_data_3d([argx, argx], [argy, argy], [0, 1.7])
-            person_dot.set_data_3d([argx], [argy], [1.7])
-            person_line.set_alpha(min(normv, 1.0))
-            person_dot.set_alpha(min(normv, 1.0))
-        else:
-            person_line.set_alpha(0.0)
-            person_dot.set_alpha(0.0)
+        peaks = loc.topk_local_maxima(grid, max_pins,
+                                      min_separation_m=pin_separation_m)
+        # Render up to max_pins peaks above PIN_THRESHOLD with EMA-smoothed
+        # positions so pins don't chatter cell-to-cell.
+        alpha = pin_smoothing
+        for i, (line, dot, halo) in enumerate(zip(pin_lines, pin_dots, pin_halos)):
+            if i < len(peaks):
+                px, py, pv = peaks[i]
+                normv = pv / running_max[0]
+                if normv > PIN_THRESHOLD:
+                    prev = pin_state[i]
+                    if prev is None:
+                        sx, sy = px, py
+                    else:
+                        sx = alpha * px + (1.0 - alpha) * prev[0]
+                        sy = alpha * py + (1.0 - alpha) * prev[1]
+                    pin_state[i] = (sx, sy)
+                    line.set_data_3d([sx, sx], [sy, sy], [0, 1.7])
+                    dot.set_data_3d([sx], [sy], [1.7])
+                    halo.set_data_3d(sx + halo_r * np.cos(halo_theta),
+                                     sy + halo_r * np.sin(halo_theta),
+                                     0.02 * np.ones_like(halo_theta))
+                    a = min(normv, 1.0)
+                    line.set_alpha(a)
+                    dot.set_alpha(a)
+                    halo.set_alpha(a)
+                    continue
+            # No peak (or below threshold) for this pin slot.
+            pin_state[i] = None
+            line.set_alpha(0.0)
+            dot.set_alpha(0.0)
+            halo.set_alpha(0.0)
 
         notes = []
+        if status.get("fatal_error"):
+            notes.append(f"READER DIED: {status['fatal_error']}")
+        else:
+            now = time.monotonic()
+            since = now - status.get("last_packet_ts", 0.0)
+            if status.get("last_packet_ts", 0.0) == 0.0:
+                notes.append("waiting for first packet…")
+            elif since > 2.0:
+                notes.append(f"no packets for {since:.1f}s")
+        if status.get("bad_samples", 0):
+            notes.append(f"{status['bad_samples']} bad samples")
         if unknown_rx:
             notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
         if unknown_tx:
             notes.append(f"unknown TX: {', '.join(sorted(unknown_tx))}")
         if notes:
             ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
-        return [surf, person_line, person_dot]
+        else:
+            ax.set_title("")
+        return [surf, *pin_lines, *pin_dots, *pin_halos]
 
     # `anim` is intentionally bound for the duration of plt.show(); without
     # a live reference, matplotlib garbage-collects FuncAnimation and the

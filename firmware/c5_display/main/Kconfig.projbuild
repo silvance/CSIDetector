@@ -1,0 +1,23 @@
+menu "C5 Display Configuration"
+
+config C5_WIFI_SSID
+    string "Hotspot SSID (must match host's hotspot)"
+    default "CSIDetector"
+
+config C5_WIFI_PASS
+    string "Hotspot password (blank for open hotspot)"
+    default ""
+
+config C5_WIFI_CHANNEL
+    int "Hotspot channel (must match host's hotspot)"
+    range 1 13
+    default 11
+
+config C5_LISTEN_PORT
+    int "UDP port to receive presence-state packets on"
+    range 1 65535
+    default 5567
+    help
+        Must match the --c5-port the host's `publish` command sends to.
+
+endmenu

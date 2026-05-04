@@ -56,7 +56,8 @@ class Localizer:
                  tx_positions: dict[str, np.ndarray],
                  rx_positions: dict[str, np.ndarray],
                  grid_step: float = 0.1,
-                 link_sigma_m: float = 0.3):
+                 link_sigma_m: float = 0.3,
+                 node_exclusion_m: float = 0.5):
         from matplotlib.path import Path
 
         self.polygon = polygon
@@ -76,6 +77,23 @@ class Localizer:
         points = np.column_stack([self.X.ravel(), self.Y.ravel()])
         self.mask = path.contains_points(points).reshape(self.X.shape)
 
+        # Cells within `node_exclusion_m` of any TX or RX position get
+        # masked out of the final heatmap. Reason: every link's kernel
+        # peaks (value 1.0) at its endpoints, so the cells at TX/RX
+        # positions accumulate kernel value from ALL the links that
+        # share that node — N kernels of 1.0 each = N. With N=4 (each
+        # TX has 4 receivers, each RX has 2 TXs), that node always
+        # wins the argmax over any actual person in the room. Masking
+        # the immediate neighborhood pushes argmax onto the corridors
+        # where motion can actually be localized.
+        self.node_mask = np.ones_like(self.X, dtype=bool)
+        if node_exclusion_m > 0:
+            r2 = node_exclusion_m * node_exclusion_m
+            for pos in list(tx_positions.values()) + list(rx_positions.values()):
+                dx = self.X - pos[0]
+                dy = self.Y - pos[1]
+                self.node_mask &= (dx * dx + dy * dy) > r2
+
         self.tx_positions = tx_positions
         self.rx_positions = rx_positions
         self.links: list[_LinkKernel] = []
@@ -88,12 +106,15 @@ class Localizer:
                 self.links.append(_LinkKernel(tx_mac, rx_mac, kernel))
 
     def update(self, link_scores: dict[tuple[str, str], float]) -> np.ndarray:
-        """Per-cell likelihood. Cells outside the polygon are zero."""
+        """Per-cell likelihood. Cells outside the polygon are zero, and
+        cells within `node_exclusion_m` of any TX/RX are also zero so
+        the argmax doesn't park at a sensor endpoint."""
         grid = np.zeros_like(self.X)
         for link in self.links:
             score = link_scores.get((link.tx_mac, link.rx_mac), 0.0)
             if score > 0.0:
                 grid += score * link.kernel
+        grid[~self.node_mask] = 0.0
         return grid
 
     def argmax_xy(self, grid: np.ndarray) -> tuple[float, float, float]:
@@ -101,3 +122,44 @@ class Localizer:
         flat = grid.argmax()
         iy, ix = np.unravel_index(flat, grid.shape)
         return float(self.x_axis[ix]), float(self.y_axis[iy]), float(grid[iy, ix])
+
+    def topk_local_maxima(self, grid: np.ndarray, k: int,
+                          min_separation_m: float = 1.0
+                          ) -> list[tuple[float, float, float]]:
+        """Up to k local maxima with non-max suppression.
+
+        Iteratively picks the brightest cell, blanks out a disk of
+        radius `min_separation_m` around it, repeats. Returned in
+        descending value order; fewer than k returned if remaining
+        peaks fall to zero. Used by the multi-pin viewer so two
+        people don't collapse into one phantom pin between them.
+        """
+        if k <= 0:
+            return []
+        # Work on a copy — caller may want to display the grid afterwards.
+        scratch = grid.copy()
+        peaks: list[tuple[float, float, float]] = []
+        # Pre-compute the suppression mask offsets in cell units.
+        # The grid step is uniform per axis but x_axis and y_axis may
+        # have slightly different deltas after np.linspace; pick the
+        # smaller so the mask never under-suppresses.
+        dx = self.x_axis[1] - self.x_axis[0] if self.x_axis.size > 1 else 1.0
+        dy = self.y_axis[1] - self.y_axis[0] if self.y_axis.size > 1 else 1.0
+        step = float(min(dx, dy))
+        radius_cells = max(1, int(np.ceil(min_separation_m / step)))
+        for _ in range(k):
+            iy, ix = np.unravel_index(scratch.argmax(), scratch.shape)
+            v = float(scratch[iy, ix])
+            if v <= 0.0:
+                break
+            peaks.append((float(self.x_axis[ix]),
+                          float(self.y_axis[iy]),
+                          v))
+            # Zero a disk around the peak so the next argmax can't land
+            # inside the same blob.
+            y_lo, y_hi = max(0, iy - radius_cells), min(scratch.shape[0], iy + radius_cells + 1)
+            x_lo, x_hi = max(0, ix - radius_cells), min(scratch.shape[1], ix + radius_cells + 1)
+            yy, xx = np.ogrid[y_lo:y_hi, x_lo:x_hi]
+            disk = ((yy - iy) ** 2 + (xx - ix) ** 2) <= (radius_cells ** 2)
+            scratch[y_lo:y_hi, x_lo:x_hi][disk] = 0.0
+        return peaks

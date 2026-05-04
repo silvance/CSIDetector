@@ -182,7 +182,21 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
     return heatmap.run_heatmap(args.source, args.links,
                                history=args.history, motion_window=args.window,
                                baselines_path=args.baselines,
-                               full_bright=args.full_bright)
+                               full_bright=args.full_bright,
+                               motion_enter=args.motion_enter,
+                               motion_exit=args.motion_exit)
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    import publish
+    return publish.run_publisher(
+        args.source, args.links,
+        c5_addr=args.c5_addr, c5_port=args.c5_port,
+        baselines_path=args.baselines,
+        history=args.history, motion_window=args.window,
+        motion_enter=args.motion_enter, motion_exit=args.motion_exit,
+        publish_hz=args.hz, verbose=args.verbose,
+    )
 
 
 def cmd_view3d(args: argparse.Namespace) -> int:
@@ -192,7 +206,11 @@ def cmd_view3d(args: argparse.Namespace) -> int:
         history=args.history, motion_window=args.window,
         baselines_path=args.baselines,
         grid_step=args.grid_step, link_sigma_m=args.link_sigma,
+        node_exclusion_m=args.node_exclusion,
         wall_height_m=args.wall_height,
+        max_pins=args.max_pins,
+        pin_separation_m=args.pin_separation,
+        pin_smoothing=args.pin_smoothing,
     )
 
 
@@ -295,12 +313,24 @@ def cmd_calibrate_links(args: argparse.Namespace) -> int:
         print(f"  TX={tx}  RX={rx}  SKIPPED — only {n} samples, "
               f"need >= {min_required}; this link will render at 0× in the heatmap",
               file=sys.stderr)
-    # Write JSON keyed by "tx_mac|rx_mac" so the schema is unambiguous.
-    # Old per-RX files (single-MAC keys) are still readable by the
-    # viewers — see the loader in heatmap/viewer3d.
-    serializable = {f"{tx}|{rx}": b for (tx, rx), b in baselines.items()}
+    # JSON output now wraps the per-link map in a versioned envelope
+    # with diagnostic metadata. Old flat-key files are still accepted
+    # by the viewers' loaders.
+    links_obj = {f"{tx}|{rx}": b for (tx, rx), b in baselines.items()}
+    samples_obj = {f"{tx}|{rx}": len(rows) for (tx, rx), rows in per_link.items()}
+    out_obj = {
+        "_meta": {
+            "format": "csidetector-baselines/1",
+            "created": csi_collector.now_iso(),
+            "settle_seconds": args.settle,
+            "record_seconds": args.seconds,
+            "window": args.window,
+            "samples_per_link": samples_obj,
+        },
+        "links": links_obj,
+    }
     with open(args.out, "w") as f:
-        json.dump(serializable, f, indent=2)
+        json.dump(out_obj, f, indent=2)
     print(f"\nwrote {args.out}", file=sys.stderr)
     return 0
 
@@ -357,6 +387,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="ratio at which links saturate to the brightest "
                          "cmap value (default 3.0; only used with --baselines). "
                          "Lower this if motion looks washed-out as 'all dark'.")
+    hm.add_argument("--motion-enter", type=float, default=2.0,
+                    help="median per-link ratio above which the room is "
+                         "declared MOTION DETECTED (default 2.0×).")
+    hm.add_argument("--motion-exit", type=float, default=1.5,
+                    help="median per-link ratio below which the room is "
+                         "declared EMPTY (default 1.5×). Hysteresis between "
+                         "exit and enter prevents the badge from flickering.")
     hm.set_defaults(func=cmd_heatmap)
 
     v3 = sub.add_parser("view3d", help="2.5D room view: floor heatmap + person pin")
@@ -369,7 +406,22 @@ def build_parser() -> argparse.ArgumentParser:
                     help="grid resolution in meters (default 0.1 = 10 cm)")
     v3.add_argument("--link-sigma", type=float, default=0.3,
                     help="kernel σ for per-link influence on cells (default 0.3 m)")
+    v3.add_argument("--node-exclusion", type=float, default=0.5,
+                    help="zero out cells within this radius (m) of any "
+                         "TX/RX position. Stops the argmax from parking "
+                         "at sensor endpoints where multiple link kernels "
+                         "trivially converge. 0 disables. Default 0.5 m.")
     v3.add_argument("--wall-height", type=float, default=2.5)
+    v3.add_argument("--max-pins", type=int, default=3,
+                    help="how many person pins to render (top-K local "
+                         "maxima after non-max suppression; default 3).")
+    v3.add_argument("--pin-separation", type=float, default=1.0,
+                    help="non-max suppression radius in meters — peaks "
+                         "closer than this collapse to one pin (default 1.0).")
+    v3.add_argument("--pin-smoothing", type=float, default=0.4,
+                    help="EMA factor for pin position; 1.0 = no smoothing, "
+                         "0.0 = pins stuck. Lower values reduce chatter on "
+                         "noisy localization (default 0.4).")
     v3.set_defaults(func=cmd_view3d)
 
     cl = sub.add_parser("calibrate-links",
@@ -384,6 +436,26 @@ def build_parser() -> argparse.ArgumentParser:
                          "to give yourself time to leave the room.")
     cl.add_argument("--window", type=int, default=50)
     cl.set_defaults(func=cmd_calibrate_links)
+
+    pub = sub.add_parser("publish",
+                         help="broadcast presence/motion state to a remote display "
+                              "(e.g. ESP32-C5 with screen)")
+    pub.add_argument("source", help="udp:<port> typically")
+    pub.add_argument("--links", required=True)
+    pub.add_argument("--baselines", default=None)
+    pub.add_argument("--c5-addr", required=True,
+                     help="IP of the receiving display (e.g. 10.42.0.42), or "
+                          "10.42.0.255 for hotspot subnet broadcast.")
+    pub.add_argument("--c5-port", type=int, default=5567,
+                     help="UDP port the C5 listens on (default 5567).")
+    pub.add_argument("--hz", type=float, default=5.0,
+                     help="state-update emit rate (default 5 Hz).")
+    pub.add_argument("--history", type=int, default=500)
+    pub.add_argument("--window", type=int, default=50)
+    pub.add_argument("--motion-enter", type=float, default=2.0)
+    pub.add_argument("--motion-exit", type=float, default=1.5)
+    pub.add_argument("--verbose", action="store_true")
+    pub.set_defaults(func=cmd_publish)
 
     return p
 
