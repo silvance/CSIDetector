@@ -169,10 +169,19 @@ def parse_udp_packet(data: bytes) -> Optional[CSISample]:
     )
 
 
-def iter_udp(port: int, bind: str = "0.0.0.0") -> Iterator[CSISample]:
+def iter_udp(port: int, bind: str = "0.0.0.0",
+             rcvbuf_bytes: int = 4 * 1024 * 1024) -> Iterator[CSISample]:
     import socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Raise the kernel's receive buffer so a brief host stall (matplotlib
+    # redraw, GC pause) doesn't cause the OS to drop UDP packets. Linux
+    # caps via /proc/sys/net/core/rmem_max — if we ask for more than the
+    # cap, we get the cap silently. 4 MB is plenty for ~800 pkts/s × 290 B.
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, rcvbuf_bytes)
+    except OSError:
+        pass  # not fatal — proceed with whatever the OS gave us
     sock.bind((bind, port))
     try:
         while True:

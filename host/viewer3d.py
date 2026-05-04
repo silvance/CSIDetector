@@ -15,6 +15,7 @@ from __future__ import annotations
 import collections
 import json
 import threading
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -113,23 +114,35 @@ def _reader_thread(source: str,
                    tx_macs: set[str],
                    unknown_rx: set[str],
                    unknown_tx: set[str],
-                   stop: threading.Event) -> None:
-    for sample in csi_collector.open_source(source):
-        if stop.is_set():
-            break
-        if sample.rx_id is None:
-            continue
-        rx = sample.rx_id.lower()
-        tx = sample.mac.lower()
-        if tx not in tx_macs:
-            unknown_tx.add(tx)
-            continue
-        key = (tx, rx)
-        buf = buffers.get(key)
-        if buf is None:
-            unknown_rx.add(rx)
-            continue
-        buf.push(sample)
+                   stop: threading.Event,
+                   status: dict) -> None:
+    # See heatmap._reader_thread — same try/except pattern. One bad
+    # packet shouldn't kill the thread; a dead source should be visible.
+    try:
+        for sample in csi_collector.open_source(source):
+            if stop.is_set():
+                break
+            try:
+                if sample.rx_id is None:
+                    continue
+                rx = sample.rx_id.lower()
+                tx = sample.mac.lower()
+                if tx not in tx_macs:
+                    unknown_tx.add(tx)
+                    continue
+                key = (tx, rx)
+                buf = buffers.get(key)
+                if buf is None:
+                    unknown_rx.add(rx)
+                    continue
+                buf.push(sample)
+                status["last_packet_ts"] = time.monotonic()
+                status["pkt_count"] = status.get("pkt_count", 0) + 1
+            except Exception as exc:
+                status["bad_samples"] = status.get("bad_samples", 0) + 1
+                status["last_error"] = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        status["fatal_error"] = f"{type(exc).__name__}: {exc}"
 
 
 def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], float]:
@@ -186,10 +199,11 @@ def run_viewer3d(source: str, links_path: str,
     }
     unknown_rx: set[str] = set()
     unknown_tx: set[str] = set()
+    status: dict = {"pkt_count": 0, "bad_samples": 0, "last_packet_ts": 0.0}
     stop = threading.Event()
     threading.Thread(target=_reader_thread,
                      args=(source, buffers, tx_macs,
-                           unknown_rx, unknown_tx, stop),
+                           unknown_rx, unknown_tx, stop, status),
                      daemon=True).start()
 
     fig = plt.figure(figsize=(9, 7))
@@ -291,12 +305,25 @@ def run_viewer3d(source: str, links_path: str,
             person_dot.set_alpha(0.0)
 
         notes = []
+        if status.get("fatal_error"):
+            notes.append(f"READER DIED: {status['fatal_error']}")
+        else:
+            now = time.monotonic()
+            since = now - status.get("last_packet_ts", 0.0)
+            if status.get("last_packet_ts", 0.0) == 0.0:
+                notes.append("waiting for first packet…")
+            elif since > 2.0:
+                notes.append(f"no packets for {since:.1f}s")
+        if status.get("bad_samples", 0):
+            notes.append(f"{status['bad_samples']} bad samples")
         if unknown_rx:
             notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
         if unknown_tx:
             notes.append(f"unknown TX: {', '.join(sorted(unknown_tx))}")
         if notes:
             ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
+        else:
+            ax.set_title("")
         return [surf, person_line, person_dot]
 
     # `anim` is intentionally bound for the duration of plt.show(); without
