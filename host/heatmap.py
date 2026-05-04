@@ -38,6 +38,17 @@ RATIO_FLOOR = 1.0
 # black lower third.
 DEFAULT_RATIO_FULL_BRIGHT = 3.0
 
+# How many recent metric samples each sparkline shows. At the 100ms
+# frame interval below, 200 samples ≈ 20s of history.
+SPARKLINE_HISTORY_LEN = 200
+# Window over which per-link packet rate is averaged.
+PKT_RATE_WINDOW_S = 3.0
+# Seconds the badge stays in "flash" styling after a state transition.
+BADGE_FLASH_DURATION_S = 0.6
+# Per-TX line styles so the two fans are distinguishable when they
+# physically overlap. Cycles for >4 TXs.
+TX_LINESTYLES = ["-", "--", "-.", ":"]
+
 
 @dataclass
 class _Node:
@@ -85,11 +96,16 @@ class _LinkBuffer:
         # Wallclock of the most recent successfully-pushed sample, used
         # by the viewer to flag dead links in the title bar.
         self.last_push_ts: float = 0.0
+        # Recent push timestamps, used to compute per-link pkt/s for the
+        # health strip. Cap is generous (covers >50 Hz × PKT_RATE_WINDOW_S).
+        self._push_ts: collections.deque[float] = collections.deque(maxlen=512)
 
     def push(self, sample: csi_collector.CSISample) -> None:
         amp = sample.amplitude
         with self._lock:
-            self.last_push_ts = time.monotonic()
+            now = time.monotonic()
+            self.last_push_ts = now
+            self._push_ts.append(now)
             if self._idx is None:
                 self._probe.append(amp)
                 if len(self._probe) < self.MASK_PROBE:
@@ -124,6 +140,13 @@ class _LinkBuffer:
                 return 0.0
             recent = np.stack(list(self._buf)[-window:])
         return float(np.mean(np.std(recent, axis=0)))
+
+    def packet_rate(self, window_s: float = PKT_RATE_WINDOW_S) -> float:
+        cutoff = time.monotonic() - window_s
+        with self._lock:
+            ts = list(self._push_ts)
+        n = sum(1 for t in ts if t >= cutoff)
+        return n / window_s
 
 
 def _reader_thread(source: str,
@@ -255,50 +278,80 @@ def run_heatmap(source: str, links_path: str,
                            unknown_rx, unknown_tx, stop, status),
                      daemon=True).start()
 
-    fig, ax = plt.subplots(figsize=(9, 7))
-    fig.suptitle(f"CSI link heatmap — {source}")
+    # Dark theme palette (used by main, sparklines, and pkt-rate strip).
+    BG = "#0a0a0a"
+    PANEL = "#181818"
+    GRID = "#333333"
+    AXIS_TXT = "#bbbbbb"
+    pair_keys: list[tuple[str, str]] = [(t.mac, r.mac) for t in txs for r in rxs]
+    link_label = {(t.mac, r.mac): f"{t.label}↔{r.label}" for t in txs for r in rxs}
+    n_links = len(pair_keys)
+
+    fig = plt.figure(figsize=(13, 8.5), facecolor=BG)
+    # Source string lives in the bottom-right corner so the badge owns
+    # the top of the figure.
+    fig.text(0.99, 0.01, f"source: {source}", color="#666",
+             fontsize=8, ha="right", va="bottom", family="monospace")
+    # Outer layout: main heatmap upper-left, sparkline column right,
+    # packet-rate strip across the bottom.
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+    outer = GridSpec(2, 2, figure=fig,
+                     width_ratios=[2.4, 1.0], height_ratios=[10, 1.4],
+                     left=0.06, right=0.97, top=0.88, bottom=0.10,
+                     wspace=0.18, hspace=0.22)
+    ax = fig.add_subplot(outer[0, 0])
+    ax.set_facecolor(PANEL)
     ax.set_xlim(bbox_min[0] - 0.3, bbox_max[0] + 0.3)
     ax.set_ylim(bbox_min[1] - 0.3, bbox_max[1] + 0.3)
     ax.set_aspect("equal")
-    ax.set_xlabel("x (m)")
-    ax.set_ylabel("y (m)")
-    ax.add_patch(plt.Polygon(polygon, fill=False, edgecolor="black", linewidth=1.5))
+    ax.set_xlabel("x (m)", color=AXIS_TXT, fontsize=10)
+    ax.set_ylabel("y (m)", color=AXIS_TXT, fontsize=10)
+    ax.tick_params(colors=AXIS_TXT, labelsize=9)
+    for s in ax.spines.values():
+        s.set_color(GRID)
+    ax.add_patch(plt.Polygon(polygon, fill=False,
+                             edgecolor=AXIS_TXT, linewidth=1.5))
 
     cmap = mpl.colormaps["magma"]
-    # One line + value-label per (TX, RX) pair.
+    # One line + value-label per (TX, RX) pair. Per-TX linestyle so two
+    # fans crossing the same point are still distinguishable.
     line_artists: list = []
     label_artists: list = []
-    pair_keys: list[tuple[str, str]] = []
-    for tx in txs:
+    for tx_idx, tx in enumerate(txs):
+        style = TX_LINESTYLES[tx_idx % len(TX_LINESTYLES)]
         for rx in rxs:
-            line, = ax.plot([tx.x, rx.x], [tx.y, rx.y],
-                            color=cmap(0.0), linewidth=3, solid_capstyle="round",
-                            alpha=0.85)
+            kwargs = dict(color=cmap(0.0), linewidth=3.5,
+                          alpha=0.92, linestyle=style)
+            if style == "-":
+                kwargs["solid_capstyle"] = "round"
+            else:
+                kwargs["dash_capstyle"] = "round"
+            line, = ax.plot([tx.x, rx.x], [tx.y, rx.y], **kwargs)
             line_artists.append(line)
-            pair_keys.append((tx.mac, rx.mac))
             # Tiny value label at the midpoint, so multiple lines through
             # an RX don't pile their text on top of each other.
             mx, my = (tx.x + rx.x) / 2.0, (tx.y + rx.y) / 2.0
             label_artists.append(ax.text(mx, my, "", fontsize=7,
                                          color="white",
                                          ha="center", va="center",
-                                         bbox=dict(facecolor="black", alpha=0.5,
+                                         bbox=dict(facecolor="#000000", alpha=0.55,
                                                    edgecolor="none", pad=1.5)))
 
     # RX dots + labels (drawn after lines so they sit on top).
     for rx in rxs:
-        ax.plot(rx.x, rx.y, "o", color="tab:blue", markersize=12, zorder=5)
-        ax.text(rx.x, rx.y + 0.18, rx.label, ha="center", va="bottom",
-                fontsize=9, color="tab:blue", zorder=6)
+        ax.plot(rx.x, rx.y, "o", color="#4ea3ff", markersize=13, zorder=5,
+                markeredgecolor=BG, markeredgewidth=1.0)
+        ax.text(rx.x, rx.y + 0.20, rx.label, ha="center", va="bottom",
+                fontsize=11, fontweight="bold", color="#4ea3ff", zorder=6)
     # TX stars; each TX gets a slightly different shade so the two fans
     # are visually distinguishable. With one TX, this still draws a star.
-    tx_shades = ["tab:orange", "tab:red", "darkorange", "firebrick"]
+    tx_shades = ["#ffb347", "#ff6363", "#ffa64d", "#e25c5c"]
     for i, tx in enumerate(txs):
-        ax.plot(tx.x, tx.y, "*", color=tx_shades[i % len(tx_shades)],
-                markersize=20, zorder=5)
-        ax.text(tx.x, tx.y + 0.18, tx.label, ha="center", va="bottom",
-                fontsize=10, fontweight="bold",
-                color=tx_shades[i % len(tx_shades)], zorder=6)
+        c = tx_shades[i % len(tx_shades)]
+        ax.plot(tx.x, tx.y, "*", color=c, markersize=22, zorder=5,
+                markeredgecolor=BG, markeredgewidth=1.0)
+        ax.text(tx.x, tx.y + 0.20, tx.label, ha="center", va="bottom",
+                fontsize=12, fontweight="bold", color=c, zorder=6)
 
     # Coloring: with baselines, ratio = current_σ / per-link baseline,
     # tint anchored so RATIO_FLOOR (=1×, still-room) maps to black and
@@ -317,21 +370,93 @@ def run_heatmap(source: str, links_path: str,
         cbar_label = "motion σ (normalized)"
         norm = plt.Normalize(vmin=0, vmax=1)
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-    fig.colorbar(sm, ax=ax, label=cbar_label)
+    cbar = fig.colorbar(sm, ax=ax, label=cbar_label, fraction=0.04, pad=0.02)
+    cbar.ax.tick_params(colors=AXIS_TXT, labelsize=8)
+    cbar.ax.yaxis.label.set_color(AXIS_TXT)
+    cbar.outline.set_edgecolor(GRID)
+
+    # Per-link sparkline column. Each link gets a small inset axes
+    # showing the last SPARKLINE_HISTORY_LEN metric samples. Threshold
+    # lines (motion_enter / motion_exit) are drawn in-axes when ratio
+    # mode is active so you can read the state at a glance.
+    spark_grid = GridSpecFromSubplotSpec(n_links, 1, subplot_spec=outer[0, 1],
+                                         hspace=0.30)
+    spark_axes: list = []
+    spark_lines: list = []
+    spark_value_texts: list = []
+    metric_history: dict[tuple[str, str], collections.deque] = {
+        k: collections.deque(maxlen=SPARKLINE_HISTORY_LEN) for k in pair_keys
+    }
+    spark_y_top = full_bright * 1.1 if use_ratio else 1.0
+    spark_y_bot = 0.0 if use_ratio else 0.0
+    for i, k in enumerate(pair_keys):
+        sax = fig.add_subplot(spark_grid[i, 0])
+        sax.set_facecolor(PANEL)
+        sax.set_xlim(0, SPARKLINE_HISTORY_LEN - 1)
+        sax.set_ylim(spark_y_bot, spark_y_top)
+        sax.set_xticks([])
+        sax.set_yticks([])
+        for s in sax.spines.values():
+            s.set_color(GRID)
+        if use_ratio:
+            sax.axhline(motion_enter, color="#ff6363",
+                        linestyle=":", linewidth=0.7, alpha=0.7)
+            sax.axhline(motion_exit, color="#5fcf6f",
+                        linestyle=":", linewidth=0.7, alpha=0.7)
+            sax.axhline(RATIO_FLOOR, color=GRID,
+                        linestyle="-", linewidth=0.5, alpha=0.7)
+        line, = sax.plot([], [], color="#dddddd", linewidth=1.2)
+        spark_axes.append(sax)
+        spark_lines.append(line)
+        # Labels live inside the axes to avoid overflowing into the main
+        # plot or clipping the right edge: link name pinned upper-left,
+        # current value upper-right (recolored each frame by tint).
+        sax.text(0.02, 0.92, link_label[k], transform=sax.transAxes,
+                 ha="left", va="top", fontsize=8, color=AXIS_TXT,
+                 family="monospace")
+        val = sax.text(0.98, 0.92, "—", transform=sax.transAxes,
+                       ha="right", va="top", fontsize=9, color="#888",
+                       family="monospace", fontweight="bold")
+        spark_value_texts.append(val)
+
+    # Packet-rate / health strip across the bottom: one bar per link
+    # showing pkt/s averaged over PKT_RATE_WINDOW_S. Bars turn red when
+    # rate drops to zero (link presumed dead).
+    rate_ax = fig.add_subplot(outer[1, :])
+    rate_ax.set_facecolor(PANEL)
+    bar_x = np.arange(n_links)
+    rate_bars = rate_ax.bar(bar_x, np.zeros(n_links),
+                            color="#3a8fb7", width=0.78,
+                            edgecolor=BG, linewidth=0.5)
+    rate_ax.set_xlim(-0.6, n_links - 0.4)
+    rate_ax.set_ylim(0, 10)  # autoscaled in update()
+    rate_ax.set_xticks(bar_x)
+    rate_ax.set_xticklabels([link_label[k] for k in pair_keys],
+                            rotation=20, ha="right", fontsize=8,
+                            color=AXIS_TXT)
+    rate_ax.tick_params(axis="y", colors=AXIS_TXT, labelsize=8)
+    rate_ax.tick_params(axis="x", colors=AXIS_TXT)
+    rate_ax.set_ylabel("pkt/s", fontsize=9, color=AXIS_TXT)
+    rate_ax.grid(axis="y", color=GRID, linewidth=0.4, alpha=0.6)
+    rate_ax.set_axisbelow(True)
+    for s in rate_ax.spines.values():
+        s.set_color(GRID)
+    rate_ymax = [10.0]  # autoscaling cap, mutable so closure can update
 
     # Big presence/motion badge across the top of the figure. Driven
     # by the median per-link motion ratio with hysteresis so the
     # state doesn't flicker on noisy frames.
-    badge_text = fig.text(0.5, 0.96, "INITIALIZING", ha="center", va="center",
-                          fontsize=22, fontweight="bold",
+    badge_text = fig.text(0.5, 0.945, "INITIALIZING", ha="center", va="center",
+                          fontsize=24, fontweight="bold",
                           color="white",
-                          bbox=dict(facecolor="dimgray", edgecolor="none",
-                                    boxstyle="round,pad=0.6"))
-    presence_state = ["INIT"]   # mutable ref so the closure can update it
+                          bbox=dict(facecolor="#666666", edgecolor="none",
+                                    boxstyle="round,pad=0.7"))
+    presence_state = ["INIT"]
+    state_change_ts = [0.0]
     BADGE_STYLE = {
-        "INIT":   ("INITIALIZING",   "dimgray"),
-        "EMPTY":  ("EMPTY",          "tab:green"),
-        "MOTION": ("MOTION DETECTED", "tab:red"),
+        "INIT":   ("INITIALIZING",    "#666666"),
+        "EMPTY":  ("EMPTY",           "#2faa55"),
+        "MOTION": ("MOTION DETECTED", "#d94545"),
     }
 
     running_max = [1e-3]
@@ -366,10 +491,39 @@ def run_heatmap(source: str, links_path: str,
             metrics = sigmas
             has_baseline = [True] * len(sigmas)
             text_fmt = lambda m, s, ok: f"{s:.3f}"
-        for line, lbl, tint, m, s, ok in zip(
-                line_artists, label_artists, tints, metrics, sigmas, has_baseline):
-            line.set_color(cmap(tint))
+        for k, line, lbl, tint, m, s, ok in zip(
+                pair_keys, line_artists, label_artists,
+                tints, metrics, sigmas, has_baseline):
+            color = cmap(tint)
+            line.set_color(color)
             lbl.set_text(text_fmt(m, s, ok))
+            # Append to history; the sparkline reads it below.
+            metric_history[k].append(m if ok else float("nan"))
+
+        # Update sparklines + their right-side value badge.
+        for k, sline, vtxt, tint, m, ok in zip(
+                pair_keys, spark_lines, spark_value_texts,
+                tints, metrics, has_baseline):
+            hist = metric_history[k]
+            if hist:
+                arr = np.array(hist, dtype=float)
+                xs = np.arange(len(arr)) + (SPARKLINE_HISTORY_LEN - len(arr))
+                sline.set_data(xs, arr)
+                sline.set_color(cmap(0.25 + 0.75 * tint))
+            vtxt.set_text(text_fmt(m, 0.0, ok))
+            vtxt.set_color(cmap(0.25 + 0.75 * tint) if ok else "#666")
+
+        # Update packet-rate strip. Bars turn dim-red when the link is
+        # silent so dead links pop visually even before the title-bar
+        # warning kicks in.
+        rates = [buffers[k].packet_rate() for k in pair_keys]
+        max_rate = max(rates) if rates else 0.0
+        if max_rate * 1.15 > rate_ymax[0]:
+            rate_ymax[0] = max_rate * 1.3 + 1.0
+            rate_ax.set_ylim(0, rate_ymax[0])
+        for bar, r in zip(rate_bars, rates):
+            bar.set_height(r)
+            bar.set_color("#d94545" if r < 0.5 else "#3a8fb7")
 
         # Update presence/motion badge using hysteresis on the median
         # link metric. Median (not max) so a single noisy link can't
@@ -382,19 +536,31 @@ def run_heatmap(source: str, links_path: str,
         if valid:
             valid.sort()
             mid = valid[len(valid) // 2]
-            cur = presence_state[0]
+            prev = presence_state[0]
+            cur = prev
             if cur == "INIT" and status.get("pkt_count", 0) > motion_window:
                 cur = "EMPTY" if mid < motion_enter else "MOTION"
             elif cur == "EMPTY" and mid >= motion_enter:
                 cur = "MOTION"
             elif cur == "MOTION" and mid <= motion_exit:
                 cur = "EMPTY"
+            if cur != prev:
+                state_change_ts[0] = time.monotonic()
             presence_state[0] = cur
             label, color = BADGE_STYLE[cur]
             if cur != "INIT":
                 label = f"{label}   (median {mid:.2f}×)"
             badge_text.set_text(label)
-            badge_text.get_bbox_patch().set_facecolor(color)
+            patch = badge_text.get_bbox_patch()
+            patch.set_facecolor(color)
+            # Brief flash on transition: white border + extra padding.
+            since_change = time.monotonic() - state_change_ts[0]
+            if since_change < BADGE_FLASH_DURATION_S:
+                patch.set_edgecolor("white")
+                patch.set_linewidth(3.0)
+            else:
+                patch.set_edgecolor("none")
+                patch.set_linewidth(0.0)
         notes = []
         # Reader-thread health on the title so a dead stream is obvious.
         if status.get("fatal_error"):
@@ -409,20 +575,30 @@ def run_heatmap(source: str, links_path: str,
         if status.get("bad_samples", 0):
             notes.append(f"{status['bad_samples']} bad samples")
         # Per-link staleness: any link whose last push is > 3s old is
-        # almost certainly dead (an associated RX that stopped sending
-        # this particular TX, e.g. due to RF, or a TX that died). Names
-        # them by label, not MAC.
+        # almost certainly dead. Group by TX so a fully-dead TX shows
+        # up as a single cluster instead of N entries scattered through
+        # the title bar.
         now = time.monotonic()
-        link_label = {(t.mac, r.mac): f"{t.label}↔{r.label}" for t in txs for r in rxs}
-        dead = []
+        rx_by_mac = {r.mac: r.label for r in rxs}
+        tx_by_mac = {t.mac: t.label for t in txs}
+        tx_order = [t.label for t in txs]
+        dead_by_tx: dict[str, list[str]] = {}
         for k, buf in buffers.items():
             ts = buf.last_push_ts
             if ts == 0.0 or (now - ts) > 3.0:
-                dead.append(link_label.get(k, "?"))
-        if dead and status.get("pkt_count", 0) > 0:
+                tx_lbl = tx_by_mac.get(k[0], "?")
+                rx_lbl = rx_by_mac.get(k[1], "?")
+                dead_by_tx.setdefault(tx_lbl, []).append(rx_lbl)
+        if dead_by_tx and status.get("pkt_count", 0) > 0:
             # Only flag dead links once at least some packets have arrived
             # — pre-startup, every link looks dead.
-            notes.append(f"dead link(s): {', '.join(sorted(dead))}")
+            parts = []
+            for tx_lbl in tx_order:
+                if tx_lbl not in dead_by_tx:
+                    continue
+                rxs_dead = sorted(dead_by_tx[tx_lbl])
+                parts.append(f"{tx_lbl}→{{{','.join(rxs_dead)}}}")
+            notes.append(f"dead: {' | '.join(parts)}")
         if unknown_rx:
             notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
         if unknown_tx:
