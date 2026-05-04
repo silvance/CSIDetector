@@ -193,6 +193,9 @@ def cmd_view3d(args: argparse.Namespace) -> int:
         baselines_path=args.baselines,
         grid_step=args.grid_step, link_sigma_m=args.link_sigma,
         wall_height_m=args.wall_height,
+        max_pins=args.max_pins,
+        pin_separation_m=args.pin_separation,
+        pin_smoothing=args.pin_smoothing,
     )
 
 
@@ -370,6 +373,16 @@ def build_parser() -> argparse.ArgumentParser:
     v3.add_argument("--link-sigma", type=float, default=0.3,
                     help="kernel σ for per-link influence on cells (default 0.3 m)")
     v3.add_argument("--wall-height", type=float, default=2.5)
+    v3.add_argument("--max-pins", type=int, default=3,
+                    help="how many person pins to render (top-K local "
+                         "maxima after non-max suppression; default 3).")
+    v3.add_argument("--pin-separation", type=float, default=1.0,
+                    help="non-max suppression radius in meters — peaks "
+                         "closer than this collapse to one pin (default 1.0).")
+    v3.add_argument("--pin-smoothing", type=float, default=0.4,
+                    help="EMA factor for pin position; 1.0 = no smoothing, "
+                         "0.0 = pins stuck. Lower values reduce chatter on "
+                         "noisy localization (default 0.4).")
     v3.set_defaults(func=cmd_view3d)
 
     cl = sub.add_parser("calibrate-links",

@@ -82,10 +82,14 @@ class _LinkBuffer:
         # Pre-mask buffer of raw amplitudes for the probe phase.
         self._probe: list[np.ndarray] = []
         self._lock = threading.Lock()
+        # Wallclock of the most recent successfully-pushed sample, used
+        # by the viewer to flag dead links in the title bar.
+        self.last_push_ts: float = 0.0
 
     def push(self, sample: csi_collector.CSISample) -> None:
         amp = sample.amplitude
         with self._lock:
+            self.last_push_ts = time.monotonic()
             if self._idx is None:
                 self._probe.append(amp)
                 if len(self._probe) < self.MASK_PROBE:
@@ -344,6 +348,21 @@ def run_heatmap(source: str, links_path: str,
                 notes.append(f"no packets for {since:.1f}s")
         if status.get("bad_samples", 0):
             notes.append(f"{status['bad_samples']} bad samples")
+        # Per-link staleness: any link whose last push is > 3s old is
+        # almost certainly dead (an associated RX that stopped sending
+        # this particular TX, e.g. due to RF, or a TX that died). Names
+        # them by label, not MAC.
+        now = time.monotonic()
+        link_label = {(t.mac, r.mac): f"{t.label}↔{r.label}" for t in txs for r in rxs}
+        dead = []
+        for k, buf in buffers.items():
+            ts = buf.last_push_ts
+            if ts == 0.0 or (now - ts) > 3.0:
+                dead.append(link_label.get(k, "?"))
+        if dead and status.get("pkt_count", 0) > 0:
+            # Only flag dead links once at least some packets have arrived
+            # — pre-startup, every link looks dead.
+            notes.append(f"dead link(s): {', '.join(sorted(dead))}")
         if unknown_rx:
             notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
         if unknown_tx:

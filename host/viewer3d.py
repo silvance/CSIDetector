@@ -176,7 +176,10 @@ def run_viewer3d(source: str, links_path: str,
                  history: int = 500, motion_window: int = 50,
                  baselines_path: Optional[str] = None,
                  grid_step: float = 0.1, link_sigma_m: float = 0.3,
-                 wall_height_m: float = 2.5) -> int:
+                 wall_height_m: float = 2.5,
+                 max_pins: int = 3,
+                 pin_separation_m: float = 1.0,
+                 pin_smoothing: float = 0.4) -> int:
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
     import matplotlib as mpl
@@ -244,11 +247,21 @@ def run_viewer3d(source: str, links_path: str,
                    depthshade=False)
         ax.text(r.x, r.y, 0.05, r.label, color="tab:blue", fontsize=8)
 
-    # Person pin: vertical line from floor to ~head height at the argmax.
-    person_line, = ax.plot([0, 0], [0, 0], [0, 1.7], color="tab:red",
-                            linewidth=3, alpha=0.0)
-    person_dot, = ax.plot([0], [0], [1.7], "o", color="tab:red", markersize=10,
-                           alpha=0.0)
+    # Up to `max_pins` person pins (one per detected local maximum
+    # after non-max suppression). Each pin keeps its own EMA-smoothed
+    # position so it doesn't chatter cell-to-cell on a noisy grid.
+    pin_lines = []
+    pin_dots = []
+    pin_state: list[Optional[tuple[float, float]]] = [None] * max_pins
+    PIN_PALETTE = ["tab:red", "tab:cyan", "tab:green", "tab:purple", "tab:olive"]
+    for i in range(max_pins):
+        c = PIN_PALETTE[i % len(PIN_PALETTE)]
+        line, = ax.plot([0, 0], [0, 0], [0, 1.7], color=c,
+                        linewidth=3, alpha=0.0)
+        dot, = ax.plot([0], [0], [1.7], "o", color=c, markersize=10,
+                       alpha=0.0)
+        pin_lines.append(line)
+        pin_dots.append(dot)
 
     bbox_min = polygon.min(axis=0)
     bbox_max = polygon.max(axis=0)
@@ -293,16 +306,32 @@ def run_viewer3d(source: str, links_path: str,
         # frame is the documented workaround. Cheap at this grid size.
         surf.set_facecolors(cmap(np.clip(norm, 0, 1)).reshape(-1, 4))
 
-        argx, argy, argv = loc.argmax_xy(grid)
-        normv = argv / running_max[0]
-        if normv > PIN_THRESHOLD:
-            person_line.set_data_3d([argx, argx], [argy, argy], [0, 1.7])
-            person_dot.set_data_3d([argx], [argy], [1.7])
-            person_line.set_alpha(min(normv, 1.0))
-            person_dot.set_alpha(min(normv, 1.0))
-        else:
-            person_line.set_alpha(0.0)
-            person_dot.set_alpha(0.0)
+        peaks = loc.topk_local_maxima(grid, max_pins,
+                                      min_separation_m=pin_separation_m)
+        # Render up to max_pins peaks above PIN_THRESHOLD with EMA-smoothed
+        # positions so pins don't chatter cell-to-cell.
+        alpha = pin_smoothing
+        for i, (line, dot) in enumerate(zip(pin_lines, pin_dots)):
+            if i < len(peaks):
+                px, py, pv = peaks[i]
+                normv = pv / running_max[0]
+                if normv > PIN_THRESHOLD:
+                    prev = pin_state[i]
+                    if prev is None:
+                        sx, sy = px, py
+                    else:
+                        sx = alpha * px + (1.0 - alpha) * prev[0]
+                        sy = alpha * py + (1.0 - alpha) * prev[1]
+                    pin_state[i] = (sx, sy)
+                    line.set_data_3d([sx, sx], [sy, sy], [0, 1.7])
+                    dot.set_data_3d([sx], [sy], [1.7])
+                    line.set_alpha(min(normv, 1.0))
+                    dot.set_alpha(min(normv, 1.0))
+                    continue
+            # No peak (or below threshold) for this pin slot.
+            pin_state[i] = None
+            line.set_alpha(0.0)
+            dot.set_alpha(0.0)
 
         notes = []
         if status.get("fatal_error"):
@@ -324,7 +353,7 @@ def run_viewer3d(source: str, links_path: str,
             ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
         else:
             ax.set_title("")
-        return [surf, person_line, person_dot]
+        return [surf, *pin_lines, *pin_dots]
 
     # `anim` is intentionally bound for the duration of plt.show(); without
     # a live reference, matplotlib garbage-collects FuncAnimation and the
