@@ -192,6 +192,7 @@ def cmd_view3d(args: argparse.Namespace) -> int:
         history=args.history, motion_window=args.window,
         baselines_path=args.baselines,
         grid_step=args.grid_step, link_sigma_m=args.link_sigma,
+        node_exclusion_m=args.node_exclusion,
         wall_height_m=args.wall_height,
         max_pins=args.max_pins,
         pin_separation_m=args.pin_separation,
@@ -384,6 +385,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="grid resolution in meters (default 0.1 = 10 cm)")
     v3.add_argument("--link-sigma", type=float, default=0.3,
                     help="kernel σ for per-link influence on cells (default 0.3 m)")
+    v3.add_argument("--node-exclusion", type=float, default=0.5,
+                    help="zero out cells within this radius (m) of any "
+                         "TX/RX position. Stops the argmax from parking "
+                         "at sensor endpoints where multiple link kernels "
+                         "trivially converge. 0 disables. Default 0.5 m.")
     v3.add_argument("--wall-height", type=float, default=2.5)
     v3.add_argument("--max-pins", type=int, default=3,
                     help="how many person pins to render (top-K local "
