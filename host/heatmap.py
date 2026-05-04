@@ -281,6 +281,7 @@ def run_heatmap(source: str, links_path: str,
                 full_bright: float = DEFAULT_RATIO_FULL_BRIGHT,
                 motion_enter: float = 2.0,
                 motion_exit: float = 1.5,
+                motion_quantile: float = 0.75,
                 calibrate_settle_s: float = CALIB_SETTLE_S,
                 calibrate_record_s: float = CALIB_RECORD_S) -> int:
     import matplotlib.pyplot as plt
@@ -657,34 +658,36 @@ def run_heatmap(source: str, links_path: str,
                 # the very next frame, not stay stuck on the green flash.
                 state_change_ts[0] = now_t
 
-        # Update presence/motion badge using hysteresis on the median
-        # link metric. Median (not max) so a single noisy link can't
-        # drive the demo state; (not mean) so a few zeroed-out
-        # missing-baseline links don't drag the signal down. Skipped
-        # while a calibration is in progress — the calib tick above
-        # owns the badge.
+        # Update presence/motion badge using hysteresis on a per-link
+        # ratio quantile. Median (50%) misses partial-fan motion: a
+        # body walking through a room typically lights up only the
+        # 2-3 LOS-adjacent links, so 5+ links stay quiet and the
+        # median sits below motion_enter. The 75th percentile (default)
+        # fires when ~25% of links agree something's going on, while
+        # still rejecting a single freak-noisy link. Skipped while a
+        # calibration is in progress — the calib tick above owns the
+        # badge.
         if calib["phase"] == "IDLE":
             if use_ratio:
                 valid = [m for m, ok in zip(metrics, has_baseline) if ok]
             else:
                 valid = list(metrics)
             if valid:
-                valid.sort()
-                mid = valid[len(valid) // 2]
+                agg = float(np.quantile(valid, motion_quantile))
                 prev = presence_state[0]
                 cur = prev
                 if cur == "INIT" and status.get("pkt_count", 0) > motion_window:
-                    cur = "EMPTY" if mid < motion_enter else "MOTION"
-                elif cur == "EMPTY" and mid >= motion_enter:
+                    cur = "EMPTY" if agg < motion_enter else "MOTION"
+                elif cur == "EMPTY" and agg >= motion_enter:
                     cur = "MOTION"
-                elif cur == "MOTION" and mid <= motion_exit:
+                elif cur == "MOTION" and agg <= motion_exit:
                     cur = "EMPTY"
                 if cur != prev:
                     state_change_ts[0] = time.monotonic()
                 presence_state[0] = cur
                 label, color = BADGE_STYLE[cur]
                 if cur != "INIT":
-                    label = f"{label}   (median {mid:.2f}×)"
+                    label = f"{label}   (p{motion_quantile*100:.0f} {agg:.2f}×)"
                 badge_text.set_text(label)
                 patch = badge_text.get_bbox_patch()
                 patch.set_facecolor(color)

@@ -185,6 +185,7 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
                                full_bright=args.full_bright,
                                motion_enter=args.motion_enter,
                                motion_exit=args.motion_exit,
+                               motion_quantile=args.motion_quantile,
                                calibrate_settle_s=args.calibrate_settle,
                                calibrate_record_s=args.calibrate_record)
 
@@ -197,6 +198,7 @@ def cmd_publish(args: argparse.Namespace) -> int:
         baselines_path=args.baselines,
         history=args.history, motion_window=args.window,
         motion_enter=args.motion_enter, motion_exit=args.motion_exit,
+        motion_quantile=args.motion_quantile,
         publish_hz=args.hz, verbose=args.verbose,
     )
 
@@ -396,6 +398,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="median per-link ratio below which the room is "
                          "declared EMPTY (default 1.5×). Hysteresis between "
                          "exit and enter prevents the badge from flickering.")
+    hm.add_argument("--motion-quantile", type=float, default=0.75,
+                    help="quantile of the per-link ratios used to decide "
+                         "MOTION/EMPTY (default 0.75). 0.5 = strict median "
+                         "(misses partial-fan motion); 0.5–0.9 trades "
+                         "sensitivity for false-positive resistance.")
     hm.add_argument("--calibrate-settle", type=float, default=20.0,
                     help="seconds you have to leave the room after pressing [C] "
                          "in the heatmap window before live recalibration starts "
@@ -463,6 +470,9 @@ def build_parser() -> argparse.ArgumentParser:
     pub.add_argument("--window", type=int, default=50)
     pub.add_argument("--motion-enter", type=float, default=2.0)
     pub.add_argument("--motion-exit", type=float, default=1.5)
+    pub.add_argument("--motion-quantile", type=float, default=0.75,
+                     help="quantile of per-link ratios used to decide MOTION/EMPTY "
+                          "(default 0.75; same default as the heatmap).")
     pub.add_argument("--verbose", action="store_true")
     pub.set_defaults(func=cmd_publish)
 
