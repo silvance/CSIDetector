@@ -187,6 +187,18 @@ def cmd_heatmap(args: argparse.Namespace) -> int:
                                motion_exit=args.motion_exit)
 
 
+def cmd_publish(args: argparse.Namespace) -> int:
+    import publish
+    return publish.run_publisher(
+        args.source, args.links,
+        c5_addr=args.c5_addr, c5_port=args.c5_port,
+        baselines_path=args.baselines,
+        history=args.history, motion_window=args.window,
+        motion_enter=args.motion_enter, motion_exit=args.motion_exit,
+        publish_hz=args.hz, verbose=args.verbose,
+    )
+
+
 def cmd_view3d(args: argparse.Namespace) -> int:
     import viewer3d
     return viewer3d.run_viewer3d(
@@ -424,6 +436,26 @@ def build_parser() -> argparse.ArgumentParser:
                          "to give yourself time to leave the room.")
     cl.add_argument("--window", type=int, default=50)
     cl.set_defaults(func=cmd_calibrate_links)
+
+    pub = sub.add_parser("publish",
+                         help="broadcast presence/motion state to a remote display "
+                              "(e.g. ESP32-C5 with screen)")
+    pub.add_argument("source", help="udp:<port> typically")
+    pub.add_argument("--links", required=True)
+    pub.add_argument("--baselines", default=None)
+    pub.add_argument("--c5-addr", required=True,
+                     help="IP of the receiving display (e.g. 10.42.0.42), or "
+                          "10.42.0.255 for hotspot subnet broadcast.")
+    pub.add_argument("--c5-port", type=int, default=5567,
+                     help="UDP port the C5 listens on (default 5567).")
+    pub.add_argument("--hz", type=float, default=5.0,
+                     help="state-update emit rate (default 5 Hz).")
+    pub.add_argument("--history", type=int, default=500)
+    pub.add_argument("--window", type=int, default=50)
+    pub.add_argument("--motion-enter", type=float, default=2.0)
+    pub.add_argument("--motion-exit", type=float, default=1.5)
+    pub.add_argument("--verbose", action="store_true")
+    pub.set_defaults(func=cmd_publish)
 
     return p
 
