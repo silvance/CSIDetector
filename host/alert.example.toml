@@ -1,0 +1,29 @@
+# Example config for `python run.py alert detect ... --alert-config alert.toml`.
+#
+# Copy this to alert.toml, fill in your bot token + chat id, and chmod 600
+# (the file contains a credential — keep it off CLI args, off ps, off git).
+
+[notifier]
+# "telegram" is the only supported type in Phase 2.
+type = "telegram"
+
+# Get a bot token from @BotFather on Telegram (https://t.me/BotFather).
+# Send your bot a message, then GET https://api.telegram.org/bot<token>/getUpdates
+# to find your chat_id (look for "chat":{"id":...}).
+bot_token = "REPLACE_WITH_YOUR_BOT_TOKEN"
+chat_id   = "REPLACE_WITH_YOUR_CHAT_ID"
+
+[alert]
+# Minimum seconds between repeated MOTION alerts. Within this window
+# the detector still prints transitions to stdout but does not notify
+# again — prevents your phone from buzzing every few seconds during
+# continuous activity.
+cooldown_s = 60
+
+# Set true to also send a "clear" notification on MOTION → STILL.
+# Off by default — most operators want one alert per event, not two.
+clear_on_exit = false
+
+# Short label prepended to every alert message. Useful when you have
+# multiple sensors deployed in different rooms.
+# location_label = "Office"

@@ -46,47 +46,10 @@ def _raw_lines(source: str, baud: int):
             yield line
 
 
-def _collect_amplitudes(source: str, seconds: float | None,
-                        max_samples: int | None,
-                        settle_seconds: float = 0.0
-                        ) -> tuple[np.ndarray, np.ndarray]:
-    if seconds is None and max_samples is None:
-        raise SystemExit(
-            "calibrate: at least one of --seconds or --max-samples is "
-            "required (otherwise it would run forever).")
-    src = csi_collector.open_source(source)
-    rows: list[np.ndarray] = []
-    idx = None
-    start = time.time()
-    settle_until = start + settle_seconds
-    deadline = (settle_until + seconds) if seconds else None
-    skipped = 0
-    for sample in src:
-        if time.time() < settle_until:
-            skipped += 1
-            continue
-        if idx is None:
-            idx = np.flatnonzero(sample.amplitude > 0)
-            if idx.size == 0:
-                continue
-        rows.append(sample.amplitude)
-        if max_samples and len(rows) >= max_samples:
-            break
-        if deadline and time.time() >= deadline:
-            break
-    if not rows or idx is None:
-        raise SystemExit("no CSI samples received")
-    if settle_seconds > 0:
-        print(f"dropped {skipped} samples during AGC settle ({settle_seconds:.1f}s)",
-              file=sys.stderr)
-    amps = np.stack(rows)[:, idx]
-    return amps, idx
-
-
 # --------------------------------------------------------------------------
-# Command bodies. Phase 2+ may relocate the alert-mode bodies into
-# csidetector.modes.alert.{calibrate,detect}; for Phase 1 they stay here
-# so the relocation is a pure file move with no behavior diff.
+# Command bodies. Alert-mode bodies live in csidetector.modes.alert.{calibrate,
+# detect}. Localize-mode bodies still inline here as thin wrappers around
+# csidetector.modes.localize.* — moving them out is a Phase 5 polish task.
 # --------------------------------------------------------------------------
 
 def cmd_capture(args: argparse.Namespace) -> int:
@@ -107,47 +70,48 @@ def cmd_capture(args: argparse.Namespace) -> int:
 
 
 def cmd_calibrate(args: argparse.Namespace) -> int:
-    amps, idx = _collect_amplitudes(
-        args.source, args.seconds, args.max_samples,
-        settle_seconds=args.settle,
+    from csidetector.modes.alert.calibrate import run_calibrate
+    return run_calibrate(
+        source=args.source,
+        seconds=args.seconds,
+        settle=args.settle,
+        max_samples=args.max_samples,
+        window=args.window,
     )
-    baseline = detector.compute_baseline(amps, args.window)
-    print(f"baseline={baseline:.6f}  samples={amps.shape[0]}  subcarriers={idx.size}",
-          file=sys.stderr)
-    print(f"{baseline:.6f}")
-    return 0
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
-    cfg = detector.DetectorConfig(
+    from csidetector.modes.alert.detect import run_detect
+    from csidetector.modes.alert.config import load_config, build_notifier
+
+    cfg = load_config(getattr(args, "alert_config", None))
+    notifier = build_notifier(cfg)
+
+    # CLI flags override config file values for the runtime knobs.
+    alert_cfg = cfg.get("alert", {}) if isinstance(cfg, dict) else {}
+    cooldown_s = (args.cooldown_s
+                  if args.cooldown_s is not None
+                  else float(alert_cfg.get("cooldown_s", 60.0)))
+    clear_on_exit = (args.clear_on_exit
+                     if args.clear_on_exit is not None
+                     else bool(alert_cfg.get("clear_on_exit", False)))
+    location_label = (args.location
+                      if args.location is not None
+                      else str(alert_cfg.get("location_label", "")))
+
+    return run_detect(
+        source=args.source,
+        baseline=args.baseline,
         window=args.window,
         enter_ratio=args.enter,
         exit_ratio=args.exit,
+        settle=args.settle,
+        verbose=args.verbose,
+        notifier=notifier,
+        cooldown_s=cooldown_s,
+        clear_on_exit=clear_on_exit,
+        location_label=location_label,
     )
-    src = csi_collector.open_source(args.source)
-    det: detector.MotionDetector | None = None
-    last_state = False
-    settle_until = time.time() + args.settle
-    for sample in src:
-        if time.time() < settle_until:
-            continue
-        if det is None:
-            idx = np.flatnonzero(sample.amplitude > 0)
-            if idx.size == 0:
-                continue
-            det = detector.MotionDetector(idx, args.baseline, cfg)
-        score, motion = det.update(sample.amplitude)
-        if motion != last_state:
-            event = "MOTION" if motion else "STILL"
-            print(f"{csi_collector.now_iso()} {event} score={score:.4f} "
-                  f"baseline={det.baseline:.4f} ratio={score/det.baseline:.2f}",
-                  flush=True)
-            last_state = motion
-        elif args.verbose:
-            print(f"{csi_collector.now_iso()} score={score:.4f} "
-                  f"ratio={score/det.baseline:.2f}",
-                  flush=True)
-    return 0
 
 
 def cmd_view(args: argparse.Namespace) -> int:
@@ -345,6 +309,27 @@ def _attach_detect(p: argparse.ArgumentParser) -> None:
     p.add_argument("--enter", type=float, default=3.0)
     p.add_argument("--exit", type=float, default=1.5)
     p.add_argument("--verbose", action="store_true")
+    # Alert-mode notifier knobs. Without --alert-config the detector
+    # behaves exactly like before (prints transitions, no notifications).
+    p.add_argument("--alert-config", default=None,
+                   help="path to alert.toml with notifier credentials + "
+                        "alert preferences. Without it, no notifications "
+                        "fire (legacy stdout-only behavior preserved).")
+    p.add_argument("--cooldown-s", type=float, default=None,
+                   help="minimum seconds between repeated MOTION alerts "
+                        "(default 60, or whatever alert.toml [alert] "
+                        "cooldown_s sets).")
+    # Tri-state on a bool flag — None means 'use config'. argparse
+    # supports this via dest + const tricks; simpler: store_true and
+    # let cmd_detect treat None as 'inherit from config'.
+    p.add_argument("--clear-on-exit", action="store_const", const=True,
+                   default=None,
+                   help="also send a notification on MOTION → STILL "
+                        "(off by default).")
+    p.add_argument("--location", default=None,
+                   help="short label prepended to alert messages "
+                        "(e.g. 'Office'). Overrides location_label "
+                        "in alert.toml.")
     p.set_defaults(func=cmd_detect)
 
 
