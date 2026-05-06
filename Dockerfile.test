@@ -1,0 +1,39 @@
+# Containerized test harness for CSIDetector host code.
+#
+# Runs all of host/tests/ in a deterministic, hardware-free environment.
+# Used by scripts/test-in-docker.sh and (eventually) by CI.
+#
+# Build:
+#     docker build -f Dockerfile.test -t csidetector-test .
+#
+# Run:
+#     docker run --rm csidetector-test
+#
+# Drop into a shell to iterate on tests locally:
+#     docker run --rm -it -v "$(pwd)/host:/repo/host" csidetector-test bash
+
+FROM python:3.11-slim
+
+WORKDIR /repo
+
+# Test-only deps. Notably absent:
+#   - PyQt6 — only needed for the interactive viewer's Qt backend
+#   - pyserial — only needed for live serial reads (no hardware here)
+# Both are skipped to keep the image small and the build fast.
+RUN pip install --no-cache-dir \
+        "numpy>=1.24" \
+        "matplotlib>=3.7" \
+        "pytest>=7.0"
+
+COPY host/ /repo/host/
+
+WORKDIR /repo/host
+
+# Headless matplotlib backend; otherwise plt imports try to open a display.
+ENV MPLBACKEND=Agg \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Default invocation: full suite, verbose, short tracebacks. Override at
+# `docker run` time with e.g. `pytest tests/test_alert_queue.py -v`.
+CMD ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]

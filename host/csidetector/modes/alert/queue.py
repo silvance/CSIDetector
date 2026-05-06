@@ -72,11 +72,15 @@ CREATE INDEX IF NOT EXISTS idx_pending
 """
 
 
-def _backoff_seconds(attempts: int) -> float:
-    """min(base * 2^(attempts-1), cap). attempts=1 → 60s, 2 → 120s, …"""
+def _backoff_seconds(attempts: int,
+                     base_s: float = BACKOFF_BASE_S,
+                     max_s: float = BACKOFF_MAX_S) -> float:
+    """min(base * 2^(attempts-1), cap). With defaults: attempts=1 → 60s,
+    2 → 120s, …, capped at 1h. The base is configurable so tests can
+    drive a deterministic retry sequence within the suite's time budget."""
     if attempts <= 0:
         return 0.0
-    return min(BACKOFF_BASE_S * (2 ** (attempts - 1)), BACKOFF_MAX_S)
+    return min(base_s * (2 ** (attempts - 1)), max_s)
 
 
 class _Store:
@@ -88,13 +92,14 @@ class _Store:
     not a contention concern.
     """
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, backoff_base_s: float = BACKOFF_BASE_S):
         path = Path(os.path.expanduser(db_path)).resolve()
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(
             str(path), check_same_thread=False, isolation_level=None,
         )
         self._lock = threading.Lock()
+        self._backoff_base = float(backoff_base_s)
         with self._lock:
             self._conn.executescript(_SCHEMA)
 
@@ -147,7 +152,8 @@ class _Store:
             if row is None:
                 return  # vanished — nothing to do
             attempts = int(row[0]) + 1
-            next_ts = time.time() + _backoff_seconds(attempts)
+            next_ts = time.time() + _backoff_seconds(
+                attempts, base_s=self._backoff_base)
             self._conn.execute(
                 "UPDATE events SET attempts = ?, last_error = ?, "
                 " next_retry_ts = ? WHERE event_id = ?",
@@ -178,9 +184,10 @@ class QueuingNotifier(Notifier):
 
     def __init__(self, inner: Notifier,
                  db_path: str = DEFAULT_DB_PATH,
-                 poll_interval_s: float = WORKER_POLL_S):
+                 poll_interval_s: float = WORKER_POLL_S,
+                 backoff_base_s: float = BACKOFF_BASE_S):
         self._inner = inner
-        self._store = _Store(db_path)
+        self._store = _Store(db_path, backoff_base_s=backoff_base_s)
         self._poll = float(poll_interval_s)
         self._wake = threading.Event()
         self._stopping = threading.Event()
@@ -260,4 +267,7 @@ def from_config(cfg: dict, inner: Notifier) -> Notifier:
         return inner
     db_path = queue_cfg.get("path", DEFAULT_DB_PATH)
     poll = float(queue_cfg.get("poll_interval_s", WORKER_POLL_S))
-    return QueuingNotifier(inner=inner, db_path=db_path, poll_interval_s=poll)
+    backoff_base = float(queue_cfg.get("backoff_base_s", BACKOFF_BASE_S))
+    return QueuingNotifier(inner=inner, db_path=db_path,
+                           poll_interval_s=poll,
+                           backoff_base_s=backoff_base)
