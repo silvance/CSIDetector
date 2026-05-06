@@ -57,41 +57,49 @@ def run_detect(source: str,
     last_alert_ts = 0.0
     settle_until = time.time() + settle
 
-    for sample in src:
-        if time.time() < settle_until:
-            continue
-        if det is None:
-            idx = np.flatnonzero(sample.amplitude > 0)
-            if idx.size == 0:
+    try:
+        for sample in src:
+            if time.time() < settle_until:
                 continue
-            det = detector.MotionDetector(idx, baseline, cfg)
-        score, motion = det.update(sample.amplitude)
-        if motion != last_state:
-            kind = "MOTION" if motion else "STILL"
-            ratio = score / det.baseline
-            print(f"{csi_collector.now_iso()} {kind} score={score:.4f} "
-                  f"baseline={det.baseline:.4f} ratio={ratio:.2f}",
-                  flush=True)
+            if det is None:
+                idx = np.flatnonzero(sample.amplitude > 0)
+                if idx.size == 0:
+                    continue
+                det = detector.MotionDetector(idx, baseline, cfg)
+            score, motion = det.update(sample.amplitude)
+            if motion != last_state:
+                kind = "MOTION" if motion else "STILL"
+                ratio = score / det.baseline
+                print(f"{csi_collector.now_iso()} {kind} score={score:.4f} "
+                      f"baseline={det.baseline:.4f} ratio={ratio:.2f}",
+                      flush=True)
 
-            now = time.time()
-            should_notify = False
-            if motion:
-                # STILL → MOTION: notify unless we recently did.
-                if now - last_alert_ts >= cooldown_s:
+                now = time.time()
+                should_notify = False
+                if motion:
+                    # STILL → MOTION: notify unless we recently did.
+                    if now - last_alert_ts >= cooldown_s:
+                        should_notify = True
+                        last_alert_ts = now
+                elif clear_on_exit:
+                    # MOTION → STILL: notify only if explicitly enabled.
                     should_notify = True
-                    last_alert_ts = now
-            elif clear_on_exit:
-                # MOTION → STILL: notify only if explicitly enabled.
-                should_notify = True
 
-            if should_notify:
-                _dispatch(notifier, kind, ratio, location_label)
+                if should_notify:
+                    _dispatch(notifier, kind, ratio, location_label)
 
-            last_state = motion
-        elif verbose:
-            print(f"{csi_collector.now_iso()} score={score:.4f} "
-                  f"ratio={score/det.baseline:.2f}",
-                  flush=True)
+                last_state = motion
+            elif verbose:
+                print(f"{csi_collector.now_iso()} score={score:.4f} "
+                      f"ratio={score/det.baseline:.2f}",
+                      flush=True)
+    finally:
+        # QueuingNotifier.close() drains pending events (best-effort)
+        # and stops the worker thread; NullNotifier.close() is a no-op.
+        try:
+            notifier.close()
+        except Exception:  # noqa: BLE001
+            pass
     return 0
 
 

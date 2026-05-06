@@ -27,3 +27,17 @@ clear_on_exit = false
 # Short label prepended to every alert message. Useful when you have
 # multiple sensors deployed in different rooms.
 # location_label = "Office"
+
+[queue]
+# Durable outbound queue for notifications. When the upstream service
+# (Telegram) is briefly unreachable, events are stored on disk and
+# retried with exponential backoff (60s, 2m, 4m, ..., capped at 1h).
+# Default on; turn off for tests with `enabled = false`.
+enabled = true
+
+# Where the SQLite file lives. `~` expands to your home directory.
+# path = "~/.csidetector/alert-queue.db"
+
+# Worker poll interval. The queue also wakes immediately on each new
+# event, so this only matters for retrying after a transient failure.
+# poll_interval_s = 30

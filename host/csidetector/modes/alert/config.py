@@ -38,11 +38,18 @@ def load_config(path: Optional[str]) -> dict:
 
 
 def build_notifier(cfg: dict):
-    """Construct a Notifier from the [notifier] table, or NullNotifier."""
+    """Construct a Notifier from the [notifier] table.
+
+    When a sender is configured, it is wrapped in a QueuingNotifier so
+    transient failures don't drop events. Disable the queue with
+    ``[queue] enabled = false`` in alert.toml if you want unbuffered
+    sends (rarely useful — recommended only for tests).
+    """
     from csidetector.modes.alert.notifier import NullNotifier
+    from csidetector.modes.alert.queue import from_config as queue_from_config
     from csidetector.modes.alert.telegram import from_config as telegram_from_config
 
-    notifier = telegram_from_config(cfg)
-    if notifier is not None:
-        return notifier
-    return NullNotifier()
+    inner = telegram_from_config(cfg)
+    if inner is None:
+        return NullNotifier()
+    return queue_from_config(cfg, inner=inner)
