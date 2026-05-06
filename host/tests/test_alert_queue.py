@@ -123,3 +123,31 @@ def test_queue_survives_restart(db_path):
         assert q2.pending_count >= 1
     finally:
         q2.close()
+
+
+def test_queue_retry_then_success_marks_sent(db_path):
+    """Transient failure → backoff window expires → next attempt succeeds.
+
+    Uses ``backoff_base_s=0.05`` so the deterministic retry sequence
+    completes in well under a second. With production defaults
+    (``BACKOFF_BASE_S=60``) this test would block for >1 minute.
+    """
+    inner = _StubInner()
+    inner.fail_first_n = 2     # fail twice, then succeed
+    q = QueuingNotifier(inner=inner, db_path=db_path,
+                        poll_interval_s=0.05,
+                        backoff_base_s=0.05)
+    try:
+        ev = Event.now("MOTION", "flaky-but-eventual")
+        q.send(ev)
+
+        # Three attempts total: two failures + one success.
+        assert _wait_for(lambda: inner.calls.count(ev.id) >= 3, timeout=3.0), \
+            f"only {inner.calls.count(ev.id)} attempts made"
+        # And the row is no longer pending.
+        assert _wait_for(lambda: q.pending_count == 0, timeout=3.0), \
+            f"pending {q.pending_count} after success"
+        # Not marked dead either.
+        assert q.dead_count == 0
+    finally:
+        q.close()

@@ -93,6 +93,34 @@ The CLI is the same `python run.py …` you've always used; new subcommands
 are added under `localize` and `alert` namespaces and the old top-level
 names (`heatmap`, `detect`, …) continue to work as aliases.
 
+### Run the test suite
+
+Locally (uses your venv's matplotlib if installed; skips the matplotlib-
+dependent localize smoke test otherwise):
+
+```sh
+cd host && python -m pytest tests/ -v
+```
+
+Or, hardware-free and reproducible, in a container:
+
+```sh
+./scripts/test-in-docker.sh                  # all layers
+./scripts/test-in-docker.sh --rebuild        # force a fresh image build
+```
+
+The container installs numpy + matplotlib + pytest only — no Qt, no
+pyserial, no real Telegram. It exercises:
+
+- core (parsing, filters, motion detection),
+- the CLI parser tree (every `--help` variant + back-compat alias dispatch),
+- alert-mode config (TOML loader + `build_notifier` factory matrix),
+- alert-mode durable queue (happy path, idempotency, transient-and-success,
+  permanent dead, restart-survives),
+- localize-mode module wiring (figure setup, file format round-trip).
+
+Suite is ~60 tests, runs in <5 seconds.
+
 ---
 
 ## Workflow A — Localized motion detection (multi-RX/TX)
