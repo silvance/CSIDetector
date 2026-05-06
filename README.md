@@ -1,134 +1,80 @@
 # CSIDetector
 
 WiFi Channel State Information (CSI) based motion sensing on ESP32 hardware.
-A small mesh of ESP32-S3 transmitters and receivers cooperate over a
-hotspot to localize motion in a room; the host renders a live floor-plan
-heatmap and a 2.5D scene with a "person" pin tracking the brightest
-spot.
+One platform, two workflows:
 
-## Hardware
+- **Localize mode** — a small mesh of multiple TX + RX boards over a hotspot,
+  with a live floor-plan heatmap and a 2.5D room viewer that pins the
+  brightest cell. Best for room-scale motion *localization*.
+- **Alert mode** — one TX + one RX, binary motion detection, optional
+  Telegram alerts with a durable retry queue. Best for *occupancy /
+  tamper notification* with minimal hardware and zero hotspot infrastructure.
 
-- 1+ ESP32-S3 transmitter board (more = better localization).
-- 4+ ESP32-S3 receiver boards distributed around the room.
-- A host computer with Python 3.10+ and a 2.4 GHz WiFi adapter that
-  supports AP mode (built-in card or any cheap USB dongle).
-- USB chargers for the receivers (no host tether needed once flashed).
+Both modes share the same signal-processing core (parsing, filters,
+sliding-window σ, hysteresis state machine), so improvements in one
+benefit the other.
 
-The S2 / C3 / C5 also work in principle but the firmware has only been
-exercised on S3.
+## Which workflow fits me?
 
-## Architecture
+| Question | Localize | Alert |
+|---|---|---|
+| Boards needed | 1+ TX, 4+ RX | 1 TX + 1 RX |
+| Network setup | Hotspot + UDP | UART-only — no Wi-Fi infra needed |
+| Output | Live heatmap + person pin on a floor plan | `STILL` / `MOTION` events + optional Telegram message |
+| Goal | "Where is the person?" | "Did someone enter the room while I was away?" |
+| Setup time | 1-2 hours (calibration, geometry) | 5-10 minutes |
 
-```
-   ┌──────────┐  ESP-NOW broadcast (HT20 MCS0, ch 11)  ┌──────────┐
-   │ ESP32-TX │ ──────────────────────────────────────▶│ ESP32-RX │  × N
-   │   ×M     │                                        │ STA + CSI│
-   └──────────┘                                        └────┬─────┘
-                                                            │ UDP/WiFi
-                                                            ▼
-                                                     ┌────────────┐
-                                                     │  host (PC) │
-                                                     │ AP + viewer│
-                                                     └────────────┘
-```
+You can install the same firmware on every board and pick the workflow
+at the host side — nothing about alert mode requires a separate firmware
+build.
 
-Each TX broadcasts a small ESP-NOW frame at a fixed rate on a fixed
-channel. Each RX listens for those broadcasts (filtered by source MAC),
-and for every received broadcast emits one CSI sample. The RX then
-sends each sample as a binary UDP packet to the host's hotspot IP. The
-host listens on UDP, demuxes per-RX, computes per-link motion-σ on a
-sliding window, and renders.
+---
 
-Single-stream UART is still supported for development on one board (the
-firmware also prints CSI rows in the [esp-csi](https://github.com/espressif/esp-csi)
-text format), but the full demo runs over UDP.
+## Common: hardware + firmware
 
-## Firmware
+### Hardware
 
-Both firmware projects target **ESP-IDF v5.3 or newer** (tested on
-v5.5). Set the target once on a fresh checkout:
+- **TX**: ESP32-S3 board (1 minimum; 2+ for localize). The S2 / C3 / C5
+  also work in principle but the firmware has only been exercised on S3.
+- **RX**: ESP32-S3 board (1 for alert; 4+ for localize).
+- **Host**: any computer with Python 3.11+. Localize mode also needs
+  a 2.4 GHz Wi-Fi adapter that supports AP mode (built-in card or any
+  cheap USB dongle).
 
-    idf.py set-target esp32s3
+### Firmware
 
-### Transmitter (`firmware/csi_transmitter/`)
+Both firmware projects target **ESP-IDF v5.3 or newer** (tested on v5.5).
+A helper script drops you into a subshell with IDF activated:
 
 ```sh
-cd firmware/csi_transmitter
-idf.py menuconfig    # CSI_TX_CHANNEL / CSI_TX_RATE_HZ
-idf.py -p /dev/ttyACM0 flash monitor   # or /dev/ttyUSB0 on USB-UART boards
+./idf-env.sh csi_transmitter      # TX side
+./idf-env.sh csi_receiver         # RX side
+idf.py set-target esp32s3         # one-time per project
+idf.py menuconfig                 # Wi-Fi creds, channel, MAC filter
+idf.py -p /dev/ttyACM0 flash monitor
 ```
-
-Boot log:
-
-    I (412) csi_tx: TX up: mac=ac:a7:04:2c:42:54 ch=11 rate=100Hz
 
 The TX firmware pins broadcasts to 11n HT20 MCS0 via
-`esp_now_set_peer_rate_config`. Without this, ESP-NOW falls back to
-11b 1 Mbps DSSS (no HT-LTF), and the receiver's CSI engine never
-fires for the broadcasts. Note the MAC — every receiver needs it in
-its filter.
+`esp_now_set_peer_rate_config` — without this, ESP-NOW falls back to
+11b 1 Mbps DSSS (no HT-LTF) and the receiver's CSI engine never fires.
+Note the TX MAC: every receiver needs it in its filter.
 
-### Receiver (`firmware/csi_receiver/`)
+Required `menuconfig` values on the receiver depend on which workflow
+you're running:
 
-```sh
-cd firmware/csi_receiver
-idf.py menuconfig    # see required values below
-idf.py -p /dev/ttyACMx flash monitor
-```
+| Setting | Localize (multi-RX) | Alert (single-RX) |
+|---|---|---|
+| `CSI_RX_CHANNEL` | matches TX (e.g. 11) | matches TX (e.g. 11) |
+| `CSI_RX_FILTER_TX_MAC` | comma-separated TX MAC list | the one TX's MAC |
+| `CSI_RX_WIFI_SSID` | `CSIDetector` (the hotspot) | **leave blank** |
+| `CSI_RX_WIFI_PASS` | blank (open hotspot) | n/a |
+| `CSI_RX_HOST_IP` | `10.42.0.1` (host on hotspot) | n/a |
 
-Required `menuconfig` values for the multi-RX UDP setup:
+Leaving `CSI_RX_WIFI_SSID` blank disables Wi-Fi STA + UDP and falls
+back to **UART-only** mode — exactly what alert mode wants. The receiver
+then prints CSI rows over USB-CDC and the host reads them directly.
 
-    CSI_RX_CHANNEL         = 11               # must match TX
-    CSI_RX_FILTER_TX_MAC   = <TX1 MAC>, <TX2 MAC>     # comma-separated
-    CSI_RX_WIFI_SSID       = CSIDetector
-    CSI_RX_WIFI_PASS       = (blank, see Hotspot section)
-    CSI_RX_HOST_IP         = 10.42.0.1        # host's hotspot IP
-    CSI_RX_HOST_PORT       = 5566
-
-Leaving `CSI_RX_WIFI_SSID` blank disables WiFi STA + UDP and falls back
-to the original UART-only single-RX flow, which is useful for a quick
-smoke test on one board.
-
-> **Note on WiFi credentials**: `CSI_RX_WIFI_SSID` and `CSI_RX_WIFI_PASS`
-> are baked into the receiver's `sdkconfig` and flashed in plain text to
-> the chip's flash. For a closed demo network this is fine; for any
-> other deployment, treat the receivers as having a recoverable
-> password and don't reuse a credential you care about elsewhere.
-> The recipe in the next section uses an open hotspot, which sidesteps
-> this entirely.
-
-### Host hotspot
-
-NetworkManager creates a 2.4 GHz hotspot. Pick a USB dongle if you also
-need internet on the host's built-in card:
-
-```sh
-IFACE=wlp2s0u2   # whatever `nmcli device | grep wifi` shows
-nmcli connection add type wifi ifname "$IFACE" con-name Hotspot autoconnect no \
-    ssid CSIDetector \
-    802-11-wireless.mode ap \
-    802-11-wireless.band bg \
-    802-11-wireless.channel 11 \
-    ipv4.method shared \
-    ipv6.method ignore
-nmcli connection up Hotspot
-
-# Open the UDP port in the right firewalld zone (NM puts hotspot ifaces
-# in `nm-shared`, not the default `FedoraWorkstation`).
-sudo firewall-cmd --zone=nm-shared --add-port=5566/udp --permanent
-sudo firewall-cmd --reload
-```
-
-Verify with `iw dev "$IFACE" info | grep channel` and
-`ip addr show "$IFACE" | grep inet`. Channel 11 must match
-`CSI_TX_CHANNEL` and `CSI_RX_CHANNEL`.
-
-This recipe sets up an OPEN (no-password) hotspot. WPA2 also works, but
-some USB AP adapters can't reliably complete the 4-way handshake with
-multiple ESP32 STAs simultaneously, so for a closed demo network OPEN
-is the path of least resistance.
-
-## Host pipeline
+### Host setup
 
 ```sh
 cd host
@@ -136,97 +82,161 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-`<source>` is a serial port (`/dev/ttyUSB0`, `COM5`), a saved log file,
-`udp:<port>` for the hotspot setup, or `-` for stdin. Multi-RX
-subcommands (`heatmap`, `view3d`, `calibrate-links`) only make sense
-with a `udp:<port>` source.
+`<source>` for both modes is one of:
 
-### Quick sanity check on packet rates
+- `udp:<port>` — multi-RX over the hotspot (localize mode)
+- `/dev/ttyUSB0`, `/dev/ttyACM0`, `COM5` — single RX over USB-CDC (alert mode)
+- a captured log file — replay
+- `-` — stdin
+
+The CLI is the same `python run.py …` you've always used; new subcommands
+are added under `localize` and `alert` namespaces and the old top-level
+names (`heatmap`, `detect`, …) continue to work as aliases.
+
+---
+
+## Workflow A — Localized motion detection (multi-RX/TX)
+
+### 1. Set up the hotspot (once)
+
+NetworkManager creates a 2.4 GHz hotspot. Use a USB Wi-Fi dongle so the
+host's built-in card is free for internet:
 
 ```sh
-python -c "
-import socket, time, collections
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('0.0.0.0', 5566))
-counts = collections.Counter(); end = time.time() + 5
-while time.time() < end:
-    data, _ = s.recvfrom(2048); counts[(data[2:8].hex(':'), data[8:14].hex(':'))] += 1
-for (rx, tx), n in sorted(counts.items()):
-    print(f'TX={tx}  RX={rx}  {n//5}/s')"
+IFACE=wlp2s0u2   # whatever `nmcli device | grep wifi` shows
+nmcli connection add type wifi ifname "$IFACE" con-name CSIDetector autoconnect no \
+    ssid CSIDetector \
+    802-11-wireless.mode ap 802-11-wireless.band bg 802-11-wireless.channel 11 \
+    ipv4.method shared ipv6.method ignore
+nmcli connection up CSIDetector
+
+# Open the UDP port in the right firewalld zone (NM puts hotspot ifaces
+# in `nm-shared`, not the default zone):
+sudo firewall-cmd --zone=nm-shared --add-port=5566/udp --permanent
+sudo firewall-cmd --reload
 ```
 
-Expect one row per (TX, RX) pair at ~100/s. With 2 TX × 4 RX you'll see
-8 pairs.
+The shipped `./start.sh` brings the hotspot up + launches the heatmap
+viewer in one command for everyday use.
 
-### Calibrate per-link still-room baselines
+### 2. Calibrate per-link still-room baselines
 
 Leave the room. The script counts down before recording starts:
 
 ```sh
-python run.py calibrate-links udp:5566 --settle 30 --seconds 30 --out baselines.json
+python run.py localize calibrate-links udp:5566 \
+    --settle 30 --seconds 30 --out baselines.json
 ```
 
-`--settle` doubles as the walk-out timer. The output JSON maps each
-RX MAC to its baseline motion-σ. RXs that didn't deliver enough
-samples are flagged in stderr — silent drops would later show as
-dead links in the heatmap.
+`--settle` doubles as the walk-out timer.
 
-### Live floor-plan heatmap
+### 3. Live floor-plan heatmap + 2.5D viewer
 
 ```sh
-cp links.example.json links.json    # edit room polygon, TX/RX MACs, positions
-python run.py heatmap udp:5566 --links links.json --baselines baselines.json
+cp host/links.example.json host/links.json    # edit room polygon, TX/RX MACs, positions
+
+python run.py localize heatmap udp:5566 --links links.json --baselines baselines.json
+python run.py localize view3d  udp:5566 --links links.json --baselines baselines.json
 ```
 
-Each TX-RX line is tinted by its current motion-σ divided by its
-still-room baseline (1× = idle, ≥5× = saturated). With multiple
-TXs you get multiple fans of links crossing the room.
+The heatmap window has a `[C]` key that re-runs calibration in-place
+(20 s walk-out + 15 s record by default — adjustable via
+`--calibrate-settle` / `--calibrate-record`). New baselines overwrite
+the file you passed via `--baselines`.
 
-### 2.5D room viewer
+### 4. Optional: broadcast presence state to a remote display
 
 ```sh
-python run.py view3d udp:5566 --links links.json --baselines baselines.json
+python run.py localize publish udp:5566 --links links.json --baselines baselines.json \
+    --c5-addr 10.42.0.255    # subnet broadcast on the hotspot
 ```
 
-Walls extruded from the polygon, floor surface coloured by per-cell
-motion likelihood (Gaussian-weighted sum of per-link motion-σ along
-each TX-RX line), red person pin at the brightest cell when
-likelihood exceeds a threshold.
+The shipped C5 firmware (`firmware/c5_display/`) listens for these and
+shows EMPTY / MOTION DETECTED on its LCD.
 
-### Single-stream debug viewer
+---
+
+## Workflow B — Single-room alerting (one TX + one RX)
+
+This mode is intentionally minimal: no hotspot, no JSON config files,
+no heatmap window. Just a baseline, a detector, and (optionally) a
+Telegram bot that pings you when something moves.
+
+### 1. Calibrate the still-room baseline
+
+Power up the TX, plug the RX into the host via USB. Leave the room and:
 
 ```sh
-python run.py view /dev/ttyUSB0      # one RX, UART
-python run.py view udp:5566          # pins to the first rx_id seen, drops the rest
+BASELINE=$(python run.py alert calibrate /dev/ttyUSB0 --seconds 30 --settle 30)
+echo "$BASELINE"   # e.g. 0.183421
 ```
 
-Subcarrier × time waterfall + motion-σ trace. Useful for verifying
-one board independently.
+The baseline is one float — no JSON file needed.
 
-### Capture a log
+### 2. Detect motion (no notifications)
 
 ```sh
-python run.py capture /dev/ttyUSB0 still.log --seconds 30
+python run.py alert detect /dev/ttyUSB0 --baseline "$BASELINE"
 ```
 
-### Single-stream binary detector
+Prints `STILL` / `MOTION` event lines on every transition. `--enter`
+and `--exit` control the hysteresis ratios (defaults 3.0× / 1.5×).
 
-For a single-board (UART) setup. `calibrate` here emits one scalar
-baseline σ; the multi-RX path uses `calibrate-links` instead, which
-writes a per-RX JSON consumed by `heatmap` / `view3d`. The two
-subcommands are not interchangeable.
+### 3. Detect motion with Telegram alerts
+
+Get a bot token from [@BotFather](https://t.me/BotFather), send your
+bot a message, then GET `https://api.telegram.org/bot<token>/getUpdates`
+to find your chat id. Drop both into a config file:
 
 ```sh
-BASELINE=$(python run.py calibrate /dev/ttyUSB0 --seconds 30)
-python run.py detect /dev/ttyUSB0 --baseline "$BASELINE"
+cp host/alert.example.toml host/alert.toml
+chmod 600 host/alert.toml      # the file contains a credential
+$EDITOR host/alert.toml        # fill in bot_token and chat_id
 ```
 
-Prints `MOTION` / `STILL` events on transitions. `--enter` / `--exit`
-control the hysteresis ratio (defaults 3.0× / 1.5×).
+Then run detect with `--alert-config`:
+
+```sh
+python run.py alert detect /dev/ttyUSB0 --baseline "$BASELINE" \
+    --alert-config alert.toml --location "Office"
+```
+
+You'll get a Telegram message on every `STILL → MOTION` transition.
+Repeat alerts inside the same activity window are suppressed by a
+configurable cooldown (default 60 s — set `--cooldown-s` or
+`alert.cooldown_s` in the config). Pass `--clear-on-exit` to also send
+a notification on `MOTION → STILL`.
+
+### How offline alerts survive an internet outage
+
+Each alert is enqueued in a SQLite file (default
+`~/.csidetector/alert-queue.db`) before being handed to the Telegram
+sender. A background worker drains the queue with exponential backoff:
+
+- Transient failure (network down, Telegram 5xx): retry at
+  60 s, 2 m, 4 m, 8 m, … up to 1 h, until success.
+- Permanent failure (Telegram 4xx — bad token, bad chat id, malformed
+  message): mark the row dead and stop retrying.
+- Process restart: pending rows are picked up automatically.
+- Idempotency: each event has a UUID; re-enqueueing the same id is a
+  no-op, so a crash mid-send can't double-deliver.
+
+So if your host loses internet for an hour and you walk past the sensor
+twice during that hour, both alerts deliver as soon as the host is
+back online — Telegram itself then handles delivery to your phone if
+*it* was offline.
+
+Disable the queue (rare; useful only for tests) by setting
+`[queue] enabled = false` in `alert.toml`.
+
+---
 
 ## Tuning notes
 
+These mostly apply to localize mode but a few help alert mode too.
+
 - **Channel**: pick the 2.4 GHz channel with the least neighbouring
-  WiFi traffic. Channel 11 is a reasonable default in North America.
+  Wi-Fi traffic. Channel 11 is a reasonable default in North America.
   TX, RX, and the hotspot AP must all be on the same channel.
 - **TX placement**: corners are best. A TX in the middle of the room
   makes every link's motion-σ rise on any motion (the long links
@@ -236,20 +246,25 @@ control the hysteresis ratio (defaults 3.0× / 1.5×).
   catch hand motion, low enough that ESP-NOW airtime is comfortable
   with multiple TXs.
 - **Antenna**: the WROOM-1U's u.fl connector takes any 2.4 GHz
-  antenna (WiFi Pineapple antennas, generic ESP32 dev-kit antennas).
+  antenna (Wi-Fi Pineapple antennas, generic ESP32 dev-kit antennas).
   LoRa antennas (sub-GHz) will not work.
+- **RF blast zones**: 3D printers, microwaves, USB3 cables, switching
+  power supplies, and routers right next to a receiver will tank its
+  packet rate and inflate σ. The heatmap's pkt-rate strip surfaces this
+  immediately; in alert mode the RX's noisy σ shows up as constant
+  false MOTION until you move the sensor.
 - **Metal in the line of sight**: still kills the link. Metal furniture,
-  appliances, and structural beams between TX and RX mask any motion
+  appliances, and structural beams between TX and RX mask motion
   behind them.
 
 ## Roadmap
 
 - [x] Single TX / single RX, live waterfall, single-stream binary detector
-- [x] Multi-RX over WiFi (UDP forwarding to host), per-link motion-σ heatmap
-- [x] Multi-TX support, per-link baselines, 2.5D floor-plan viewer with
-      person pin
-- [ ] Multi-person separation (top-K local maxima with non-max suppression)
-- [ ] Aggregator firmware on ESP32-C5-with-screen for an untethered display
+- [x] Multi-RX over Wi-Fi (UDP forwarding to host), per-link motion-σ heatmap
+- [x] Multi-TX support, per-link baselines, 2.5D floor-plan viewer with person pin
+- [x] Multi-person separation (top-K local maxima with non-max suppression)
+- [x] Aggregator firmware on ESP32-C5-with-screen for an untethered display
+- [x] Telegram alerting + durable outbound queue (alert mode)
 - [ ] Optional: NBVI subcarrier auto-selection (espectre's MVS)
 - [ ] Doppler/phase processing for sub-meter localization
 
@@ -268,4 +283,4 @@ This project leans on prior work; in particular:
 - [euaziel/WiFi-CSI-Human-Pose-Detection](https://github.com/euaziel/WiFi-CSI-Human-Pose-Detection)
   — surveyed for pose-estimation approaches; not adopted because
   full-pose models require multi-antenna NICs (e.g. Intel 5300) that
-  ESP32s do not have.
+  ESP32 doesn't expose.
