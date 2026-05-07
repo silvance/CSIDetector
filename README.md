@@ -14,6 +14,10 @@ Both modes share the same signal-processing core (parsing, filters,
 sliding-window σ, hysteresis state machine), so improvements in one
 benefit the other.
 
+> **In a hurry?** If you just want the alert-mode demo working in 15
+> minutes, follow [`docs/alert-quickstart.md`](docs/alert-quickstart.md).
+> It's numbered steps, no narrative, with troubleshooting inline.
+
 ## Which workflow fits me?
 
 | Question | Localize | Alert |
