@@ -151,6 +151,29 @@ sudo firewall-cmd --reload
 The shipped `./start.sh` brings the hotspot up + launches the heatmap
 viewer in one command for everyday use.
 
+If your hotspot drops when no clients are connected (some USB Wi-Fi
+dongles / power-management configs do this), three quick fixes in
+order of preference:
+
+```sh
+# Tell NM to bring it back up automatically.
+nmcli connection modify CSIDetector connection.autoconnect yes \
+                                    connection.autoconnect-retries 0
+
+# Disable Wi-Fi radio power-save on the AP interface.
+sudo iw dev wlp2s0u2 set power_save off    # match your iface name
+
+# Last resort: install the watchdog timer that ticks every 30 s and
+# revives the hotspot if it's down. See scripts/csidetector-hotspot.{service,timer}
+# for the unit files; install with:
+#
+#   $EDITOR scripts/csidetector-hotspot.service       # set ExecStart= absolute path
+#   sudo cp scripts/csidetector-hotspot.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now csidetector-hotspot.timer
+#   journalctl -u csidetector-hotspot --since "5 min ago"   # verify
+```
+
 ### 2. Calibrate per-link still-room baselines
 
 Leave the room. The script counts down before recording starts:
