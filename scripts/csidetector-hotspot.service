@@ -1,0 +1,28 @@
+# systemd unit: one-shot watchdog tick. Triggered by csidetector-hotspot.timer.
+#
+# Edit ExecStart= below to point at the absolute path of hotspot-watchdog.sh
+# in your checkout, then:
+#
+#   sudo cp scripts/csidetector-hotspot.service /etc/systemd/system/
+#   sudo cp scripts/csidetector-hotspot.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now csidetector-hotspot.timer
+#
+# Inspect:
+#   journalctl -u csidetector-hotspot --since "5 min ago"
+#   systemctl list-timers | grep csidetector
+
+[Unit]
+Description=CSIDetector hotspot watchdog (one-shot)
+# Do not run before NetworkManager is reachable — saves a noisy first
+# attempt at boot before nmcli can list connections.
+After=NetworkManager.service
+Requires=NetworkManager.service
+
+[Service]
+Type=oneshot
+# REPLACE THIS PATH with the absolute path to your checkout's
+# hotspot-watchdog.sh. The script is designed to be safe to rerun.
+ExecStart=/REPLACE_ME/CSIDetector/scripts/hotspot-watchdog.sh
+# Customize HOTSPOT_NAME if your nmcli connection isn't named "CSIDetector":
+# Environment=HOTSPOT_NAME=MyOtherAP
