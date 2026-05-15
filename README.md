@@ -17,6 +17,11 @@ benefit the other.
 > **In a hurry?** If you just want the alert-mode demo working in 15
 > minutes, follow [`docs/alert-quickstart.md`](docs/alert-quickstart.md).
 > It's numbered steps, no narrative, with troubleshooting inline.
+>
+> **Ready to deploy as an appliance?** Once the desktop demo works, see
+> [`docs/appliance-setup.md`](docs/appliance-setup.md) for the
+> Pi Zero 2 W + ESP32-S3 single-box setup. One installer script handles
+> the whole bootstrap (deps, venv, calibration, systemd unit).
 
 ## Which workflow fits me?
 
