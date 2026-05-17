@@ -119,14 +119,18 @@ def test_build_notifier_queue_disabled_returns_bare_telegram():
         n.close()
 
 
-def test_build_notifier_missing_token_raises():
-    with pytest.raises(ValueError, match="bot_token"):
+def test_build_notifier_missing_token_raises_systemexit():
+    # ValueError from TelegramNotifier.__init__ gets converted to
+    # SystemExit by build_notifier so the CLI doesn't dump a raw
+    # traceback on a config typo. Message should still mention the
+    # offending field so the operator can fix it.
+    with pytest.raises(SystemExit, match="bot_token"):
         build_notifier({"notifier": {"type": "telegram",
                                      "bot_token": "", "chat_id": "1"}})
 
 
-def test_build_notifier_missing_chat_id_raises():
-    with pytest.raises(ValueError, match="chat_id"):
+def test_build_notifier_missing_chat_id_raises_systemexit():
+    with pytest.raises(SystemExit, match="chat_id"):
         build_notifier({"notifier": {"type": "telegram",
                                      "bot_token": "t", "chat_id": ""}})
 
@@ -147,5 +151,22 @@ def test_queue_path_expands_tilde_and_creates_parent_dir(tmp_path, monkeypatch):
         # The DB file itself is created lazily by sqlite3; opening the
         # connection in _Store.__init__ does that.
         assert expected.exists()
+    finally:
+        n.close()
+
+
+def test_queue_clamps_zero_poll_interval(tmp_path):
+    """poll_interval_s=0 in config would otherwise turn the worker into
+    a tight CPU-burning loop. from_config clamps it to a small floor."""
+    cfg = {
+        "notifier": {"type": "telegram", "bot_token": "t", "chat_id": "1"},
+        "queue": {"path": str(tmp_path / "q.db"), "poll_interval_s": 0,
+                  "backoff_base_s": 0},
+    }
+    n = build_notifier(cfg)
+    try:
+        assert isinstance(n, QueuingNotifier)
+        # Inspect the worker's poll interval; must be > 0.
+        assert n._poll >= 0.05
     finally:
         n.close()

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import math
 from typing import Optional
 
 import numpy as np
@@ -71,6 +72,18 @@ def hampel_filter(x: np.ndarray, k: float = 3.0, window: int = 7) -> np.ndarray:
 class MotionDetector:
     def __init__(self, subcarrier_idx: np.ndarray, baseline: float,
                  config: DetectorConfig = DetectorConfig()):
+        # Reject NaN / non-positive / non-finite baselines explicitly.
+        # max(nan, x) returns nan in Python, which then produces nan
+        # ratios — neither enter nor exit branch fires, the detector
+        # silently never alerts, and the operator has no signal that
+        # anything is wrong. Better to crash now with a clear error.
+        if not math.isfinite(baseline) or baseline <= 0:
+            raise ValueError(
+                f"MotionDetector: baseline must be a positive finite number, "
+                f"got {baseline!r}. Re-run calibration.")
+        if config.window <= 0:
+            raise ValueError(
+                f"MotionDetector: window must be > 0, got {config.window!r}")
         self.idx = subcarrier_idx
         self.baseline = max(float(baseline), config.min_baseline)
         self.cfg = config
@@ -78,6 +91,13 @@ class MotionDetector:
         self._in_motion = False
 
     def update(self, amplitude: np.ndarray) -> tuple[float, bool]:
+        # Defensively drop samples whose subcarrier count is too small
+        # for the index — happens on mid-stream bandwidth/MCS changes
+        # the same way it does for the multi-link _LinkBuffer. Without
+        # this, alert-mode `detect` crashes with IndexError and stops
+        # delivering notifications.
+        if self.idx.size and self.idx.max() >= amplitude.size:
+            return 0.0, self._in_motion
         self._buf.append(amplitude[self.idx])
         if len(self._buf) < self._buf.maxlen:
             return 0.0, self._in_motion
