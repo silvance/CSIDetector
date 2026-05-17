@@ -24,6 +24,11 @@ from csidetector.modes.alert.notifier import (
 
 _API_BASE = "https://api.telegram.org/bot{token}/sendMessage"
 _TIMEOUT_S = 10.0
+# HTTP 4xx codes that are *transient* despite being in the client-error
+# range — Telegram returns these under load / rate-limiting, and the
+# right behavior is to retry with backoff rather than mark the event
+# permanently dead. 408 = Request Timeout, 429 = Too Many Requests.
+_TRANSIENT_4XX = frozenset({408, 429})
 
 
 class TelegramNotifier(Notifier):
@@ -49,17 +54,30 @@ class TelegramNotifier(Notifier):
             headers={"Content-Type": "application/x-www-form-urlencoded"})
         try:
             with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
+                raw = resp.read()
         except urllib.error.HTTPError as exc:
-            # 4xx from Telegram = bad token / bad chat id / malformed
-            # message — never going to succeed on retry. Surface as
-            # permanent so the queue (Phase 3) doesn't loop forever.
-            if 400 <= exc.code < 500:
+            # 4xx is mostly permanent (bad token / chat id / malformed
+            # message) — but 408 / 429 are explicitly transient: Telegram
+            # rate-limiting a burst of motion events would otherwise
+            # cause silent message loss. Let those re-raise so the queue
+            # retries them with backoff.
+            if 400 <= exc.code < 500 and exc.code not in _TRANSIENT_4XX:
                 raise PermanentNotifierError(
                     f"telegram returned HTTP {exc.code}: {exc.reason}") from exc
-            raise   # 5xx / network: transient, caller may retry
+            raise   # 5xx / 408 / 429: transient, caller may retry
         except urllib.error.URLError:
             raise   # transient network issue
+        # 2xx body parse. A captive portal or transparent proxy can
+        # return non-JSON HTML here; without bounding that, the queue
+        # would retry it forever. Treat unparseable 2xx bodies as
+        # permanent so the queue marks the row dead and we move on.
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            preview = raw[:80].decode("utf-8", errors="replace")
+            raise PermanentNotifierError(
+                f"telegram returned 2xx with non-JSON body "
+                f"(captive portal?): {preview!r}") from exc
         if not payload.get("ok", False):
             # Body says ok=false even though HTTP was 2xx — Telegram does
             # this on some malformed-input cases. Treat as permanent.

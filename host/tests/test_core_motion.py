@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
+import pytest
 
 from csidetector.core import detector
 
@@ -45,3 +48,62 @@ def test_motion_detector_transitions(synthetic_amplitudes):
             saw_clear = True
             break
     assert saw_clear, "stuck in MOTION after data went quiet"
+
+
+# --------------------------------------------------------------------------
+# Constructor validation.
+# --------------------------------------------------------------------------
+
+def test_motion_detector_rejects_nan_baseline():
+    """The old code did max(nan, x) which returns nan, then ratio = nan,
+    then neither enter/exit branch ever fires — silently no alerts.
+    Reject explicitly so the operator gets a clear error."""
+    with pytest.raises(ValueError, match="baseline"):
+        detector.MotionDetector(np.arange(8), float("nan"))
+
+
+def test_motion_detector_rejects_zero_baseline():
+    with pytest.raises(ValueError, match="baseline"):
+        detector.MotionDetector(np.arange(8), 0.0)
+
+
+def test_motion_detector_rejects_negative_baseline():
+    with pytest.raises(ValueError, match="baseline"):
+        detector.MotionDetector(np.arange(8), -0.1)
+
+
+def test_motion_detector_rejects_inf_baseline():
+    with pytest.raises(ValueError, match="baseline"):
+        detector.MotionDetector(np.arange(8), float("inf"))
+
+
+def test_motion_detector_rejects_zero_window():
+    cfg = detector.DetectorConfig(window=0)
+    with pytest.raises(ValueError, match="window"):
+        detector.MotionDetector(np.arange(8), 0.1, cfg)
+
+
+# --------------------------------------------------------------------------
+# Mid-stream shape mismatch (bandwidth / MCS change).
+# --------------------------------------------------------------------------
+
+def test_motion_detector_drops_too_short_samples_without_crashing(synthetic_amplitudes):
+    """If a later sample has fewer subcarriers than the idx mask covers
+    (e.g. a mid-stream bandwidth change), the old code raised IndexError
+    and killed alert-mode detect. New behavior: silently drop the
+    runt sample and keep going."""
+    cfg = detector.DetectorConfig(window=50)
+    still = synthetic_amplitudes(n=100, n_sub=64, noise=0.01)
+    baseline = detector.compute_baseline(still[:75], window=25)
+    det = detector.MotionDetector(np.arange(64), baseline, cfg)
+    # Normal-width sample: accepted.
+    score, _ = det.update(still[0])
+    assert math.isfinite(score)
+    # Runt sample (32 subcarriers, but idx covers 0..63): must not crash.
+    runt = np.ones(32, dtype=np.float32)
+    score, motion = det.update(runt)
+    assert score == 0.0
+    assert motion is False
+    # Subsequent normal-width sample is still processed correctly.
+    score, _ = det.update(still[1])
+    assert math.isfinite(score)

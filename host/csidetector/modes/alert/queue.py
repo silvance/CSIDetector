@@ -266,8 +266,13 @@ def from_config(cfg: dict, inner: Notifier) -> Notifier:
     if not enabled:
         return inner
     db_path = queue_cfg.get("path", DEFAULT_DB_PATH)
-    poll = float(queue_cfg.get("poll_interval_s", WORKER_POLL_S))
-    backoff_base = float(queue_cfg.get("backoff_base_s", BACKOFF_BASE_S))
+    # Clamp to floors. poll_interval_s = 0 turns the worker into a tight
+    # loop (wake.wait(0) returns immediately, drain, repeat) that pegs a
+    # CPU and hammers the DB. backoff_base_s = 0 makes failed sends loop
+    # at queue-poll cadence with no breathing room. Both useful only in
+    # tests; clamp to small but non-zero floors in production.
+    poll = max(0.05, float(queue_cfg.get("poll_interval_s", WORKER_POLL_S)))
+    backoff_base = max(0.05, float(queue_cfg.get("backoff_base_s", BACKOFF_BASE_S)))
     return QueuingNotifier(inner=inner, db_path=db_path,
                            poll_interval_s=poll,
                            backoff_base_s=backoff_base)

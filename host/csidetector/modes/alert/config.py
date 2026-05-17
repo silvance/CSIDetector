@@ -44,12 +44,19 @@ def build_notifier(cfg: dict):
     transient failures don't drop events. Disable the queue with
     ``[queue] enabled = false`` in alert.toml if you want unbuffered
     sends (rarely useful — recommended only for tests).
+
+    Misconfigured creds (empty bot_token / chat_id) raise as a friendly
+    ``SystemExit`` rather than letting the underlying ``ValueError``
+    bubble up as an unhandled traceback from the CLI.
     """
     from csidetector.modes.alert.notifier import NullNotifier
     from csidetector.modes.alert.queue import from_config as queue_from_config
     from csidetector.modes.alert.telegram import from_config as telegram_from_config
 
-    inner = telegram_from_config(cfg)
+    try:
+        inner = telegram_from_config(cfg)
+    except ValueError as exc:
+        raise SystemExit(f"alert: notifier config invalid: {exc}") from exc
     if inner is None:
         return NullNotifier()
     return queue_from_config(cfg, inner=inner)
