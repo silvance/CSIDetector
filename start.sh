@@ -43,8 +43,19 @@ else
         echo "          nmcli con modify '${HOTSPOT_NAME}' ipv4.method shared"
         exit 1
     fi
-    echo "[start] waiting 3s for the AP to settle..."
-    sleep 3
+    # Poll up to ~10s for the AP to actually reach activated state.
+    # `nmcli connection up` returns when the activation is requested,
+    # not when it's complete — the radio still needs a moment to bring
+    # up the BSS. Fixed sleeps either over-wait (slow startup) or fire
+    # too early on slow USB dongles.
+    echo "[start] waiting for AP to reach activated state..."
+    for _ in $(seq 1 20); do
+        if nmcli -t -f NAME,STATE connection show --active 2>/dev/null \
+                | grep -qx "${HOTSPOT_NAME}:activated"; then
+            break
+        fi
+        sleep 0.5
+    done
 fi
 
 # --- 2. Sanity-check the host config -------------------------------------

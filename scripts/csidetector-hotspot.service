@@ -15,9 +15,12 @@
 [Unit]
 Description=CSIDetector hotspot watchdog (one-shot)
 # Do not run before NetworkManager is reachable — saves a noisy first
-# attempt at boot before nmcli can list connections.
+# attempt at boot before nmcli can list connections. Wants= (not
+# Requires=) so a temporary NM hiccup doesn't permanently disable the
+# watchdog. The watchdog itself handles the "nmcli not available"
+# case gracefully.
 After=NetworkManager.service
-Requires=NetworkManager.service
+Wants=NetworkManager.service
 
 [Service]
 Type=oneshot

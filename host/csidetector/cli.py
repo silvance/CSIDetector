@@ -242,6 +242,17 @@ def cmd_calibrate_links(args: argparse.Namespace) -> int:
             next_tick = time.time() + 5.0
 
     stop.set()
+    # Drain any exception the reader thread enqueued during the record
+    # window. Without this, a bad source URL (or any other reader-side
+    # failure) gets masked as a misleading "no usable baselines" error,
+    # while the real root cause sits in the queue and is never raised.
+    while True:
+        try:
+            item = samples_q.get_nowait()
+        except queue.Empty:
+            break
+        if isinstance(item, Exception):
+            raise item
     baselines = detector.compute_link_baselines(per_link, window=args.window)
     if not baselines:
         raise SystemExit("no usable baselines — did any link deliver enough samples?")
