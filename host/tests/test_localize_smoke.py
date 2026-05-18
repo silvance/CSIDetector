@@ -56,6 +56,8 @@ def test_load_links_round_trip():
 
 
 def test_load_baselines_handles_envelope_format():
+    # Light smoke check — full coverage of the load paths is in
+    # test_localize_config.py, which doesn't need matplotlib.
     from csidetector.modes.localize.heatmap import _load_baselines, _Node
 
     txs = [_Node(mac="aa:bb:cc:dd:ee:01", x=0, y=0, label="TX1")]
