@@ -120,6 +120,18 @@ def cmd_view(args: argparse.Namespace) -> int:
         args.source, history=args.history, motion_window=args.window)
 
 
+def cmd_alert_gui(args: argparse.Namespace) -> int:
+    from csidetector.modes.alert.gui import run_gui
+    return run_gui(
+        source=args.source,
+        alert_config=args.alert_config,
+        baseline=args.baseline,
+        enter_ratio=args.enter,
+        exit_ratio=args.exit,
+        location=args.location,
+    )
+
+
 def cmd_heatmap(args: argparse.Namespace) -> int:
     from csidetector.modes.localize import heatmap
     return heatmap.run_heatmap(args.source, args.links,
@@ -353,6 +365,29 @@ def _attach_view(p: argparse.ArgumentParser) -> None:
     p.set_defaults(func=cmd_view)
 
 
+def _attach_alert_gui(p: argparse.ArgumentParser) -> None:
+    """Alert-mode desktop GUI. All flags are optional — the GUI loads
+    its last-known settings from ~/.csidetector/state.json and persists
+    edits there. CLI flags override the persisted state for this run."""
+    p.add_argument("--source", default=None,
+                   help="serial device path (default: last value used, "
+                        "or /dev/ttyACM0)")
+    p.add_argument("--alert-config", default=None,
+                   help="path to alert.toml (Telegram creds + cooldown). "
+                        "Without one, the GUI runs in stdout-only mode "
+                        "with the 'Test alert' button disabled.")
+    p.add_argument("--baseline", type=float, default=None,
+                   help="override the persisted baseline σ. You'll usually "
+                        "want to use the Calibrate button instead.")
+    p.add_argument("--enter", type=float, default=None,
+                   help="motion-enter ratio (default: persisted value or 1.7)")
+    p.add_argument("--exit", type=float, default=None,
+                   help="motion-exit ratio (default: persisted value or 1.3)")
+    p.add_argument("--location", default=None,
+                   help="location label prepended to alert messages.")
+    p.set_defaults(func=cmd_alert_gui)
+
+
 def _attach_heatmap(p: argparse.ArgumentParser) -> None:
     p.add_argument("source", help="udp:<port> typically")
     p.add_argument("--links", required=True,
@@ -499,6 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
     _attach_view(al_sub.add_parser("view-waterfall",
                                    help="single-stream waterfall viewer "
                                         "(useful for install-time QA)"))
+    _attach_alert_gui(al_sub.add_parser("gui",
+                                        help="desktop GUI (Qt): calibrate, "
+                                             "arm/disarm, live ratio + queue"))
 
     return p
 
