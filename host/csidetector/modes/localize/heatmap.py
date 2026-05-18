@@ -99,8 +99,27 @@ class _Node:
 
 
 def _load_links(path: str) -> tuple[dict, list[_Node], list[_Node]]:
-    with open(path) as f:
-        cfg = json.load(f)
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"links config {path}: malformed JSON ({exc.msg} at line "
+            f"{exc.lineno})") from exc
+    except OSError as exc:
+        raise SystemExit(f"links config {path}: {exc}") from exc
+
+    # Explicit top-level validation; without it a missing key raises a
+    # bare KeyError ("'rxs'") that gives the user no useful context.
+    for required in ("room", "rxs"):
+        if required not in cfg:
+            raise SystemExit(
+                f"links config {path}: missing top-level '{required}' key. "
+                f"See links.example.json for the expected schema.")
+    if "txs" not in cfg and "tx" not in cfg:
+        raise SystemExit(
+            f"links config {path}: missing 'txs' (or legacy 'tx') key.")
+
     txs_cfg = cfg["txs"] if "txs" in cfg else [cfg["tx"]]
     txs = []
     for i, t in enumerate(txs_cfg):
@@ -244,10 +263,33 @@ def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], floa
     if not path:
         return {}
     import os
-    with open(path) as f:
-        raw = json.load(f)
-    meta = raw.get("_meta") if isinstance(raw, dict) else None
-    if meta is not None and "links" in raw:
+    try:
+        with open(path) as f:
+            raw = json.load(f)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"baselines {path}: malformed JSON ({exc.msg} at line "
+            f"{exc.lineno})") from exc
+    except OSError as exc:
+        raise SystemExit(f"baselines {path}: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise SystemExit(
+            f"baselines {path}: top-level JSON must be an object, "
+            f"got {type(raw).__name__}")
+
+    meta = raw.get("_meta")
+    if meta is not None:
+        # Wrapped envelope (with metadata). Require an explicit `links`
+        # map — without it, the file is truncated/corrupt and the only
+        # safe behavior is to refuse it. The old code fell through to
+        # the "flat" branch and tried to coerce the metadata dict to a
+        # float, producing a confusing TypeError on viewer startup.
+        if "links" not in raw or not isinstance(raw["links"], dict):
+            raise SystemExit(
+                f"baselines {path}: wrapped envelope is missing 'links' "
+                f"map (or it's not an object). Re-run `calibrate-links` "
+                f"or hand-edit the file.")
         link_map = raw["links"]
         # Stale-file warning: file mtime > 1 hour suggests environment
         # has likely drifted enough that the baselines aren't valid.
@@ -261,7 +303,11 @@ def _load_baselines(path: Optional[str], txs, rxs) -> dict[tuple[str, str], floa
         except OSError:
             pass
     else:
-        link_map = raw
+        # Flat formats — strip any stray _meta key defensively before
+        # iterating, even though we'd only see one here if someone
+        # hand-edited a file in an unusual way.
+        link_map = {k: v for k, v in raw.items() if k != "_meta"}
+
     out: dict[tuple[str, str], float] = {}
     legacy_rx_macs: set[str] = set()
     tx_macs = [t.mac for t in txs]
@@ -520,10 +566,15 @@ def run_heatmap(source: str, links_path: str,
             return
         if calib["phase"] != "IDLE":
             return
-        calib["phase"] = "SETTLE"
-        calib["started"] = time.monotonic()
-        calib["samples"] = {k: [] for k in pair_keys}
-        print(f"heatmap: live recalibration started — leave the room "
+        # Key handler runs on the GUI event thread; only set a single
+        # sentinel string. The actual reset of calib['samples'] and
+        # 'started' happens in update() so all multi-field mutations
+        # are confined to one thread. Without this, a keypress during
+        # an animation frame can race the dict replacement against the
+        # `calib['samples'][k].append(sigma)` happening in RECORD, with
+        # samples appended to the orphaned old list.
+        calib["phase"] = "REQUESTED"
+        print(f"heatmap: live recalibration requested — leave the room "
               f"(settle {calibrate_settle_s:.0f}s, record {calibrate_record_s:.0f}s)")
 
     fig.canvas.mpl_connect("key_press_event", on_key)
@@ -610,6 +661,14 @@ def run_heatmap(source: str, links_path: str,
         # calibration phase instead of the presence state.
         phase = calib["phase"]
         now_t = time.monotonic()
+        if phase == "REQUESTED":
+            # Promote the request to SETTLE here (animation thread) so
+            # all multi-field mutations of `calib` happen on one thread.
+            # See on_key() for why.
+            calib["started"] = now_t
+            calib["samples"] = {k: [] for k in pair_keys}
+            calib["phase"] = "SETTLE"
+            phase = "SETTLE"
         elapsed = now_t - calib["started"]
         if phase == "SETTLE":
             remain = max(0.0, calibrate_settle_s - elapsed)
@@ -634,26 +693,42 @@ def run_heatmap(source: str, links_path: str,
             if elapsed >= calibrate_record_s:
                 # Median (not mean) so a single transient spike doesn't
                 # poison a whole link's baseline.
+                # Record sample counts for EVERY attempted link, including
+                # ones that didn't hit the 5-sample threshold. Without
+                # this, the saved _meta.samples_per_link silently omits
+                # skipped links and the audit trail makes stale-but-
+                # preserved baselines look freshly recorded.
                 updated = 0
+                skipped: list[str] = []
                 samples_per_link: dict[tuple[str, str], int] = {}
                 for k, samples in calib["samples"].items():
+                    samples_per_link[k] = len(samples)
                     if len(samples) >= 5:
                         baselines[k] = float(np.median(samples))
-                        samples_per_link[k] = len(samples)
                         updated += 1
+                    else:
+                        skipped.append(f"{k[0]}|{k[1]}")
                 if baselines_path:
                     try:
                         _save_baselines_envelope(
                             baselines_path, baselines,
                             calibrate_settle_s, calibrate_record_s,
                             motion_window, samples_per_link)
-                        print(f"heatmap: live-calibrated {updated} links "
-                              f"→ {baselines_path}")
+                        msg = (f"heatmap: live-calibrated {updated} links "
+                               f"→ {baselines_path}")
+                        if skipped:
+                            msg += (f" (skipped {len(skipped)} with <5 "
+                                    f"samples; old baselines kept)")
+                        print(msg)
                     except OSError as e:
                         print(f"heatmap: calibration done but save failed: {e}")
                 else:
-                    print(f"heatmap: live-calibrated {updated} links (in-memory only; "
-                          f"pass --baselines next time to persist)")
+                    msg = (f"heatmap: live-calibrated {updated} links "
+                           f"(in-memory only; pass --baselines next time "
+                           f"to persist)")
+                    if skipped:
+                        msg += f" — skipped {len(skipped)} with <5 samples"
+                    print(msg)
                 calib["phase"] = "DONE"
                 calib["started"] = now_t
         elif phase == "DONE":
@@ -664,8 +739,14 @@ def run_heatmap(source: str, links_path: str,
             patch.set_linewidth(3.0)
             if elapsed >= CALIB_DONE_FLASH_S:
                 calib["phase"] = "IDLE"
-                # Force the badge to re-evaluate against current state on
-                # the very next frame, not stay stuck on the green flash.
+                # Re-bootstrap the presence state machine after recal.
+                # Without this, the badge flips back to whatever it was
+                # before calibration (likely MOTION since the user was
+                # in the room) on the very next frame, with no flash —
+                # confusing for ~1 frame until the new ratios cross
+                # motion_exit. Forcing INIT makes the state machine
+                # re-derive from the fresh baselines.
+                presence_state[0] = "INIT"
                 state_change_ts[0] = now_t
 
         # Update presence/motion badge using hysteresis on a per-link
@@ -751,9 +832,12 @@ def run_heatmap(source: str, links_path: str,
                 tx_lbl = tx_by_mac.get(k[0], "?")
                 rx_lbl = rx_by_mac.get(k[1], "?")
                 dead_by_tx.setdefault(tx_lbl, []).append(rx_lbl)
-        if dead_by_tx and status.get("pkt_count", 0) > 0:
-            # Only flag dead links once at least some packets have arrived
-            # — pre-startup, every link looks dead.
+        # Wait until at least ~one motion-window of packets has arrived
+        # before flagging any link dead. Otherwise, in the first ~3 s
+        # after the first packet, every link except the one that just
+        # received looks "dead" and the title bar lights up red for no
+        # reason. motion_window scales naturally with sample rate.
+        if dead_by_tx and status.get("pkt_count", 0) >= motion_window:
             parts = []
             for tx_lbl in tx_order:
                 if tx_lbl not in dead_by_tx:
@@ -761,10 +845,15 @@ def run_heatmap(source: str, links_path: str,
                 rxs_dead = sorted(dead_by_tx[tx_lbl])
                 parts.append(f"{tx_lbl}→{{{','.join(rxs_dead)}}}")
             notes.append(f"dead: {' | '.join(parts)}")
+        # Snapshot the unknown_rx/_tx sets under the GIL before
+        # iterating — the reader thread can still be adding entries.
+        # set.copy() holds the GIL for the duration; without it, a
+        # concurrent .add() during sorted() raises
+        # `RuntimeError: Set changed size during iteration`.
         if unknown_rx:
-            notes.append(f"unknown RX: {', '.join(sorted(unknown_rx))}")
+            notes.append(f"unknown RX: {', '.join(sorted(unknown_rx.copy()))}")
         if unknown_tx:
-            notes.append(f"unknown TX: {', '.join(sorted(unknown_tx))}")
+            notes.append(f"unknown TX: {', '.join(sorted(unknown_tx.copy()))}")
         if notes:
             ax.set_title("  |  ".join(notes), fontsize=8, color="tab:red")
         else:
