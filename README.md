@@ -267,6 +267,23 @@ configurable cooldown (default 60 s — set `--cooldown-s` or
 `alert.cooldown_s` in the config). Pass `--clear-on-exit` to also send
 a notification on `MOTION → STILL`.
 
+### 3.5. (Optional) GUI instead of CLI
+
+If you'd rather click than type:
+
+```sh
+python run.py alert gui --alert-config alert.toml
+```
+
+A small Qt window with **Calibrate / Arm / Disarm / Test alert** buttons,
+a live ratio gauge, sparkline history, queue size, and the last
+alert's timestamp. Reuses the same detect pipeline and Telegram queue;
+nothing about the alert behavior changes. Settings (last source,
+baseline, thresholds) persist at `~/.csidetector/state.json` so the
+window relaunches with sensible defaults.
+
+PyQt6 is already in `requirements.txt`.
+
 ### How offline alerts survive an internet outage
 
 Each alert is enqueued in a SQLite file (default
