@@ -125,6 +125,33 @@ def test_queue_survives_restart(db_path):
         q2.close()
 
 
+def test_queue_close_drains_pending_events(db_path):
+    """Per docstring, close() drains pending events as a best-effort
+    final attempt. The bug: _drain_once short-circuited inside its for
+    loop on _stopping.is_set(), so the final shutdown drain fetched
+    rows but never sent any of them. Fixed by passing force=True to
+    the final drain.
+    """
+    inner = _StubInner()
+    q = QueuingNotifier(inner=inner, db_path=db_path,
+                        poll_interval_s=10.0,   # ~never wakes naturally
+                        backoff_base_s=0.05)
+    # Enqueue several events without giving the natural poll a chance.
+    events = [Event.now("MOTION", f"e{i}") for i in range(5)]
+    # Pause the worker by holding inner.lock briefly so the first
+    # _drain_once on natural wake hasn't caught up. Actually simpler:
+    # enqueue and immediately close. With the old bug, close()'s final
+    # drain would skip all events. With the fix (force=True), close()
+    # delivers them all before returning.
+    for ev in events:
+        q.send(ev)
+    q.close()
+
+    delivered = {e.id for e in events} & set(inner.calls)
+    assert delivered == {e.id for e in events}, (
+        f"close() should drain all pending — only delivered {len(delivered)}/5")
+
+
 def test_queue_retry_then_success_marks_sent(db_path):
     """Transient failure → backoff window expires → next attempt succeeds.
 

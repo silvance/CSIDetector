@@ -202,14 +202,33 @@ class QueuingNotifier(Notifier):
         self._wake.set()  # nudge the worker so a healthy connection delivers fast
 
     def close(self) -> None:
-        """Signal the worker to drain + exit. Returns within ~poll_interval."""
+        """Signal the worker to drain + exit. Returns within ~poll_interval.
+
+        If the worker doesn't exit by the timeout (mid-urlopen, slow
+        Telegram, etc.) we deliberately DO NOT close the store — the
+        worker is a daemon thread that will die on process exit, and
+        if we closed the store underneath it the worker's mark_sent
+        would fail mid-send, leaving the event sent-on-the-wire but
+        not marked locally → duplicate alert on next startup.
+        """
         self._stopping.set()
         self._wake.set()
-        self._thread.join(timeout=self._poll + 5.0)
+        # max() floor handles tests that use very small poll intervals
+        # for speed — we need at least ~15s to cover the worst-case
+        # in-flight urlopen (Telegram timeout is 10s).
+        join_timeout = max(15.0, self._poll + 5.0)
+        self._thread.join(timeout=join_timeout)
         try:
             self._inner.close()
         except Exception:  # noqa: BLE001
             pass
+        if self._thread.is_alive():
+            logger.warning(
+                "queue: worker still running after %.0fs join timeout; "
+                "skipping store close to avoid racing mid-send mark_sent. "
+                "The worker is a daemon thread and will exit on process "
+                "termination.", join_timeout)
+            return
         self._store.close()
 
     # --- Inspection (used by tests + future status command) -------------
@@ -233,17 +252,20 @@ class QueuingNotifier(Notifier):
             # poll interval (so a long-failed event eventually retries).
             self._wake.wait(timeout=self._poll)
             self._wake.clear()
-        # Final drain attempt on shutdown — best-effort.
-        self._drain_once()
+        # Final drain on shutdown. Pass force=True — otherwise
+        # _drain_once short-circuits on the _stopping flag inside its
+        # loop and the documented "drain pending events on close"
+        # behavior never fires.
+        self._drain_once(force=True)
 
-    def _drain_once(self) -> None:
+    def _drain_once(self, force: bool = False) -> None:
         try:
             due = self._store.fetch_due(now=time.time())
         except sqlite3.Error as exc:
             logger.error("queue: fetch_due failed: %s", exc)
             return
         for event in due:
-            if self._stopping.is_set():
+            if not force and self._stopping.is_set():
                 return
             try:
                 self._inner.send(event)

@@ -180,10 +180,21 @@ read -r _ || true
 BASELINE_RAW="$(sudo -u "$SERVICE_USER" "$VENV_DIR/bin/python" \
     "$HOST_DIR/run.py" alert calibrate "$DEVICE" --seconds 30 --settle 30 \
     2>/dev/null)"
-BASELINE="$(printf '%s' "$BASELINE_RAW" | tail -n1 | tr -d '[:space:]')"
+# `alert calibrate` prints the baseline as its single stdout line — but
+# parsing via `tail -n1` alone is fragile (any future stdout addition
+# silently breaks the installer). Pick the last line that LOOKS like a
+# float (optional sign + digits + optional decimal). Reject anything
+# else with a clear error so the failure surfaces immediately.
+BASELINE="$(printf '%s\n' "$BASELINE_RAW" \
+            | grep -E '^[[:space:]]*-?[0-9]+(\.[0-9]+)?[[:space:]]*$' \
+            | tail -n1 \
+            | tr -d '[:space:]' || true)"
 
 if [[ -z "$BASELINE" ]]; then
-    echo "ERROR: calibration produced no output. Re-run after checking RX." >&2
+    echo "ERROR: calibration did not produce a numeric baseline." >&2
+    echo "       stdout was:" >&2
+    printf '         %s\n' "$BASELINE_RAW" >&2
+    echo "       Re-run after checking the RX is streaming on $DEVICE." >&2
     exit 1
 fi
 
@@ -227,10 +238,10 @@ Type=simple
 User=${SERVICE_USER}
 EnvironmentFile=${ENV_FILE}
 WorkingDirectory=${HOST_DIR}
-ExecStart=${VENV_DIR}/bin/python ${HOST_DIR}/run.py alert detect \${DEVICE} \\
-    --baseline \${BASELINE} \\
-    --alert-config ${ALERT_TOML} \\
-    --location \${LOCATION}
+ExecStart=${VENV_DIR}/bin/python ${HOST_DIR}/run.py alert detect "\${DEVICE}" \\
+    --baseline "\${BASELINE}" \\
+    --alert-config "${ALERT_TOML}" \\
+    --location "\${LOCATION}"
 Restart=on-failure
 RestartSec=10s
 
