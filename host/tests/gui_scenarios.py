@@ -13,6 +13,7 @@ docstring and add it to SCENARIOS.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import csidetector.modes.alert.gui as alert_gui
 from csidetector.core import collector, recording
@@ -610,7 +611,8 @@ def monitor_records_csi(s: Session) -> None:
     s.expect(mon._arm_btn.isEnabled() and mon._record_btn.text() == "Record",
              "everything is back")
     s.click("Open folder")
-    s.expect(s.opened == [str(s.recordings)], "Open folder shows the recordings")
+    # (Qt hands back C:/… with forward slashes on Windows: compare as paths.)
+    s.expect([Path(p) for p in s.opened] == [s.recordings], "Open folder shows the recordings")
     # Transmitter off: nothing to save.
     s.csi("/dev/ttyACM1", on=False)
     s.click("Record")
