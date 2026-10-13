@@ -201,6 +201,29 @@ def test_record_worker_stopped_during_the_countdown_saves_nothing_quietly(
     assert not (tmp_path / "recs").exists() or not list((tmp_path / "recs").glob("*"))
 
 
+def test_recordings_fall_back_to_home_and_open_folder_follows(qt_app, tmp_path, home,
+                                                             monkeypatch):
+    """Documents not writable (e.g. Windows' Controlled folder access):
+    recordings go to ~/CSIDetector recordings, and Open folder shows that."""
+    import csidetector.modes.alert.gui as gui
+    blocked = tmp_path / "Documents"
+    blocked.write_text("")                       # a file: nothing can go under it
+    monkeypatch.setattr(gui, "recordings_dir", lambda: blocked / "CSIDetector recordings")
+    monkeypatch.setattr(gui, "_STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(gui, "_STATE_PATH", tmp_path / "state" / "state.json")
+    folder, note = gui._writable_recordings_dir()
+    assert folder == home / "CSIDetector recordings" and "can't be written" in note
+    opened = []
+    monkeypatch.setattr(gui.QDesktopServices, "openUrl",
+                        lambda url: opened.append(url.toLocalFile()) or True)
+    win = gui.CSIDetectorWindow(alert_config_path="")
+    try:
+        win._on_open_recordings()
+        assert [Path(p) for p in opened] == [folder]
+    finally:
+        win.close()
+
+
 def test_record_worker_saves_nothing_without_csi(qt_app, tmp_path, monkeypatch):
     import csidetector.modes.alert.gui as gui
     monkeypatch.setattr(gui, "NO_DATA_WARN_S", 0.1)

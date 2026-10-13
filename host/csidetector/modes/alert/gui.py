@@ -490,12 +490,18 @@ def _git_commit() -> str:
               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], **kw)
-        if head.returncode != 0:
-            return ""
-        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], **kw)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return head.stdout.strip() + ("+dirty" if dirty.stdout.strip() else "")
+    if head.returncode != 0:
+        return ""
+    commit = head.stdout.strip()
+    try:
+        # --no-optional-locks: never take index.lock in the user's checkout.
+        dirty = subprocess.run(["git", "--no-optional-locks", "status", "--porcelain",
+                                "--untracked-files=no"], **kw)
+    except (OSError, subprocess.SubprocessError):
+        return commit
+    return commit + ("+dirty" if dirty.stdout.strip() else "")
 
 
 # Board settings a recording may carry: what shapes the CSI, nothing that
@@ -755,6 +761,7 @@ class CSIDetectorWindow(QMainWindow):
         self._rec_worker: Optional[_RecordWorker] = None
         self._rec_saved = False           # this recording produced a file
         self._rec_rate_ref: Optional[tuple[float, int]] = None   # (time, samples)
+        self._rec_folder: Optional[Path] = None   # where the last recording went
         # Set on close: a calibration result still queued from the worker
         # must not be saved over state written after the window closed.
         self._closed = False
@@ -998,6 +1005,7 @@ class CSIDetectorWindow(QMainWindow):
                                 f"Recordings go in {recordings_dir()}, but it can't be "
                                 f"written to:\n\n{exc}")
             return
+        self._rec_folder = folder
         st = self._state
         key = self._rec_condition.currentData()
         meta = {
@@ -1122,12 +1130,15 @@ class CSIDetectorWindow(QMainWindow):
         self._badge.set_state("DISARMED")
 
     def _on_open_recordings(self) -> None:
-        folder = recordings_dir()
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            QMessageBox.warning(self, "Can't open the folder", str(exc))
-            return
+        """The folder recordings actually went to (the home folder's when
+        Documents couldn't be written to)."""
+        folder = self._rec_folder
+        if folder is None or not folder.is_dir():
+            try:
+                folder, _note = _writable_recordings_dir()
+            except OSError as exc:
+                QMessageBox.warning(self, "Can't open the folder", str(exc))
+                return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     # ----------------------------------------------------------------------
