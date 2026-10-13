@@ -13,6 +13,7 @@ atomically (temp file + rename).
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import time
@@ -159,8 +160,21 @@ def write_alert_toml(path: Path, bot_token: str, chat_id: str,
 # links.json
 # --------------------------------------------------------------------------
 
+def _num(v) -> Optional[float]:
+    """``v`` as a finite float, or None. Accepts what the viewers accept
+    (they call float() on these, so "0.3" works too); booleans are
+    refused as an obvious mistake."""
+    if isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
 def _is_num(v) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return _num(v) is not None
 
 
 def validate_links_shape(data) -> None:
@@ -182,8 +196,9 @@ def validate_links_shape(data) -> None:
                              "[x, y] number pairs")
     else:
         for key in ("width_m", "height_m"):
-            if key in room and not (_is_num(room[key]) and room[key] > 0):
-                raise ValueError(f"'room.{key}' must be a positive number")
+            # The viewers need both when there's no polygon.
+            if not (_num(room.get(key)) or 0) > 0:
+                raise ValueError(f"'room' needs a 'polygon' or a positive '{key}'")
     lists = [("txs", data.get("txs")), ("rxs", data.get("rxs"))]
     if "tx" in data:
         lists.append(("tx", [data["tx"]]))
@@ -304,7 +319,7 @@ def merge_links(existing: Optional[dict],
             else:
                 fresh.append((dest, mac, label, prefix))
 
-    taken = [(float(n["x"]), float(n["y"])) for n in tx_nodes + rx_nodes
+    taken = [(_num(n["x"]), _num(n["y"])) for n in tx_nodes + rx_nodes
              if _is_num(n.get("x")) and _is_num(n.get("y"))]
     spots = iter(_placeholder_spots(_room_bbox(out["room"]), taken, len(fresh)))
     for dest, mac, label, prefix in fresh:

@@ -133,7 +133,9 @@ def test_backups_are_owner_only_and_never_overwrite_each_other(tmp_path):
     {"txs": {"mac": "aa:bb:cc:dd:ee:ff", "x": 0, "y": 0}},
     {"txs": [{"mac": 12, "x": 0, "y": 0}]},
     {"rxs": [{"mac": "not-a-mac", "x": 0, "y": 0}]},
-    {"rxs": [{"mac": "aa:bb:cc:dd:ee:ff", "x": "1", "y": 0}]},
+    {"rxs": [{"mac": "aa:bb:cc:dd:ee:ff", "x": "left", "y": 0}]},
+    {"rxs": [{"mac": "aa:bb:cc:dd:ee:ff", "x": float("nan"), "y": 0}]},
+    {"room": {"width_m": 5}},
     {"tx": "aa:bb:cc:dd:ee:ff"},
 ])
 def test_malformed_links_are_refused_and_left_alone(tmp_path, bad):
@@ -179,3 +181,14 @@ def test_placeholders_avoid_existing_nodes_and_each_other():
     assert len(new) == 3 and len(set(new)) == 3
     for x, y in new:
         assert min((x - px) ** 2 + (y - py) ** 2 for px, py in placed) > 0.25
+
+
+def test_numeric_strings_are_accepted_like_the_viewers_do(tmp_path):
+    """heatmap/view3d call float() on these, so "0.3" is a working file."""
+    path = tmp_path / "links.json"
+    path.write_text(json.dumps({
+        "room": {"width_m": "5", "height_m": "4"},
+        "txs": [{"mac": "aa:bb:cc:dd:ee:01", "x": "0.3", "y": "1"}], "rxs": []}))
+    pf.write_links(path, txs=[], rxs=[("aa:bb:cc:dd:ee:02", "R")])
+    cfg, txs, rxs = _load_links(str(path))
+    assert (txs[0].x, txs[0].y) == (0.3, 1.0) and len(rxs) == 1

@@ -12,8 +12,10 @@ registry records boards identically whichever path flashed them.
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
 import os
+import shlex
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -51,6 +53,7 @@ class WizardState:
         self.password = ""
         self.host_ip = "10.42.0.1"
         self.host_port = 5566
+        self.hotspot_connection = ""                  # NetworkManager name, if detected
         self.txs: dict[str, str] = {}                 # mac → label
         self.rxs: dict[str, tuple[str, str]] = {}     # mac → (label, port)
 
@@ -222,6 +225,8 @@ class EnvironmentPage(QWizardPage):
             st.password = self.password.text()
             st.host_ip = self.host_ip.text().strip()
             st.host_port = self.port.value()
+            st.hotspot_connection = next(
+                (h.connection for h in self._hotspots if h.ssid == st.ssid), "")
         else:
             st.ssid, st.password = "", ""
         return True
@@ -288,7 +293,8 @@ class FlashPage(QWizardPage):
         self._flashing: tuple[Optional[dv.AttachedBoard], str] = (None, "")
         self._identifying: tuple[Optional[dv.AttachedBoard], str] = (None, "")
         # Ticks survive Back → Next: initializePage rebuilds the list.
-        self._remembered: set[str] = set()
+        # None until the page is first left via Back.
+        self._remembered: Optional[set[str]] = None
         self._page_id = PAGE_TX if role == dv.ROLE_TX else PAGE_RX
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._auto_refresh)
@@ -353,8 +359,11 @@ class FlashPage(QWizardPage):
         self._remembered = set(self.checked_macs())
 
     def _populate_ready(self) -> None:
-        chosen = set(self.wiz.state.txs if self.role == dv.ROLE_TX
-                     else self.wiz.state.rxs) | self._remembered
+        # What the user last left ticked here wins: state.txs/rxs can be
+        # from an earlier forward pass they've since changed on this page.
+        chosen = (self._remembered if self._remembered is not None
+                  else set(self.wiz.state.txs if self.role == dv.ROLE_TX
+                           else self.wiz.state.rxs))
         self.ready.blockSignals(True)
         self.ready.clear()
         for rec in self.wiz.registry.all():
@@ -493,8 +502,7 @@ class FlashPage(QWizardPage):
         if board is None:
             return
         if res.ok and res.chip:
-            board.chip = res.chip
-            board.mac = board.mac or res.mac
+            board = dataclasses.replace(board, chip=res.chip)
             self._sync_buttons()
             self._flash_board(board, label)
             return
@@ -572,7 +580,9 @@ class FlashPage(QWizardPage):
                 if label:
                     self.wiz.registry.upsert(res.mac, label=label)
                 rec = self.wiz.registry.get(res.mac)
-                if board is not None and not board.mac:
+                if board is not None and board.vid != dv.ESPRESSIF_VID:
+                    # A bridge's USB serial isn't the MAC, so the live board
+                    # list can't map this MAC back to its port.
                     self._ports[res.mac] = board.port
                 if self._single:
                     # One per role in alert mode: the new board replaces any tick.
@@ -662,6 +672,13 @@ class FlashPage(QWizardPage):
         if self.role == dv.ROLE_TX and len(macs) > fw.MAX_FILTER_MACS:
             return [f"A receiver can listen to at most {fw.MAX_FILTER_MACS} "
                     f"transmitters; untick some."]
+        if self.role == dv.ROLE_RX:
+            both = [m for m in macs if m in self.wiz.state.txs]
+            if both:
+                name = self.wiz.state.txs[both[0]] or both[0]
+                return [f"{name} is also this setup's transmitter. Flash a different "
+                        f"board as the receiver, or go Back and choose another "
+                        f"transmitter."]
         if self.role == dv.ROLE_RX and self._single:
             port = self._attached_port(macs[0])
             if not port:
@@ -857,7 +874,9 @@ class FinishPage(QWizardPage):
             if st.host_port != 5566:
                 env.append(f"PORT={st.host_port}")
             if links.resolve() != (self.wiz.host_dir / "links.json").resolve():
-                env.append(f"LINKS={links}")
+                env.append(f"LINKS={shlex.quote(str(links))}")
+            if st.hotspot_connection and st.hotspot_connection != "CSIDetector":
+                env.append(f"HOTSPOT_NAME={shlex.quote(st.hotspot_connection)}")
             lines = [
                 f"Update {links} with "
                 f"{len(st.txs)} transmitter(s) and {len(st.rxs)} receiver(s).",
@@ -952,8 +971,6 @@ class SetupWizard(QWizard):
         self.written = []
         if st.mode == MODE_ALERT:
             from csidetector.modes.alert.gui import _PersistedState
-            if self.before_alert_apply is not None:
-                self.before_alert_apply()
             tg: TelegramPage = self.page(PAGE_TELEGRAM)
             config_path = ""
             if not tg.skip.isChecked():
@@ -962,6 +979,11 @@ class SetupWizard(QWizard):
                                     tg.location.text().strip())
                 config_path = str(path)
                 self.written.append(config_path)
+            # Only now stop an open monitor (it would save its old settings
+            # over the new state). Not before: a failed alert.toml write
+            # shouldn't leave detection silently off.
+            if self.before_alert_apply is not None:
+                self.before_alert_apply()
             _mac, (_label, port) = next(iter(st.rxs.items()))
             state = _PersistedState.load()
             state.source = port
