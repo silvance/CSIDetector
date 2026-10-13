@@ -12,3 +12,12 @@ CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 # USB-CDC also still show logs on /dev/ttyACMx). Either port works.
 CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+
+# Partition table with the csi_cfg partition the setup app writes the
+# board's settings into (components/csi_settings). Prebuilt images are
+# built by scripts/build_firmware.py; reproducible so a rebuild of
+# unchanged sources gives the same binaries.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+CONFIG_APP_REPRODUCIBLE_BUILD=y

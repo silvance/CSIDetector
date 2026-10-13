@@ -14,7 +14,15 @@
 //
 // `data` is a JSON int8 array of (Im, Re) pairs.
 //
-// UDP output format (when CSI_RX_WIFI_SSID is set): see csi_udp_header_t
+// Settings (channel, transmitter MAC filter, hotspot SSID/password, host
+// IP/port) come from the csi_cfg partition the setup app writes at flash
+// time; the Kconfig values are the defaults when it hasn't (idf.py flash).
+//
+// On the Wi-Fi 6 chips (ESP32-C5/C6) the radio reports different
+// reception metadata; the columns they don't have print as 0, so the
+// line format is the same on every chip.
+//
+// UDP output format (when a hotspot SSID is set): see csi_udp_header_t
 // below. Little-endian, packed, header followed by `len` bytes of int8
 // IQ data. Host parses by `version`.
 
@@ -33,13 +41,31 @@
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
+#include "csi_settings.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 
 static const char *TAG = "csi_rx";
 
+#if CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6 || CONFIG_IDF_TARGET_ESP32C61
+#define CSI_WIFI6_CHIP 1
+#else
+#define CSI_WIFI6_CHIP 0
+#endif
+
+// Kconfig values unless the setup app wrote this board's settings.
+static csi_settings_t s_cfg = {
+    .role = "rx",
+    .channel = CONFIG_CSI_RX_CHANNEL,
+    .tx_macs = CONFIG_CSI_RX_FILTER_TX_MAC,
+    .ssid = CONFIG_CSI_RX_WIFI_SSID,
+    .password = CONFIG_CSI_RX_WIFI_PASS,
+    .host_ip = CONFIG_CSI_RX_HOST_IP,
+    .host_port = CONFIG_CSI_RX_HOST_PORT,
+};
+
 // Up to 4 TX MACs in the filter — enough for any reasonable multi-TX
-// localization setup. Comma- or semicolon-separated in Kconfig.
+// localization setup. Comma- or semicolon-separated.
 #define MAX_FILTER_MACS 4
 static uint8_t s_filter_macs[MAX_FILTER_MACS][6];
 static int s_filter_count = 0;
@@ -105,7 +131,7 @@ static bool parse_one_mac(const char *s, int len, uint8_t out[6]) {
     return nibbles == 12;
 }
 
-// Parses the Kconfig string into s_filter_macs / s_filter_count. Returns
+// Parses the MAC list into s_filter_macs / s_filter_count. Returns
 // number of valid MACs parsed; returns -1 on any unparseable token so
 // the caller can warn loudly (silent partial filters are the trap that
 // motivated the original parser cleanup). Returns -2 if there are more
@@ -182,6 +208,19 @@ static void csi_callback(void *ctx, wifi_csi_info_t *info) {
     // parse this format unchanged. The printf+putchar sequence isn't
     // atomic — concurrent log lines can interleave — but stdout is line-
     // buffered and the host parser tolerates the rare garbled row.
+#if CSI_WIFI6_CHIP
+    printf("CSI_DATA,%lu,"                 // seq
+           "%02x:%02x:%02x:%02x:%02x:%02x," // mac
+           "%d,%d,0,0,0,0,0,0,0,0,"         // rssi,rate; sig_mode..fec_coding not reported
+           "0,%d,0,"                        // sgi,noise_floor,ampdu_cnt
+           "%d,0,%lld,"                     // channel,secondary_channel,local_timestamp
+           "0,%d,%d,%d,%d,",                // ant,sig_len,rx_state,len,first_word
+           (unsigned long)this_seq,
+           info->mac[0], info->mac[1], info->mac[2],
+           info->mac[3], info->mac[4], info->mac[5],
+           rx->rssi, rx->rate, rx->noise_floor, rx->channel, (long long)ts,
+           rx->sig_len, rx->rx_state, info->len, info->first_word_invalid ? 1 : 0);
+#else
     printf("CSI_DATA,%lu,"                 // seq
            "%02x:%02x:%02x:%02x:%02x:%02x," // mac
            "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d," // rssi,rate,sig_mode,mcs,bw,smoothing,not_sounding,aggregation,stbc,fec_coding
@@ -196,6 +235,7 @@ static void csi_callback(void *ctx, wifi_csi_info_t *info) {
            rx->sgi, rx->noise_floor, rx->ampdu_cnt,
            rx->channel, rx->secondary_channel, (long long)ts,
            rx->ant, rx->sig_len, rx->rx_state, info->len, info->first_word_invalid ? 1 : 0);
+#endif
 
     putchar('"');
     putchar('[');
@@ -215,15 +255,15 @@ static void open_udp_socket(esp_ip4_addr_t ip) {
         return;
     }
     s_udp_dest.sin_family = AF_INET;
-    s_udp_dest.sin_port = htons(CONFIG_CSI_RX_HOST_PORT);
-    if (inet_pton(AF_INET, CONFIG_CSI_RX_HOST_IP, &s_udp_dest.sin_addr) != 1) {
-        ESP_LOGE(TAG, "bad CSI_RX_HOST_IP=%s", CONFIG_CSI_RX_HOST_IP);
+    s_udp_dest.sin_port = htons(s_cfg.host_port);
+    if (inet_pton(AF_INET, s_cfg.host_ip, &s_udp_dest.sin_addr) != 1) {
+        ESP_LOGE(TAG, "bad host IP %s", s_cfg.host_ip);
         close(s_udp_sock);
         s_udp_sock = -1;
         return;
     }
     ESP_LOGI(TAG, "UDP forwarding to %s:%d (this RX " IPSTR ")",
-             CONFIG_CSI_RX_HOST_IP, CONFIG_CSI_RX_HOST_PORT, IP2STR(&ip));
+             s_cfg.host_ip, s_cfg.host_port, IP2STR(&ip));
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
@@ -263,7 +303,7 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-    bool wifi_enabled = (CONFIG_CSI_RX_WIFI_SSID[0] != '\0');
+    bool wifi_enabled = (s_cfg.ssid[0] != '\0');
     if (wifi_enabled) {
         s_wifi_events = xEventGroupCreate();
         ESP_ERROR_CHECK(esp_event_handler_instance_register(
@@ -271,11 +311,11 @@ static void wifi_init(void) {
         ESP_ERROR_CHECK(esp_event_handler_instance_register(
             IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
         wifi_config_t sta_cfg = {0};
-        strlcpy((char *)sta_cfg.sta.ssid, CONFIG_CSI_RX_WIFI_SSID, sizeof(sta_cfg.sta.ssid));
-        strlcpy((char *)sta_cfg.sta.password, CONFIG_CSI_RX_WIFI_PASS, sizeof(sta_cfg.sta.password));
+        strlcpy((char *)sta_cfg.sta.ssid, s_cfg.ssid, sizeof(sta_cfg.sta.ssid));
+        strlcpy((char *)sta_cfg.sta.password, s_cfg.password, sizeof(sta_cfg.sta.password));
         // Fast-scan on the configured channel so association doesn't
         // sweep all 13 channels.
-        sta_cfg.sta.channel = CONFIG_CSI_RX_CHANNEL;
+        sta_cfg.sta.channel = s_cfg.channel;
         sta_cfg.sta.scan_method = WIFI_FAST_SCAN;
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_cfg));
     }
@@ -313,7 +353,7 @@ static void wifi_init(void) {
         ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
         wifi_promiscuous_filter_t filt = { .filter_mask = WIFI_PROMIS_FILTER_MASK_ALL };
         ESP_ERROR_CHECK(esp_wifi_set_promiscuous_filter(&filt));
-        ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_RX_CHANNEL, WIFI_SECOND_CHAN_NONE));
+        ESP_ERROR_CHECK(esp_wifi_set_channel(s_cfg.channel, WIFI_SECOND_CHAN_NONE));
     }
 
     // Cache our MAC for stamping outgoing UDP packets (the host uses it
@@ -327,6 +367,16 @@ static void espnow_init(void) {
 }
 
 static void enable_csi(void) {
+#if CSI_WIFI6_CHIP
+    // Wi-Fi 6 chips: L-LTF from 11g frames, HT-LTF from HT20/HT40 (the
+    // transmitter's ESP-NOW broadcasts are HT20). As esp-csi's csi_recv.
+    wifi_csi_config_t cfg = {
+        .enable = 1,
+        .acquire_csi_legacy = 1,
+        .acquire_csi_ht20 = 1,
+        .acquire_csi_ht40 = 1,
+    };
+#else
     wifi_csi_config_t cfg = {
         .lltf_en = true,
         .htltf_en = true,
@@ -340,6 +390,7 @@ static void enable_csi(void) {
         .manu_scale = false,
         .shift = 0,
     };
+#endif
     // esp-csi/csi_recv order: rx_cb -> config -> enable. Some IDF versions
     // silently drop set_csi_config if it lands before set_csi_rx_cb.
     ESP_ERROR_CHECK(esp_wifi_set_csi_rx_cb(&csi_callback, NULL));
@@ -362,7 +413,8 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    const char *cfg_mac = CONFIG_CSI_RX_FILTER_TX_MAC;
+    csi_settings_load(&s_cfg);
+    const char *cfg_mac = s_cfg.tx_macs;
     int parsed = parse_filter_macs(cfg_mac);
     if (parsed > 0) {
         for (int i = 0; i < s_filter_count; i++) {
@@ -372,25 +424,25 @@ void app_main(void) {
                      s_filter_macs[i][3], s_filter_macs[i][4], s_filter_macs[i][5]);
         }
     } else if (parsed == -2) {
-        ESP_LOGE(TAG, "CSI_RX_FILTER_TX_MAC=\"%s\" lists more than %d MACs; "
+        ESP_LOGE(TAG, "TX MAC filter \"%s\" lists more than %d MACs; "
                       "filter DISABLED. Increase MAX_FILTER_MACS and rebuild.",
                  cfg_mac, MAX_FILTER_MACS);
         s_filter_count = 0;
     } else if (parsed < 0) {
         // Non-empty but unparseable somewhere — surface this loudly so the
         // user doesn't think they're filtering when they aren't.
-        ESP_LOGE(TAG, "CSI_RX_FILTER_TX_MAC=\"%s\" is not a valid MAC list; "
+        ESP_LOGE(TAG, "TX MAC filter \"%s\" is not a valid MAC list; "
                       "filter DISABLED. Use aa:bb:cc:dd:ee:ff or comma-separated "
                       "for multiple TXs.",
                  cfg_mac);
     } else {
         ESP_LOGW(TAG, "no TX MAC filter set — emitting CSI for every frame "
-                      "the radio decodes (set CSI_RX_FILTER_TX_MAC to clean up)");
+                      "the radio decodes (set the TX MAC filter to clean up)");
     }
 
     wifi_init();
     espnow_init();
     emit_header();
     enable_csi();
-    ESP_LOGI(TAG, "CSI capture started on channel %d", CONFIG_CSI_RX_CHANNEL);
+    ESP_LOGI(TAG, "CSI capture started on channel %d", s_cfg.channel);
 }

@@ -15,12 +15,20 @@
 #include "esp_now.h"
 #include "esp_mac.h"
 #include "nvs_flash.h"
+#include "csi_settings.h"
 
 static const char *TAG = "csi_tx";
 
 static const uint8_t BROADCAST_MAC[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 static SemaphoreHandle_t s_send_complete;
+
+// Kconfig values unless the setup app wrote this board's settings.
+static csi_settings_t s_cfg = {
+    .role = "tx",
+    .channel = CONFIG_CSI_TX_CHANNEL,
+    .rate_hz = CONFIG_CSI_TX_RATE_HZ,
+};
 
 static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_netif_init());
@@ -42,7 +50,7 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
 
     // Pin to a fixed channel so receivers can stay tuned.
-    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_CSI_TX_CHANNEL, WIFI_SECOND_CHAN_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(s_cfg.channel, WIFI_SECOND_CHAN_NONE));
 }
 
 // IDF 5.4+ changed the ESP-NOW send callback's first arg from `const
@@ -67,7 +75,7 @@ static void espnow_init(void) {
     ESP_ERROR_CHECK(esp_now_init());
     ESP_ERROR_CHECK(esp_now_register_send_cb(on_send_done));
     esp_now_peer_info_t peer = {
-        .channel = CONFIG_CSI_TX_CHANNEL,
+        .channel = s_cfg.channel,
         .ifidx = WIFI_IF_STA,
         .encrypt = false,
     };
@@ -88,7 +96,7 @@ static void espnow_init(void) {
 }
 
 static void broadcast_task(void *arg) {
-    const TickType_t period = pdMS_TO_TICKS(1000 / CONFIG_CSI_TX_RATE_HZ);
+    const TickType_t period = pdMS_TO_TICKS(1000 / s_cfg.rate_hz);
     uint32_t seq = 0;
     uint32_t sent = 0;
     uint32_t dropped = 0;
@@ -133,6 +141,7 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
+    csi_settings_load(&s_cfg);
     wifi_init();
     espnow_init();
 
@@ -140,7 +149,7 @@ void app_main(void) {
     esp_wifi_get_mac(WIFI_IF_STA, mac);
     ESP_LOGI(TAG, "TX up: mac=%02x:%02x:%02x:%02x:%02x:%02x ch=%d rate=%dHz",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-             CONFIG_CSI_TX_CHANNEL, CONFIG_CSI_TX_RATE_HZ);
+             s_cfg.channel, s_cfg.rate_hz);
 
     xTaskCreate(broadcast_task, "broadcast", 4096, NULL, 5, NULL);
 }
