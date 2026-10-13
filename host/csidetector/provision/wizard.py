@@ -301,11 +301,11 @@ class FlashPage(QWizardPage):
         self.board_combo.setPlaceholderText(
             "No ESP32 found. Plug one in with a data USB cable (not charge-only).")
         self.board_combo.currentIndexChanged.connect(lambda *_: self._sync_buttons())
-        # The port the user picked: kept while that board is briefly off the
-        # bus (a reset), instead of sticking to whatever a re-scan fell back to.
-        self._wanted_port: Optional[str] = None
-        self.board_combo.activated.connect(
-            lambda i: setattr(self, "_wanted_port", self.board_combo.itemData(i)))
+        # The board the user picked — by MAC for a native board, else by
+        # port — kept while it's briefly off the bus (a reset) instead of
+        # sticking to whatever a re-scan fell back to.
+        self._wanted: Optional[tuple[str, str]] = None      # (mac, port)
+        self.board_combo.activated.connect(self._on_board_chosen)
         refresh = QPushButton("Refresh")
         # Lambda: clicked(bool) would pass `checked` in as relist=False.
         refresh.clicked.connect(lambda: self.refresh_boards())
@@ -503,8 +503,13 @@ class FlashPage(QWizardPage):
         else:
             boards = self._boards
         current = self.board_combo.currentData()
-        if self._wanted_port and any(b.port == self._wanted_port for b in boards):
-            current = self._wanted_port
+        if self._wanted is not None:
+            mac, port = self._wanted
+            match = next((b.port for b in boards if mac and b.mac == mac),
+                         None if mac else
+                         next((b.port for b in boards if b.port == port and not b.mac), None))
+            if match:
+                current = match
         key = [(b.port, self._board_mac(b), self._board_chip(b), b.vid) for b in boards]
         if key == self._board_key:
             self._sync_buttons()
@@ -537,6 +542,11 @@ class FlashPage(QWizardPage):
         if board.mac:
             return board.mac
         return next((m for m, p in self.wiz.bridge_ports.items() if p == board.port), "")
+
+    def _on_board_chosen(self, index: int) -> None:
+        port = self.board_combo.itemData(index)
+        board = next((b for b in self._boards if b.port == port), None)
+        self._wanted = (board.mac if board else "", port)
 
     def _other_role_macs(self) -> set[str]:
         st = self.wiz.state

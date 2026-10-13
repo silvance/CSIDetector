@@ -692,7 +692,11 @@ class CSIDetectorWindow(QMainWindow):
         (its USB serial number). Bridge boards can't be, so their saved
         port (ideally a /dev/serial/by-id link) is used as is."""
         source, mac = self._state.source, self._state.receiver_mac
-        serial_port = (source.startswith("/dev/tty") or source.upper().startswith("COM"))
+        # Serial ports the collector opens (/dev/tty*, macOS /dev/cu.*, COMn),
+        # but not a /dev/serial/by-id link, which already names the board.
+        serial_port = ((source.startswith("/dev/")
+                        and not source.startswith("/dev/serial/by-id/"))
+                       or source.upper().startswith("COM"))
         if mac and serial_port:
             from csidetector.provision import devices as dv
             try:

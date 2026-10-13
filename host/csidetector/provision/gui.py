@@ -732,9 +732,12 @@ class DevicesTab(QWidget):
     def _on_selection(self) -> None:
         row = self._selected_row()
         rec = row.record if row else None
-        # The board (its MAC: a port can get a different board) and what the
-        # registry says about it now.
-        board_id = (row.identity(), row.mac) if row else None
+        # The board — by its USB serial, which is the MAC on a native board
+        # (so a different board on the same port counts as one) and fixed on
+        # a bridge (so its MAC appearing after Identify doesn't) — and what
+        # the registry says about it now.
+        board_id = ((row.identity(), row.board.usb_serial if row.board else row.mac)
+                    if row else None)
         saved = (rec.label, rec.role) if rec else ("", "")
         shown_id, shown = self._details_for or (None, None)
         if board_id != shown_id or (not self._details_edited and saved != shown):
