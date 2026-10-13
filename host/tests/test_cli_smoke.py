@@ -44,6 +44,7 @@ HELP_PATHS = [
     ["alert", "view-waterfall", "--help"],
     # Shared
     ["capture", "--help"],
+    ["setup", "--help"],
 ]
 
 
@@ -73,7 +74,7 @@ def test_top_level_subcommands_registered():
         "heatmap", "view3d", "calibrate-links", "publish",
         "calibrate", "detect", "view",
         # Shared
-        "capture",
+        "capture", "setup",
     }
     missing = expected - set(sub.choices)
     assert not missing, f"missing top-level subcommands: {missing}"
