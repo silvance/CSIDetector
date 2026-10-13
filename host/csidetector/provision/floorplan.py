@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import (
-    QBrush, QColor, QFont, QPainter, QPen, QPixmap, QPolygonF, QTransform,
+    QBrush, QColor, QFont, QFontDatabase, QPainter, QPen, QPixmap, QPolygonF, QTransform,
 )
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
@@ -461,7 +461,7 @@ class RoomTab(QWidget):
         fit = QPushButton("Fit")
         fit.clicked.connect(self.canvas.refit)
         self.coords = QLabel("")
-        self.coords.setFont(QFont("monospace"))
+        self.coords.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
         view_row = QHBoxLayout()
         view_row.addWidget(self.snap_box)
         view_row.addWidget(fit)

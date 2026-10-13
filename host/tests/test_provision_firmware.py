@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 import stat
+import sys
 from pathlib import Path
 
 import pytest
 
 from csidetector.provision import firmware as fw
+
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX-only (bash, file modes, symlinks or /proc)")
 
 REPO_FIRMWARE = fw.repo_firmware_root()
 
@@ -113,6 +117,7 @@ def test_flash_job_validate_catches_missing_project(tmp_path):
     assert any("not found" in e for e in job.validate())
 
 
+@POSIX_ONLY
 def test_prepare_build_dir_reuses_build_when_config_unchanged(tmp_path):
     job = _job(tmp_path, fw.RxConfig(ssid="CSIDetector", password="hunter22"))
     assert fw.prepare_build_dir(job) is True
@@ -154,6 +159,7 @@ def test_prepare_build_dir_rebuilds_when_project_defaults_change(tmp_path):
     assert fw.prepare_build_dir(job) is True
 
 
+@POSIX_ONLY
 def test_build_dirs_are_private(tmp_path):
     """Generated sdkconfig / sdkconfig.h hold the hotspot password and are
     written 0644 by kconfgen, so the directories must block other users."""
@@ -163,6 +169,7 @@ def test_build_dirs_are_private(tmp_path):
     assert stat.S_IMODE(os.stat(job.build_root).st_mode) == 0o700
 
 
+@POSIX_ONLY
 def test_flash_command_quotes_paths_and_keeps_secrets_out(tmp_path):
     export = tmp_path / "esp idf" / "export.sh"
     job = _job(tmp_path, fw.RxConfig(ssid="My Hotspot", password="hunter22"))
@@ -179,6 +186,7 @@ def test_flash_command_quotes_paths_and_keeps_secrets_out(tmp_path):
     assert "hunter22" not in script and "My Hotspot" not in script
 
 
+@POSIX_ONLY
 def test_identify_command_uses_idf_python_esptool(tmp_path):
     argv = fw.identify_command("/dev/ttyACM0", tmp_path / "export.sh")
     tokens = shlex.split(argv[2])
@@ -186,6 +194,7 @@ def test_identify_command_uses_idf_python_esptool(tmp_path):
                            "read_mac"]
 
 
+@POSIX_ONLY
 def test_idf_env_strips_active_venv():
     base = {
         "VIRTUAL_ENV": "/home/u/proj/.venv",
@@ -296,3 +305,52 @@ def test_detect_hotspots_survives_missing_nmcli():
     def run(argv):
         raise FileNotFoundError("nmcli")
     assert fw.detect_hotspots(run) == []
+
+
+def test_find_idf_export_windows_installer_layout(tmp_path):
+    root = tmp_path / "Espressif" / "frameworks"
+    for v in ("esp-idf-v5.1.2", "esp-idf-v5.2.1", "esp-idf-v5.10.0"):
+        (root / v).mkdir(parents=True)
+        (root / v / "export.bat").write_text("")
+    env = {"IDF_TOOLS_PATH": str(tmp_path / "Espressif"), "SystemDrive": str(tmp_path / "nowhere")}
+    assert fw.find_idf_export(env, windows=True) == root / "esp-idf-v5.10.0" / "export.bat"
+
+
+def test_paths_with_spaces_are_refused(tmp_path):
+    job = _job(tmp_path / "build dir", fw.TxConfig())
+    assert any("path with spaces" in e for e in job.validate())
+
+
+def test_env_dump_parsing():
+    env = {"IDF_PATH": "/opt/idf", "Path": "/bin", "TEMP": "C:\\Users\\José\\Temp"}
+    dump = json.dumps({"env": env, "python": "/opt/idf-env/python.exe"})   # ASCII-only
+    out = f"Activating ESP-IDF 5.5\nnoise=ignored\n{fw.ENV_MARKER}{dump}\n"
+    idf = fw.parse_env_dump(out)
+    assert idf.idf_py == Path("/opt/idf/tools/idf.py") and idf.python == "/opt/idf-env/python.exe"
+    assert idf.env["TEMP"].endswith("José\\Temp") and "noise" not in idf.env
+    assert fw.parse_env_dump("export.bat failed") is None
+    # export.bat "succeeded" but IDF's python wasn't first on PATH: the dump
+    # (which imports esptool) never ran, so there's no marker.
+    assert fw.parse_env_dump("Activating ESP-IDF\nNo module named esptool\n") is None
+    no_idf = json.dumps({"env": {"Path": "/bin"}, "python": "x"})
+    assert fw.parse_env_dump(f"{fw.ENV_MARKER}{no_idf}\n") is None
+
+
+def test_windows_export_env_for_the_installer_layout(tmp_path):
+    root = tmp_path / "Espressif"
+    export = root / "frameworks" / "esp-idf-v5.4.1" / "export.bat"
+    export.parent.mkdir(parents=True)
+    (root / "tools" / "idf-python" / "3.11.2").mkdir(parents=True)
+    (root / "tools" / "idf-git" / "2.44.0" / "cmd").mkdir(parents=True)
+    env = fw.windows_export_env(export, {"Path": "/usr/bin", "MSYSTEM": "MINGW64"})
+    assert "MSYSTEM" not in env                      # export.bat refuses to run with it
+    assert env["IDF_TOOLS_PATH"] == str(root)
+    parts = env["Path"].split(os.pathsep)
+    assert parts[0].endswith("3.11.2") and parts[1].endswith("cmd") and parts[-1] == "/usr/bin"
+    other = fw.windows_export_env(tmp_path / "esp-idf" / "export.bat", {"PATH": "/bin"})
+    assert other == {"PATH": "/bin"}                 # not the installer layout: as is
+
+
+def test_esptool_missing_hint():
+    assert any("environment didn't load" in h for h in fw.failure_hints(
+        "C:\\py\\python.exe: No module named esptool"))

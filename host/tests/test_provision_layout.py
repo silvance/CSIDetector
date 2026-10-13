@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,8 @@ import pytest
 from csidetector.modes.localize.heatmap import _load_links
 from csidetector.provision import layout as lo
 from csidetector.provision.devices import ROLE_RX, ROLE_TX
+
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX-only (bash, file modes, symlinks or /proc)")
 
 EXAMPLE_LINKS = Path(__file__).resolve().parents[1] / "links.example.json"
 
@@ -149,6 +152,7 @@ def test_review_fixes(tmp_path):
     assert not lo.self_intersects([(0, 0), (5, 0), (5, 4), (2.5, 4), (2.5, 2.5), (0, 2.5)])
 
 
+@POSIX_ONLY
 def test_save_writes_through_a_symlink(tmp_path):
     real = tmp_path / "rooms" / "office" / "links.json"
     real.parent.mkdir(parents=True)

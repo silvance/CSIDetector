@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
 
 from csidetector.provision import devices as dv
 
+
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX-only (bash, file modes, symlinks or /proc)")
 
 def _port(device, vid=None, pid=None, serial=None, desc=""):
     return SimpleNamespace(device=device, vid=vid, pid=pid,
@@ -143,6 +146,7 @@ def test_registry_ignores_unknown_keys_and_bad_macs_on_load(tmp_path):
     assert [r.mac for r in reg.all()] == ["a0:f2:62:f0:39:d8"]
 
 
+@POSIX_ONLY
 def test_stable_port_uses_by_id_only_when_it_names_the_board(tmp_path):
     """Native ESP32s put their MAC in the by-id name; two CP2102 boards
     share one name (udev points it at whichever enumerated last)."""

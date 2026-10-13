@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PyQt6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont
+from PyQt6.QtGui import QBrush, QColor, QFont, QFontDatabase
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QComboBox, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -88,7 +88,10 @@ class ProcessRunner(QObject):
     def running(self) -> bool:
         return self._proc is not None
 
-    def start(self, argv: list[str], env: dict) -> None:
+    def start(self, argv: list[str], env: dict, native_args: Optional[str] = None) -> None:
+        """``native_args`` (Windows): pass this command line to argv[0]
+        verbatim instead of quoting argv[1:] — for cmd.exe, whose parsing
+        doesn't follow the usual rules."""
         if self._proc is not None:
             raise RuntimeError("a process is already running")
         proc = QProcess(self)
@@ -104,6 +107,11 @@ class ProcessRunner(QObject):
         self._output = ""
         self.cancelled = False
         self._proc = proc
+        if native_args is not None and hasattr(proc, "setNativeArguments"):
+            proc.setProgram(argv[0])
+            proc.setNativeArguments(native_args)
+            proc.start()
+            return
         if _SETSID and shutil.which(argv[0]):
             # QProcess's child isn't a group leader, so setsid execs in
             # place: the pid QProcess reports is the new group's id. (A
@@ -223,10 +231,44 @@ class Flasher(QObject):
         super().__init__(parent)
         self.registry = registry
         self._runner = ProcessRunner(self)
-        self._runner.line.connect(self.line)
+        self._runner.line.connect(self._on_line)
         self._runner.progress.connect(self.progress)
         self._runner.finished.connect(self._on_finished)
         self._pending: Optional[dict] = None
+        self._mute = False      # the environment dump of an export.bat capture
+
+    def _on_line(self, text: str) -> None:
+        if text.startswith(fw.ENV_MARKER):
+            self._mute = True   # what follows is `set` output: not for the log
+        if not self._mute:
+            self.line.emit(text)
+
+    def _run(self, export: Path, argv_for: Callable, phase: str) -> None:
+        """Start argv_for(idf) — on Windows once ESP-IDF's environment has
+        been captured (first use of this export.bat: an extra stage)."""
+        self._mute = False
+        if not fw.IS_WINDOWS:
+            self._runner.start(argv_for(None), fw.idf_env())
+            self.started.emit(phase)
+            return
+        idf = fw.cached_idf_env(export)
+        if idf is not None:
+            self._runner.start(argv_for(idf), idf.env)
+            self.started.emit(phase)
+            return
+        self._pending.update(stage="env", export=export, argv_for=argv_for, phase=phase)
+        if Path(export).suffix.lower() != ".bat":
+            # export.sh on Windows would just open in some other program.
+            self.line.emit(f"[setup] {export} isn't ESP-IDF's export.bat; on Windows "
+                           f"choose export.bat (in the esp-idf folder).")
+            self._runner.finished.emit(97, "ESP-IDF export.bat failed: "
+                                           "an export.bat is needed on Windows")
+            return
+        argv, native = fw.env_capture_command(export)
+        self.line.emit("[setup] loading the ESP-IDF environment (once per session)…")
+        self._runner.start(argv, fw.windows_export_env(export, fw.idf_env()),
+                           native_args=native)
+        self.started.emit("Loading ESP-IDF…")
 
     @property
     def busy(self) -> bool:
@@ -244,8 +286,7 @@ class Flasher(QObject):
         self.line.emit(
             f"[setup] flashing {job.project} ({job.target}) to {job.port}"
             + ("" if changed else " — config unchanged, reusing previous build"))
-        self._runner.start(fw.flash_command(job, export), fw.idf_env())
-        self.started.emit("Building…")
+        self._run(export, lambda idf: fw.flash_command(job, export, idf), "Building…")
 
     def identify(self, port: str, usb_serial: str, export: Path,
                  esptool_cmd: str = "read_mac") -> None:
@@ -255,9 +296,8 @@ class Flasher(QObject):
                          "usb_serial": usb_serial, "cmd": esptool_cmd,
                          "export": export}
         self.line.emit(f"[setup] identifying {port} …")
-        self._runner.start(fw.identify_command(port, export, esptool_cmd),
-                           fw.idf_env())
-        self.started.emit("Identifying…")
+        self._run(export, lambda idf: fw.identify_command(port, export, esptool_cmd, idf),
+                  "Identifying…")
 
     def cancel(self) -> None:
         self._runner.cancel()
@@ -272,6 +312,28 @@ class Flasher(QObject):
         if pending is None:
             return
         cancelled = self._runner.cancelled
+        if pending.get("stage") == "env":
+            idf = None if (code != 0 or cancelled) else fw.parse_env_dump(output)
+            visible = output.split(fw.ENV_MARKER, 1)[0]     # never the env dump
+            if idf is None:
+                if not cancelled and code == 0:
+                    visible += ("\nESP-IDF export.bat failed: its environment has "
+                                "no IDF_PATH, or its python isn't ESP-IDF's")
+                    self.line.emit("[setup] ESP-IDF export.bat ran, but ESP-IDF's "
+                                   "Python environment isn't set up (no IDF_PATH, or "
+                                   "esptool missing). Run ESP-IDF's install.bat, or "
+                                   "reinstall with the ESP-IDF Tools Installer.")
+                code = code or 97
+                pending.pop("stage")
+                output = visible
+            else:
+                fw.remember_idf_env(pending["export"], idf)
+                pending.pop("stage")
+                self._pending = pending
+                self._mute = False
+                self._runner.start(pending["argv_for"](idf), idf.env)
+                self.started.emit(pending["phase"])
+                return
         if pending["kind"] == "identify":
             if (code != 0 and not cancelled and "invalid choice" in output
                     and pending["cmd"] == "read_mac"):
@@ -409,8 +471,7 @@ class DevicesTab(QWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        mono = QFont("monospace")
-        mono.setStyleHint(QFont.StyleHint.Monospace)
+        mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
 
         # Device table
         self.table = QTableWidget(0, len(self.COLUMNS))
@@ -519,7 +580,8 @@ class DevicesTab(QWidget):
         self._form = form
 
         self.export_edit = QLineEdit()
-        self.export_edit.setPlaceholderText("path to esp-idf/export.sh")
+        self.export_edit.setPlaceholderText(f"path to ESP-IDF's {fw.EXPORT_NAME}, e.g. "
+                                            f"{fw.EXPORT_EXAMPLE}")
         self.export_edit.editingFinished.connect(self._save_settings)
         browse = QPushButton("Browse…")
         browse.clicked.connect(self._browse_export)
@@ -620,8 +682,8 @@ class DevicesTab(QWidget):
 
     def _browse_export(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select ESP-IDF export.sh", os.path.expanduser("~/esp"),
-            "export.sh (export.sh);;All files (*)")
+            self, f"Select ESP-IDF {fw.EXPORT_NAME}", os.path.expanduser("~"),
+            f"{fw.EXPORT_NAME} ({fw.EXPORT_NAME});;All files (*)")
         if path:
             self.export_edit.setText(path)
             self._save_settings()
@@ -838,6 +900,18 @@ class DevicesTab(QWidget):
     def detect_hotspot(self) -> None:
         hotspots = self._detect_hotspots()
         if not hotspots:
+            if fw.IS_WINDOWS:
+                ips = fw.local_ipv4_addresses()
+                if fw.WINDOWS_HOTSPOT_IP in ips:
+                    self.host_ip_edit.setText(fw.WINDOWS_HOTSPOT_IP)
+                QMessageBox.information(
+                    self, "Enter the Wi-Fi details",
+                    "Windows can't report the hotspot's name and channel here. "
+                    "Type the SSID, password and channel of the network the "
+                    "receivers should join (a router with a fixed channel works "
+                    "best). This computer's addresses: "
+                    + (", ".join(ips) or "none found") + ".")
+                return
             QMessageBox.information(
                 self, "No hotspot found",
                 "No active NetworkManager hotspot (AP-mode Wi-Fi connection) "
@@ -899,8 +973,8 @@ class DevicesTab(QWidget):
                                f"doesn't support (supported: {', '.join(fw.TARGETS)}).")
         if not self.export_edit.text().strip() or \
                 not Path(self.export_edit.text().strip()).expanduser().is_file():
-            plan.errors.append("ESP-IDF export.sh not found — set its path "
-                               "below the form (usually ~/esp/esp-idf/export.sh).")
+            plan.errors.append(f"ESP-IDF {fw.EXPORT_NAME} not found — set its path "
+                               f"below the form (usually {fw.EXPORT_EXAMPLE}).")
         if plan.errors:
             return plan
 
@@ -942,11 +1016,18 @@ class DevicesTab(QWidget):
                     f"labelled 'USB') to this computer and run detection on that.")
             if config.ssid:
                 hotspots = self._detect_hotspots()
-                if not hotspots:
+                if not hotspots and not fw.IS_WINDOWS:
                     plan.warnings.append(
                         "No running hotspot was detected, so the SSID, host IP and "
                         "channel couldn't be checked. Start the hotspot "
                         "(./start.sh) and use 'Detect from hotspot' to be sure.")
+                elif not hotspots:
+                    ips = fw.local_ipv4_addresses()
+                    if ips and config.host_ip not in ips:
+                        plan.warnings.append(
+                            f"Host IP {config.host_ip} isn't one of this computer's "
+                            f"addresses ({', '.join(ips)}), so the receiver's data "
+                            f"won't arrive here.")
                 else:
                     ips = {h.ip for h in hotspots if h.ip}
                     ssids = {h.ssid for h in hotspots}
@@ -1030,7 +1111,7 @@ class DevicesTab(QWidget):
         export = self._export_path()
         if not export.is_file():
             QMessageBox.warning(self, "ESP-IDF not found",
-                                "Set the path to esp-idf/export.sh first.")
+                                f"Set the path to ESP-IDF's {fw.EXPORT_NAME} first.")
             return
         self.flasher.identify(row.board.port, row.board.usb_serial, export,
                               esptool_cmd)

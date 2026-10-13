@@ -134,10 +134,41 @@ the heatmap can't use (no receivers, a self-crossing outline), and keeps
 a backup of the previous file. After a localize wizard run it opens with
 the new boards marked as not yet placed.
 
-Builds go to `~/.cache/csidetector/firmware/` with a generated sdkconfig
+Builds go to `~/.cache/csidetector/firmware/` (on Windows,
+`%LOCALAPPDATA%\csid\fw`) with a generated sdkconfig
 overlay; the firmware projects' own `sdkconfig` files are never modified,
 and reflashing more boards with the same settings skips the rebuild.
-ESP-IDF is found via `$IDF_EXPORT`, `$IDF_PATH`, or `~/esp/esp-idf`.
+ESP-IDF is found via `$IDF_EXPORT`, `$IDF_PATH`, `~/esp/esp-idf`, or
+(Windows) `C:\Espressif\frameworks\esp-idf-v*`.
+
+#### On Windows
+
+1. Install **Python 3.11 or newer** from
+   [python.org](https://www.python.org/downloads/) and tick *Add python.exe
+   to PATH* in the installer.
+2. Install **ESP-IDF v5.x** with Espressif's
+   [Windows installer](https://dl.espressif.com/dl/esp-idf/) (the default
+   `C:\Espressif` location is found automatically).
+3. Put CSIDetector in a folder **without spaces** in its path, e.g.
+   `C:\csidetector` (`git clone`, or download the ZIP and extract it there).
+   ESP-IDF can't build in paths with spaces; the app says so if it is.
+4. Double-click **`setup-windows.bat`**. The first run creates a Python
+   environment and installs the requirements; after that it just opens the
+   setup app.
+
+Boards with native USB (ESP32-S3/C3/C5 "USB" port) need no driver. Boards
+whose USB goes through a CP210x or CH340 chip may need that chip's driver
+from Silicon Labs or WCH before they show up.
+
+Alert mode works the same as on Linux. Localize mode needs a Wi-Fi network
+that the receivers and this computer share: Windows can't report a hotspot's
+name and channel to the app, so you type them in. A router with a fixed
+channel works best (Windows' Mobile hotspot picks its own channel, which can
+change); the wizard lists this computer's IP addresses to choose from.
+There's no `start.sh` on Windows: the wizard's last page gives the
+Command Prompt commands for calibration and the heatmap. Allow Python
+through Windows Firewall on private networks when asked, or the receivers'
+data won't arrive.
 
 ### Run the test suite
 

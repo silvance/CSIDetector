@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -64,7 +65,7 @@ def env(qt_app, tmp_path, monkeypatch):
                          idf_export=str(export), host_dir=host_dir)
     started = []
     monkeypatch.setattr(wiz.flasher._runner, "start",
-                        lambda argv, environ: started.append(argv))
+                        lambda argv, environ, native_args=None: started.append(argv))
     # Never block a test on a modal dialog.
     monkeypatch.setattr(wiz, "confirm", lambda *a: True)
     shown = []
@@ -129,7 +130,8 @@ def test_alert_flow_end_to_end(env):
 
     assert wiz.result() == QWizard.DialogCode.Accepted
     toml = env.host_dir / "alert.toml"
-    assert stat.S_IMODE(os.stat(toml).st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(toml).st_mode) == 0o600
     cfg = load_config(str(toml))
     assert cfg["notifier"]["bot_token"] == TOKEN
     assert cfg["alert"]["location_label"] == "South RX"
@@ -554,6 +556,36 @@ def test_failed_alert_toml_write_leaves_the_monitor_running(env, tmp_path):
     wiz.button(QWizard.WizardButton.FinishButton).click()
     assert wiz.currentId() == wz.PAGE_FINISH            # stayed: "Couldn't save"
     assert retired == []
+
+
+def test_windows_localize_flow_without_networkmanager(env, monkeypatch):
+    """Windows: no hotspot detection; the Environment page offers this
+    computer's IPs (the Mobile hotspot's is picked) and says what to enter,
+    and the finish steps are Command Prompt commands, not start.sh."""
+    monkeypatch.setattr(fw, "IS_WINDOWS", True)
+    monkeypatch.setattr(fw, "local_ipv4_addresses", lambda: ["192.168.1.20", "192.168.137.1"])
+    monkeypatch.setattr(fw, "_IDF_ENV_CACHE", {})
+    wiz = env.wiz
+    # export.bat's environment already captured (that stage has its own test).
+    fw.remember_idf_env(Path(wiz.state.export),
+                        fw.IdfEnv({}, sys.executable, Path("/idf/tools/idf.py")))
+    wiz.detect_hotspots = lambda: []
+    wiz.page(wz.PAGE_MODE).localize.setChecked(True)
+    wiz.next()
+    page = wiz.currentPage()
+    assert page.host_ip.text() == "192.168.137.1"
+    assert "fixed channel" in page.hotspot_status.text()
+    page.ssid.setText("HomeWiFi")
+    page.password.setText("hunter222")
+    wiz.next()
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    wiz.next()
+    _flash(env, "/dev/ttyACM1", MAC_B)
+    wiz.next()
+    wiz.next()
+    text = wiz.currentPage().summary.text()
+    assert "start.sh" not in text and "localize heatmap udp:5566" in text
+    assert "cd /d" in text and "allow it on private networks" in text
 
 
 def test_calibration_is_kept_only_on_the_same_channel(env):

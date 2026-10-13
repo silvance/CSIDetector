@@ -13,6 +13,8 @@ from csidetector.modes.alert.config import load_config
 from csidetector.modes.localize.heatmap import _load_links
 from csidetector.provision import project_files as pf
 
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX-only (bash, file modes, symlinks or /proc)")
+
 TOKEN = "123456789:" + "A" * 35
 EXAMPLE_LINKS = Path(__file__).resolve().parents[1] / "links.example.json"
 
@@ -24,6 +26,7 @@ def test_validate_telegram():
     assert len(pf.validate_telegram("nope", "x")) == 2
 
 
+@POSIX_ONLY
 def test_write_alert_toml_is_owner_only_and_loadable(tmp_path):
     path = tmp_path / "alert.toml"
     assert pf.write_alert_toml(path, TOKEN, "8722080863", 'Lab "A"') is None
@@ -120,8 +123,9 @@ def test_backups_are_owner_only_and_never_overwrite_each_other(tmp_path):
     second = pf.write_alert_toml(path, TOKEN, "8722080863")   # same second
     assert first != second
     assert 'bot_token = "old"' in first.read_text()           # not clobbered
-    for p in (first, second, path):
-        assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+    if os.name != "nt":                      # Windows: the profile ACL protects it
+        for p in (first, second, path):
+            assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
 
 
 @pytest.mark.parametrize("bad", [
@@ -194,6 +198,7 @@ def test_numeric_strings_are_accepted_like_the_viewers_do(tmp_path):
     assert (txs[0].x, txs[0].y) == (0.3, 1.0) and len(rxs) == 1
 
 
+@POSIX_ONLY
 def test_write_links_writes_through_a_symlink(tmp_path):
     """The wizard's merge mustn't replace a symlinked links.json either."""
     real = tmp_path / "rooms" / "office" / "links.json"

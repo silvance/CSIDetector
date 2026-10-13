@@ -17,6 +17,7 @@ import ipaddress
 import json
 import os
 import shlex
+import sys
 import threading
 import time
 from pathlib import Path
@@ -88,8 +89,10 @@ class ModePage(QWizardPage):
                             "no Wi-Fi setup needed."))
         lay.addSpacing(12)
         lay.addWidget(self.localize)
-        lay.addWidget(_hint("Receivers join this computer's hotspot and stream over "
-                            "Wi-Fi. Needs the hotspot running (./start.sh)."))
+        lay.addWidget(_hint(
+            "Receivers join a Wi-Fi network this computer is on and stream over it. "
+            + ("Use your Wi-Fi router, or Windows' Mobile hotspot." if fw.IS_WINDOWS
+               else "Needs the hotspot running (./start.sh).")))
         lay.addStretch(1)
 
     def validatePage(self) -> bool:  # noqa: N802
@@ -102,6 +105,15 @@ def _note() -> QLabel:
     label = QLabel("")
     label.setWordWrap(True)
     return label
+
+
+def _export_browse_dir() -> str:
+    """Where ESP-IDF usually is, to start the file dialog there."""
+    for d in ((os.path.expandvars(r"%SystemDrive%\Espressif\frameworks"),)
+              if fw.IS_WINDOWS else ()) + (os.path.expanduser("~/esp"),):
+        if os.path.isdir(d):
+            return d
+    return os.path.expanduser("~")
 
 
 def _hint(text: str) -> QLabel:
@@ -138,7 +150,7 @@ class EnvironmentPage(QWizardPage):
         self.port.setRange(1, 65535)
 
         form = QFormLayout(self)
-        form.addRow("ESP-IDF export.sh:", row)
+        form.addRow(f"ESP-IDF {fw.EXPORT_NAME}:", row)
         form.addRow("Wi-Fi channel:", self.channel)
         form.addRow(self.hotspot_status)
         form.addRow("", self.detect_btn)
@@ -177,10 +189,27 @@ class EnvironmentPage(QWizardPage):
 
     def detect(self) -> None:
         self._hotspots = self.wiz.detect_hotspots()
-        if not self._hotspots:
+        if not self._hotspots and not fw.IS_WINDOWS:
             self.hotspot_status.setText(
                 "⚠ No running hotspot found. Start it (./start.sh), then click "
                 "Detect — or fill the values in by hand.")
+            return
+        if not self._hotspots:
+            # Windows has no NetworkManager to ask: help with the host IP and
+            # say what the rest must match.
+            ips = fw.local_ipv4_addresses()
+            if fw.WINDOWS_HOTSPOT_IP in ips:
+                self.host_ip.setText(fw.WINDOWS_HOTSPOT_IP)
+            elif len(ips) == 1:
+                self.host_ip.setText(ips[0])
+            self.hotspot_status.setText(
+                "Enter the Wi-Fi network the receivers should join: its name, "
+                "password and channel. A router with a fixed channel (set in its "
+                "settings) works best; Windows' Mobile hotspot picks its own "
+                "channel, which can change. This computer's addresses: "
+                + (", ".join(ips) or "none found")
+                + (f" ({fw.WINDOWS_HOTSPOT_IP} is the Mobile hotspot)."
+                   if fw.WINDOWS_HOTSPOT_IP in ips else "."))
             return
         hs = self._hotspots[0]
         self.ssid.setText(hs.ssid)
@@ -194,8 +223,8 @@ class EnvironmentPage(QWizardPage):
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select ESP-IDF export.sh", os.path.expanduser("~/esp"),
-            "export.sh (export.sh);;All files (*)")
+            self, f"Select ESP-IDF {fw.EXPORT_NAME}", _export_browse_dir(),
+            f"{fw.EXPORT_NAME} ({fw.EXPORT_NAME});;All files (*)")
         if path:
             self.export_edit.setText(path)
 
@@ -205,8 +234,8 @@ class EnvironmentPage(QWizardPage):
         if not text:
             return None
         path = Path(text).expanduser()
-        if path.is_dir() and (path / "export.sh").is_file():
-            path = path / "export.sh"
+        if path.is_dir() and (path / fw.EXPORT_NAME).is_file():
+            path = path / fw.EXPORT_NAME
         return path if path.is_file() else None
 
     def problems(self) -> list[str]:
@@ -214,14 +243,14 @@ class EnvironmentPage(QWizardPage):
         text = self.export_edit.text().strip()
         if self.export_path() is None:
             if not text:
-                out.append("Select ESP-IDF's export.sh (usually "
-                           "~/esp/esp-idf/export.sh). If ESP-IDF isn't installed "
+                out.append(f"Select ESP-IDF's {fw.EXPORT_NAME} (usually "
+                           f"{fw.EXPORT_EXAMPLE}). If ESP-IDF isn't installed "
                            "yet, see the README's Firmware section.")
             elif Path(text).expanduser().is_dir():
-                out.append("That folder has no export.sh. Select the esp-idf "
-                           "folder, or its export.sh.")
+                out.append(f"That folder has no {fw.EXPORT_NAME}. Select the "
+                           f"esp-idf folder, or its {fw.EXPORT_NAME}.")
             else:
-                out.append(f"No export.sh at {text}.")
+                out.append(f"No {fw.EXPORT_NAME} at {text}.")
         if self.wiz.state.mode == MODE_LOCALIZE:
             if not self.ssid.text():
                 out.append("Enter the hotspot's name (SSID).")
@@ -265,10 +294,13 @@ class EnvironmentPage(QWizardPage):
                 and not self.wiz.confirm(
                     "No hotspot password",
                     "The password is blank, so receivers will look for an OPEN "
-                    "network. NetworkManager hotspots normally have a password "
-                    "(nmcli -s -g 802-11-wireless-security.psk connection show "
-                    "<name> shows it); with a blank one here, receivers won't "
-                    "join.\n\nContinue with an open network?")):
+                    "network. Hotspots and routers normally have a password "
+                    + ("(Windows shows the Mobile hotspot's in Settings → Network "
+                       "& internet → Mobile hotspot)" if fw.IS_WINDOWS else
+                       "(nmcli -s -g 802-11-wireless-security.psk connection show "
+                       "<name> shows a NetworkManager one)")
+                    + "; with a blank one here, receivers won't join.\n\n"
+                    "Continue with an open network?")):
             return False
         st = self.wiz.state
         st.export = str(self.export_path() or self.export_edit.text().strip())
@@ -299,7 +331,9 @@ class FlashPage(QWizardPage):
         self.board_combo = QComboBox()
         self.board_combo.setAccessibleName("Board")
         self.board_combo.setPlaceholderText(
-            "No ESP32 found. Plug one in with a data USB cable (not charge-only).")
+            "No ESP32 found. Plug one in with a data USB cable (not charge-only)."
+            + (" Boards with a CP210x or CH340 USB chip need its driver."
+               if fw.IS_WINDOWS else ""))
         self.board_combo.currentIndexChanged.connect(lambda *_: self._sync_buttons())
         # The board the user picked — by MAC for a native board, else by
         # port — kept while it's briefly off the bus (a reset) instead of
@@ -1095,17 +1129,35 @@ class FinishPage(QWizardPage):
                 env.append(f"LINKS={shlex.quote(str(links))}")
             if st.hotspot_connection and st.hotspot_connection != "CSIDetector":
                 env.append(f"HOTSPOT_NAME={shlex.quote(st.hotspot_connection)}")
-            host = shlex.quote(str(self.wiz.host_dir))
-            start = shlex.quote(str(self.wiz.host_dir.parent / "start.sh"))
-            self.next_steps = [
-                "Next steps:",
-                "  1. Place each new board in the setup app's Room layout tab "
-                "(opens when you click Finish; dashed markers aren't placed yet).",
-                "  2. Leave the room and run:",
-                f"     cd {host} && python run.py localize calibrate-links "
-                f"udp:{st.host_port} --out baselines.json --settle 30",
-                f"  3. {' '.join(env + [start])}   (hotspot + heatmap)",
-            ]
+            step1 = ("  1. Place each new board in the setup app's Room layout tab "
+                     "(opens when you click Finish; dashed markers aren't placed yet).")
+            if fw.IS_WINDOWS:
+                # No start.sh (bash, NetworkManager) on Windows: the commands
+                # it runs, for the Command Prompt.
+                host = f'"{self.wiz.host_dir}"'
+                py = f'"{sys.executable}"'
+                self.next_steps = [
+                    "Next steps:", step1,
+                    "  2. Make sure the Wi-Fi network is on, leave the room and run "
+                    "(in a Command Prompt):",
+                    f"     cd /d {host} && {py} run.py localize calibrate-links "
+                    f"udp:{st.host_port} --out baselines.json --settle 30",
+                    "  3. Then, for the live heatmap:",
+                    f"     cd /d {host} && {py} run.py localize heatmap "
+                    f"udp:{st.host_port} --links \"{links}\" --baselines baselines.json",
+                    "  The first time, Windows asks whether Python may use the "
+                    "network: allow it on private networks, or no data arrives.",
+                ]
+            else:
+                host = shlex.quote(str(self.wiz.host_dir))
+                start = shlex.quote(str(self.wiz.host_dir.parent / "start.sh"))
+                self.next_steps = [
+                    "Next steps:", step1,
+                    "  2. Leave the room and run:",
+                    f"     cd {host} && python run.py localize calibrate-links "
+                    f"udp:{st.host_port} --out baselines.json --settle 30",
+                    f"  3. {' '.join(env + [start])}   (hotspot + heatmap)",
+                ]
             lines = [f"Update {links} with {len(st.txs)} transmitter(s) and "
                      f"{len(st.rxs)} receiver(s).", ""] + self.next_steps
             self.open_monitor.setVisible(False)
