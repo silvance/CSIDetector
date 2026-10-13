@@ -11,6 +11,12 @@ Runs the real SetupWindow / SetupWizard against a simulated bench:
   progress parsing, failure hints, esptool's wrong-chip error, and
   Cancel's process-tree kill. Each successful flash records the
   firmware config the board now carries (``Session.firmware(mac)``).
+* A receiver can stream simulated CSI (``csi(port)``; still or motion),
+  read through the collector's real serial loop via a fake
+  ``serial.Serial``, so the alert monitor can be calibrated, armed and
+  starved of data.
+* Native-USB boards drop off the bus briefly after esptool resets them,
+  as real ones do.
 * Message boxes and file dialogs are recorded (and rendered to PNG)
   instead of blocking. Questions are answered from a queue (default Yes).
 * Unhandled exceptions and Qt warnings are recorded, never fatal.
@@ -39,6 +45,8 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import math
+import random
 import json
 import os
 import re
@@ -71,10 +79,13 @@ if str(HOST_DIR) not in sys.path:
 
 import csidetector.modes.alert.gui as alert_gui  # noqa: E402
 import csidetector.modes.alert.telegram as telegram  # noqa: E402
+import serial as pyserial  # noqa: E402
 from csidetector.provision import devices as dv  # noqa: E402
 from csidetector.provision import firmware as fw  # noqa: E402
 from csidetector.provision import gui  # noqa: E402
 from csidetector.provision import wizard as wz  # noqa: E402
+
+_REAL_LIST_BOARDS = dv.list_boards
 
 # USB identities per connection type: (vid, pid, description).
 VIA = {
@@ -156,6 +167,13 @@ def chip_target(chip):
 
 def target_name(target):
     return "ESP32" + ("-" + target[5:].upper() if len(target) > 5 else "")
+
+def hard_reset(port):
+    """The chip resets: a native-USB board leaves the bus for a moment."""
+    out("Hard resetting via RTS pin...")
+    os.makedirs(os.path.join(BENCH, "reset"), exist_ok=True)
+    with open(os.path.join(BENCH, "reset", port.replace("/", "_")), "w") as f:
+        f.write(str(time.time()))
 '''
 
 _FAKE_IDF = _COMMON + r'''
@@ -218,7 +236,7 @@ for pct in range(0, 101, 10):
     out("Writing at 0x%08x... (%d %%)" % (0x10000 + pct * 0x800, pct))
 out("Wrote 812345 bytes (512345 compressed) at 0x00010000 in 6.1 seconds")
 out("Hash of data verified.")
-out("Hard resetting via RTS pin...")
+hard_reset(port)
 
 cfg = {{}}
 overlay = defs.get("SDKCONFIG_DEFAULTS", "").split(";")[-1]
@@ -260,7 +278,7 @@ if behavior in ("absent", "no_connect"):
 out("Detecting chip type... " + target_name(chip_target(board["chip"])))
 out("Chip is %s (revision v0.2)" % board["chip"])
 out("MAC: " + board["mac"])
-out("Hard resetting via RTS pin...")
+hard_reset(port)
 '''
 
 
@@ -328,7 +346,13 @@ class DriverError(AssertionError):
 
 class Session:
     def __init__(self, out_dir: Optional[str | Path] = None, screenshots: bool = True,
-                 line_delay: float = 0.01, name: str = "session", fast_timers: bool = False):
+                 line_delay: float = 0.01, name: str = "session", fast_timers: bool = False,
+                 calibrate_s: tuple[float, float] = (2.0, 2.0),
+                 reset_drop_s: Optional[float] = None):
+        """``calibrate_s``: the monitor's (leave-the-room, record) seconds
+        (the app uses 30 + 30). ``reset_drop_s``: how long a native board is
+        off the bus after a reset (0 = never). Default: as on real hardware,
+        shorter than the app's post-flash re-scan delay."""
         self.name = name
         self.screenshots = screenshots and out_dir is not None
         self.out = Path(out_dir) if out_dir else None
@@ -355,12 +379,20 @@ class Session:
         self._restore: list[Callable[[], None]] = []
         self._focus = ""
         self._fast_timers = fast_timers
+        self._calibrate_s = calibrate_s
+        self.reset_drop_s = (reset_drop_s if reset_drop_s is not None
+                             else 0.1 if fast_timers else 0.8)
+        self._csi: dict[str, dict] = {}       # port → {"rate", "motion", "seq"}
         self.window: Optional[gui.SetupWindow] = None
 
     # -- lifecycle -------------------------------------------------------
 
     def __enter__(self) -> "Session":
-        self.start()
+        try:
+            self.start()
+        except BaseException:
+            self.close()                    # undo the patches start() made
+            raise
         return self
 
     def __exit__(self, *exc) -> None:
@@ -387,6 +419,18 @@ class Session:
         self._step("start the setup app", "shown")
 
     def close(self) -> None:
+        try:
+            self._close_app()
+        finally:
+            for undo in reversed(self._restore):
+                undo()
+            self._restore.clear()
+            if self.out:
+                self.write_report()
+            shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _close_app(self) -> None:
+        self._csi.clear()
         if self.window is not None:
             for runner in self._runners():
                 if runner.running:
@@ -409,12 +453,6 @@ class Session:
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
-        for undo in reversed(self._restore):
-            undo()
-        self._restore.clear()
-        if self.out:
-            self.write_report()
-        shutil.rmtree(self._tmp, ignore_errors=True)
 
     def _patch(self, obj: Any, attr: str, value: Any) -> None:
         old = getattr(obj, attr)
@@ -422,7 +460,8 @@ class Session:
         self._restore.append(lambda: setattr(obj, attr, old))
 
     def _patch_environment(self) -> None:
-        for key, value in (("XDG_CACHE_HOME", str(self._tmp / "cache")),):
+        for key, value in (("XDG_CACHE_HOME", str(self._tmp / "cache")),
+                           ("HOME", str(self.home))):
             old = os.environ.get(key)
             os.environ[key] = value
             self._restore.append(lambda k=key, o=old: os.environ.__setitem__(k, o)
@@ -434,7 +473,12 @@ class Session:
         if self._fast_timers:
             self._patch(gui.TIMING, "auto_refresh_ms", 250)
             self._patch(gui.TIMING, "post_process_refresh_ms", 200)
-
+            self._patch(alert_gui, "NO_DATA_WARN_S", 1.0)
+        self._patch(alert_gui, "CALIBRATE_SETTLE_S", self._calibrate_s[0])
+        self._patch(alert_gui, "CALIBRATE_RECORD_S", self._calibrate_s[1])
+        # The monitor finds its receiver again via list_boards().
+        self._patch(dv, "list_boards", lambda comports=None: self._list_boards())
+        self._patch(pyserial, "Serial", self._fake_serial_class())
         for kind in ("warning", "information", "critical", "question"):
             self._patch(QMessageBox, kind, self._message_box(kind))
         self._patch(QFileDialog, "getOpenFileName", self._file_dialog("open"))
@@ -443,7 +487,7 @@ class Session:
         session = self
 
         class FakeTelegram:
-            def __init__(self, token: str, chat_id: str, *a, **k):
+            def __init__(self, bot_token: str = "", chat_id: str = "", *a, **k):
                 self.chat_id = chat_id
 
             def send(self, event) -> None:
@@ -511,6 +555,81 @@ class Session:
         """Pretend a NetworkManager hotspot is running."""
         self.hotspots = [fw.HotspotInfo(connection or ssid, iface, ssid, channel, ip)]
 
+    def csi(self, port: str, rate: float = 100.0, motion: bool = False,
+            on: bool = True) -> None:
+        """The receiver on ``port`` hears its transmitter: it streams CSI
+        lines at ``rate`` Hz (``motion`` = someone moving). ``on=False``
+        stops the stream (transmitter unplugged)."""
+        if on:
+            self._csi[port] = {"rate": rate, "motion": motion, "seq": 0}
+        else:
+            self._csi.pop(port, None)
+        self.notes.append(f"CSI on {port}: " + (
+            f"{rate:g} Hz, {'motion' if motion else 'still'}" if on else "off"))
+
+    def motion(self, port: str, on: bool = True) -> None:
+        """Someone starts / stops moving between the boards."""
+        self._csi[port]["motion"] = on
+        self.notes.append(f"motion on {port}: {on}")
+
+    def _fake_serial_class(self):
+        session = self
+
+        class FakeSerial:
+            """serial.Serial for the collector: CSI lines from the bench,
+            b"" after ``timeout`` when nothing streams (as pyserial does)."""
+
+            def __init__(self, port: str, baudrate: int = 9600, timeout=None, **kw):
+                if port not in session.boards:
+                    raise pyserial.SerialException(
+                        f"[Errno 2] could not open port {port}: [Errno 2] No such "
+                        f"file or directory: '{port}'")
+                self.port, self.timeout = port, timeout or 1.0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def close(self) -> None:
+                pass
+
+            def readline(self) -> bytes:
+                if self.port not in session.boards:
+                    raise pyserial.SerialException(
+                        "device reports readiness to read but returned no data "
+                        "(device disconnected or multiple access on port?)")
+                stream = session._csi.get(self.port)
+                if not stream:
+                    time.sleep(self.timeout)
+                    return b""
+                time.sleep(1.0 / stream["rate"])
+                stream["seq"] += 1
+                return session._csi_line(self.port, stream).encode()
+
+        return FakeSerial
+
+    def _csi_line(self, port: str, stream: dict) -> str:
+        """A CSI_DATA line as the receiver firmware prints it: 64
+        subcarriers (guard / DC zeroed), amplitude noisier with motion."""
+        fwr = self.firmware(self.boards[port].mac) or {}
+        cfg = fwr.get("config", {})
+        tx = (cfg.get("CONFIG_CSI_RX_FILTER_TX_MAC", "").split(",")[0].strip()
+              or "aa:bb:cc:dd:ee:ff")
+        channel = cfg.get("CONFIG_CSI_RX_CHANNEL", "11")
+        sigma = 4.0 if stream["motion"] else 0.6
+        iq = []
+        for k in range(64):
+            amp = 0 if (k < 6 or k > 58 or k == 32) else \
+                max(1, min(120, round(20 + 6 * math.sin(k / 5) + random.gauss(0, sigma))))
+            iq += [0, amp]                 # (Im, Re) pairs
+        fields = ["CSI_DATA", str(stream["seq"]), tx, "-52", "11", "1", "0", "0", "0", "0",
+                  "0", "0", "0", "0", "-92", "0", str(channel), "0",
+                  str(int(time.time() * 1e6) & 0x7FFFFFFF), "0", "0", "0", str(len(iq)),
+                  "0", '"' + json.dumps(iq).replace(" ", "") + '"']
+        return ",".join(fields) + "\n"
+
     def esptool_dash_only(self, on: bool = True) -> None:
         """Simulate an esptool that only accepts ``read-mac``."""
         self._control["esptool_dash_only"] = on
@@ -540,7 +659,18 @@ class Session:
         (self.bench / "control.json").write_text(json.dumps(self._control))
 
     def _list_boards(self) -> list[dv.AttachedBoard]:
-        return dv.list_boards([b.comport() for b in self.boards.values()])
+        return _REAL_LIST_BOARDS([b.comport() for b in self.boards.values()
+                                  if not self._resetting(b)])
+
+    def _resetting(self, board: FakeBoard) -> bool:
+        """A native-USB board re-enumerates after a reset: briefly gone."""
+        if board.via != "native" or self.reset_drop_s <= 0:
+            return False
+        marker = self.bench / "reset" / board.port.replace("/", "_")
+        try:
+            return time.time() - float(marker.read_text()) < self.reset_drop_s
+        except (OSError, ValueError):
+            return False
 
     def _runners(self) -> list:
         if self.window is None:
@@ -597,9 +727,11 @@ class Session:
         buttons = (QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
                    if kind == "question" else QMessageBox.StandardButton.Ok)
         box = QMessageBox(icon, title, text, buttons)
-        box.adjustSize()
+        box.show()                          # laid out (and wrapped) as on screen
+        QApplication.processEvents()
         name = f"{len(self.steps):02d}-dialog-{len(self.dialogs)}.png"
         box.grab().save(str(self.out / name))
+        box.close()
         box.deleteLater()
         return name
 
@@ -933,6 +1065,15 @@ class Session:
     def cancel_wizard(self) -> bool:
         return self._nav(QWizard.WizardButton.CancelButton, "Cancel (wizard)")
 
+    def press(self, key: str, field: Optional[str] = None) -> None:
+        """Press a key ("Return", "Escape", "Tab", …) in a field (by its
+        label, as for fill) or on the window."""
+        w = self.field(field) if field else self.screen()
+        if field:
+            w.setFocus()
+        QTest.keyClick(w, getattr(Qt.Key, f"Key_{key}"))
+        self._step(f"press {key}" + (f" in {field!r}" if field else ""), "pressed")
+
     def answer(self, *answers: str) -> None:
         """Queue answers ("Yes"/"No") for the next question dialogs."""
         self._answers += list(answers)
@@ -973,12 +1114,16 @@ class Session:
         return ok
 
     def wait_for(self, predicate: Callable[[], bool], timeout: float = 5.0,
-                 what: str = "condition") -> bool:
+                 what: str = "condition", required: bool = True) -> bool:
+        """Wait until ``predicate()``; a timeout is a failed expectation
+        unless ``required=False``."""
         deadline = time.monotonic() + timeout
         while not predicate() and time.monotonic() < deadline:
             QTest.qWait(20)
         ok = bool(predicate())
         self._step(f"wait for {what}", "true" if ok else f"still false after {timeout:g}s")
+        if not ok and required:
+            self.expect(False, f"{what} (timed out after {timeout:g}s)")
         return ok
 
     # -- checks & records ------------------------------------------------

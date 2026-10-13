@@ -45,12 +45,20 @@ the `Session` methods before you start. Key calls:
   behavior="ok"|"no_connect"|"busy"|"hang"|"build_fail")`, `unplug`,
   `set_behavior`, `hotspot(...)`, `esptool_dash_only()`,
   `firmware(mac)` (the config a board was actually flashed with),
-  `leftover_processes()`, `telegram_ok = False`.
+  `leftover_processes()`, `telegram_ok = False`. Native boards drop off
+  the bus briefly after esptool resets them (`reset_drop_s`).
+- CSI: `csi(port, rate=100, motion=False)` makes the receiver on `port`
+  stream CSI through the collector's real serial loop (`on=False` = the
+  transmitter went away); `motion(port, True)` = someone moving. With
+  this the alert monitor can be calibrated, armed, and starved of data.
+  Calibration is shortened via `Session(calibrate_s=(settle, record))`.
 - Actions (by visible text, like a user): `click`, `fill`, `choose`,
   `tick`, `select_row`, `tab`, `next`/`back`/`finish`/`cancel_wizard`,
-  `answer("Yes"/"No")` for the next question dialog, `choose_file`.
+  `press("Return", "Label")`, `answer("Yes"/"No")` for the next question
+  dialog, `choose_file`. `focus("monitor")` to act on the monitor window.
 - Waiting: `wait_idle()` (flash/identify done), `wait_refresh()`,
-  `wait(seconds)`, `wait_for(pred)`.
+  `wait(seconds)`, `wait_for(pred)` (a timeout counts as a failed
+  expectation unless `required=False`).
 - Looking: `snap(note)`, `dump()`, `texts()`, `page_title()`,
   `nav_usable("next")`, `focus("monitor")`, `dialogs`, `expect(...)`.
 

@@ -22,7 +22,8 @@ import json
 import struct
 import sys
 import time
-from typing import Iterable, Iterator, Optional
+import threading
+from typing import Callable, Iterable, Iterator, Optional
 
 import numpy as np
 
@@ -99,13 +100,24 @@ def nonzero_subcarriers(samples: Iterable[CSISample], probe: int = 64) -> np.nda
     return np.flatnonzero(mask)
 
 
-def iter_serial(port: str, baud: int = 921600) -> Iterator[CSISample]:
+def iter_serial(port: str, baud: int = 921600,
+                stop: Optional[threading.Event] = None,
+                on_idle: Optional[Callable[[], None]] = None) -> Iterator[CSISample]:
+    """CSI samples from a serial port, forever.
+
+    ``stop`` ends the iterator within ~1 s (one read timeout) even when
+    no data is arriving — otherwise a consumer that only checks a flag
+    per sample can't be stopped while the transmitter is off.
+    ``on_idle`` is called after each read timeout with nothing read.
+    """
     import serial  # imported lazily so unit tests don't need pyserial
 
     with serial.Serial(port, baud, timeout=1) as ser:
-        while True:
+        while stop is None or not stop.is_set():
             raw = ser.readline()
             if not raw:
+                if on_idle is not None:
+                    on_idle()
                 continue
             # errors="replace" never raises; the previous UnicodeDecodeError
             # arm was dead. Garbled bytes become U+FFFD and parse_line
@@ -197,13 +209,15 @@ def iter_udp(port: int, bind: str = "0.0.0.0",
         sock.close()
 
 
-def open_source(source: str) -> Iterator[CSISample]:
+def open_source(source: str, stop: Optional[threading.Event] = None,
+                on_idle: Optional[Callable[[], None]] = None) -> Iterator[CSISample]:
+    """``stop`` / ``on_idle`` apply to serial sources (see iter_serial)."""
     if source == "-":
         return iter_stdin()
     if source.startswith("udp:"):
         return iter_udp(int(source[4:]))
     if source.startswith("/dev/") or source.lower().startswith("com"):
-        return iter_serial(source)
+        return iter_serial(source, stop=stop, on_idle=on_idle)
     return iter_file(source)
 
 

@@ -90,6 +90,12 @@ class MotionDetector:
         self._buf: collections.deque[np.ndarray] = collections.deque(maxlen=config.window)
         self._in_motion = False
 
+    @property
+    def ready(self) -> bool:
+        """True once a full window has been seen; update() returns a score
+        of 0.0 before that."""
+        return len(self._buf) == self._buf.maxlen
+
     def update(self, amplitude: np.ndarray) -> tuple[float, bool]:
         # Defensively drop samples whose subcarrier count is too small
         # for the index — happens on mid-stream bandwidth/MCS changes

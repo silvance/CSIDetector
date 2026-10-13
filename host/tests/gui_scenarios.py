@@ -277,8 +277,8 @@ def cancel_mid_flash(s: Session) -> None:
     _start_wizard(s)
     s.choose("Board", "/dev/ttyACM0")
     s.click("Flash as transmitter")
-    s.wait_for(lambda: s.busy() and s.page().progress.value() >= 10,
-               timeout=10, what="the flash to start writing")
+    s.wait_for(lambda: s.busy() and s.page().status.text().startswith("Flashing"),
+               timeout=10, what="the flash to reach the (hung) write")
     s.expect(not s.nav("back").isVisible(), "Back is hidden while flashing")
     s.expect(not s.nav_usable("next"), "Next is disabled while flashing")
     s.click("Cancel", nth=0)              # the page's Cancel, not the wizard's
@@ -294,8 +294,8 @@ def close_wizard_while_flashing(s: Session) -> None:
     _start_wizard(s)
     s.choose("Board", "/dev/ttyACM0")
     s.click("Flash as transmitter")
-    s.wait_for(lambda: s.busy() and s.page().progress.value() >= 10,
-               timeout=10, what="the flash to start writing")
+    s.wait_for(lambda: s.busy() and s.page().status.text().startswith("Flashing"),
+               timeout=10, what="the flash to reach the (hung) write")
     s.answer("No")
     s.cancel_wizard()
     s.expect(s.wizard is not None and s.wizard.isVisible(), "No keeps the wizard open")
@@ -389,6 +389,319 @@ def devices_tab_target_follows_chip(s: Session) -> None:
     s.expect(s.field("Target chip").isEnabled(), "an unidentified board's target is editable")
 
 
+# --------------------------------------------------------------------------
+# Regression walkthroughs for the GUI tester's findings
+# --------------------------------------------------------------------------
+
+def _alert_setup(s: Session, telegram: bool = False, open_monitor: bool = True,
+                 tx_port: str = "/dev/ttyACM0", rx_port: str = "/dev/ttyACM1") -> None:
+    """Plug two native S3 boards and run the alert wizard to Finish."""
+    if tx_port not in s.boards:
+        s.plug(tx_port, mac=TX_MAC)
+    if rx_port not in s.boards:
+        s.plug(rx_port, mac=RX_MAC)
+    _start_wizard(s)
+    _flash_here(s, tx_port, "Desk TX")
+    s.next()
+    _flash_here(s, rx_port, "South RX", "receiver")
+    s.next()
+    if telegram:
+        s.fill("Bot token", TOKEN)
+        s.fill("Chat ID", "8722080863")
+    else:
+        s.fill("Skip", True)
+    s.next()
+    s.fill("Open the live monitor", open_monitor)
+    s.expect(s.finish(), "Finish")
+
+
+def _monitor(s: Session):
+    s.focus("monitor")
+    return s.window._monitor
+
+
+def _dialog(s: Session, title: str) -> bool:
+    return any(d.title == title for d in s.dialogs)
+
+
+def two_bridge_boards(s: Session) -> None:
+    """Two classic ESP32s on CP2102s: the receiver page must not default to (or
+    silently reflash) the transmitter just flashed."""
+    s.plug("/dev/ttyUSB0", chip="ESP32-D0WD-V3", mac=TX_MAC, via="cp2102")
+    s.plug("/dev/ttyUSB1", chip="ESP32-D0WD-V3", mac=RX_MAC, via="cp2102")
+    _start_wizard(s)
+    _flash_here(s, "/dev/ttyUSB0", "Desk TX")
+    s.wait_idle()
+    s.expect(s.next(), "Transmitters → Receivers")
+    board = s.field("Board")
+    s.expect(board.currentData() == "/dev/ttyUSB1", "defaults away from the transmitter")
+    s.expect("Desk TX" in board.itemText(board.findData("/dev/ttyUSB0")),
+             "the dropdown says which board is the transmitter")
+    s.choose("Board", "/dev/ttyUSB0")
+    s.answer("No")
+    s.click("Flash as receiver")
+    s.expect(_dialog(s, "Board already in use"), "asks before reflashing the transmitter")
+    s.expect(not s.busy() and "not flashed" in s.texts(), "declining leaves it alone")
+    _flash_here(s, "/dev/ttyUSB1", "South RX", "receiver")
+    s.wait_idle()
+    s.expect(s.firmware(TX_MAC)["project"] == "csi_transmitter", "the TX is still a TX")
+    s.wait_refresh()
+    s.expect(s.nav_usable("next"), "the bridge receiver completes the page")
+
+
+def monitor_no_csi(s: Session) -> None:
+    """Transmitter off: Calibrate times out with a reason, Disarm stops, the
+    monitor says no data is arriving, and closing it lets go of the port."""
+    _alert_setup(s)
+    mon = _monitor(s)
+    s.click("Calibrate")
+    s.expect(s.button("Cancel calibration").isEnabled(), "calibration can be cancelled")
+    s.wait_for(lambda: _dialog(s, "Calibration failed"), timeout=10,
+               what="calibration to give up")
+    s.expect(any("No CSI data" in d.text for d in s.dialogs), "says no CSI arrived")
+    s.expect(mon._calibrate_btn.text() == "Calibrate", "the button is back")
+    # Calibrate with data, then lose it while armed.
+    s.csi("/dev/ttyACM1")
+    s.click("Calibrate")
+    s.wait_for(lambda: _dialog(s, "Calibration complete"), timeout=10,
+               what="calibration with data")
+    s.click("Arm")
+    s.wait_for(lambda: "ARMED" in mon._badge.text(), what="armed and still")
+    s.csi("/dev/ttyACM1", on=False)
+    s.wait_for(lambda: mon._no_data.isVisible(), timeout=5, what="the no-data warning")
+    s.snap("armed, no CSI")
+    s.click("Disarm")
+    s.wait_for(lambda: mon._detect_thread is None, timeout=3, what="disarm to finish")
+    s.click("Calibrate")
+    s.click("Cancel calibration")
+    s.wait_for(lambda: mon._calib_thread is None, timeout=3, what="cancel to finish")
+    s.expect(not _dialog(s, "Calibration failed") or
+             sum(d.title == "Calibration failed" for d in s.dialogs) == 1,
+             "a cancelled calibration isn't reported as a failure")
+
+
+def monitor_detects_motion(s: Session) -> None:
+    """The demo: calibrate a still room, arm, someone walks in, Telegram buzzes."""
+    _alert_setup(s, telegram=True)
+    mon = _monitor(s)
+    s.csi("/dev/ttyACM1")
+    s.click("Calibrate")
+    s.wait_for(lambda: _dialog(s, "Calibration complete"), timeout=10, what="calibration")
+    s.click("Arm")
+    s.wait_for(lambda: "STILL" in mon._badge.text(), what="armed, still")
+    s.motion("/dev/ttyACM1")
+    s.wait_for(lambda: "MOTION" in mon._badge.text(), timeout=5, what="motion detected")
+    s.snap("motion")
+    s.wait_for(lambda: s.telegram_sent, timeout=5, what="the Telegram alert")
+    s.click("Disarm")
+    s.wait_for(lambda: mon._detect_thread is None, timeout=3, what="disarm")
+
+
+def monitor_receiver_port_moved(s: Session) -> None:
+    """Boards replugged in another order: the receiver is ttyACM0 now. The
+    monitor finds it by MAC instead of failing on the old port."""
+    _alert_setup(s)
+    for port in ("/dev/ttyACM0", "/dev/ttyACM1"):
+        s.unplug(port)
+    s.plug("/dev/ttyACM0", mac=RX_MAC)
+    s.csi("/dev/ttyACM0")
+    mon = _monitor(s)
+    s.click("Calibrate")
+    s.wait_for(lambda: _dialog(s, "Calibration complete"), timeout=10,
+               what="calibration on the new port")
+    s.expect(mon._state.source == "/dev/ttyACM0", "the monitor follows the receiver")
+
+
+def monitor_reopen_keeps_baseline(s: Session) -> None:
+    """The monitor can be reopened from the setup app, and re-running the
+    wizard with the same boards keeps the calibration."""
+    _alert_setup(s, open_monitor=False)
+    s.expect(s.window._monitor is None, "no monitor yet")
+    s.click("Open alert monitor")
+    s.expect(s.window._monitor is not None, "the button opens it")
+    s.csi("/dev/ttyACM1")
+    mon = _monitor(s)
+    s.click("Calibrate")
+    s.wait_for(lambda: _dialog(s, "Calibration complete"), timeout=10, what="calibration")
+    baseline = mon._state.baseline
+    s.focus("auto")
+    s.click("Setup wizard")
+    s.next()
+    s.next()
+    s.tick("Desk TX")
+    s.next()
+    s.tick("South RX")
+    s.next()
+    s.fill("Skip", True)
+    s.next()
+    s.expect("kept" in s.texts(), "the finish page says the calibration is kept")
+    s.finish()
+    s.expect(alert_gui._PersistedState.load().baseline == baseline, "baseline kept")
+
+
+def monitor_test_alert(s: Session) -> None:
+    """Test alert reports what Telegram actually said, and without Telegram
+    points at the wizard, not at command-line flags."""
+    _alert_setup(s, telegram=True)
+    _monitor(s)
+    s.telegram_ok = False
+    s.click("Test alert")
+    s.wait_for(lambda: _dialog(s, "Test alert failed"), what="the failure")
+    s.expect(any("401" in d.text for d in s.dialogs), "shows Telegram's error")
+    s.telegram_ok = True
+    s.click("Test alert")
+    s.wait_for(lambda: _dialog(s, "Test alert sent"), what="the success")
+    s.window._monitor._state.alert_config_path = ""
+    s.click("Edit config")
+    s.click("Test alert")
+    texts = [d.text for d in s.dialogs if d.title == "Telegram not set up"]
+    s.expect(len(texts) == 2 and all("--alert-config" not in t for t in texts),
+             "no-Telegram messages point at the wizard")
+
+
+def environment_reasons(s: Session) -> None:
+    """A disabled Next says why: ESP-IDF path, hotspot fields, short password,
+    Telegram token."""
+    s.plug("/dev/ttyACM0", mac=TX_MAC)
+    s.hotspot()
+    s.click("Setup wizard")
+    s.fill("Localize", True)
+    s.next()
+    s.fill("ESP-IDF export.sh", "")
+    s.expect(not s.nav_usable("next") and "export.sh" in s.page().note.text(),
+             "says to pick export.sh")
+    s.fill("ESP-IDF export.sh", str(s.export_sh.parent))      # the folder is fine
+    s.fill("Hotspot password", "abc12")
+    s.expect(not s.nav_usable("next") and "8–64" in s.page().note.text(),
+             "a short password is caught here, not at the first receiver")
+    s.fill("Hotspot password", "")
+    s.answer("No")
+    s.next()
+    s.expect(_dialog(s, "No hotspot password"), "warns that blank means open network")
+    s.expect(s.page_title() == "Environment", "No stays on the page")
+
+
+def enter_in_label_flashes(s: Session) -> None:
+    """Enter in the Label box flashes the board instead of skipping the page."""
+    s.plug("/dev/ttyACM0", mac=TX_MAC)
+    _start_wizard(s)
+    s.fill("Label", "Desk TX")
+    s.press("Return", "Label")
+    s.expect(s.page_title() == "Transmitters", "still on the transmitter page")
+    s.wait_idle()
+    s.wait_idle()
+    s.expect(s.firmware(TX_MAC), "Enter flashed the board")
+
+
+def rerun_with_bridge_receiver(s: Session) -> None:
+    """Second wizard run with a bridge-board receiver from the first: the page
+    says to Identify it, and Identify finds its port."""
+    s.plug("/dev/ttyACM0", mac=TX_MAC)
+    s.plug("/dev/ttyUSB0", chip="ESP32-D0WD-V3", mac=RX_MAC, via="cp2102")
+    _start_wizard(s)
+    _flash_here(s, "/dev/ttyACM0", "Desk TX")
+    s.next()
+    _flash_here(s, "/dev/ttyUSB0", "Bench RX", "receiver")
+    s.wait_idle()
+    s.next()
+    _telegram_skip_and_finish(s)
+    _start_wizard(s)
+    s.tick("Desk TX")
+    s.next()
+    s.tick("Bench RX")
+    s.expect(not s.nav_usable("next") and "identify" in s.texts(),
+             "says to identify the adapter board")
+    s.choose("Board", "/dev/ttyUSB0")
+    s.click("Identify")
+    s.wait_idle()
+    s.expect(s.nav_usable("next"), "Identify finds the receiver's port")
+
+
+def no_boards_plugged_in(s: Session) -> None:
+    """Nothing plugged in: Flash is disabled and the list says what to check."""
+    _start_wizard(s)
+    s.expect(not s.button("Flash as transmitter").isEnabled(), "Flash is disabled")
+    s.expect("data usb cable" in s.field("Board").placeholderText().lower(),
+             "the empty list says what to check")
+
+
+def unsupported_chip_status(s: Session) -> None:
+    """An ESP32-H2 is refused, and the status says so instead of 'Identifying…'."""
+    s.plug("/dev/ttyACM0", chip="ESP32-H2", mac=TX_MAC)
+    _start_wizard(s)
+    s.click("Flash as transmitter")
+    s.wait_idle()
+    s.expect(_dialog(s, "Can't flash"), "refused")
+    s.expect("identifying" not in s.texts() and "not flashed" in s.texts(),
+             "the status says it wasn't flashed")
+    s.expect(not s.page().progress.isVisible(), "no stale progress bar")
+
+
+def broken_links_json(s: Session) -> None:
+    """A broken links.json is reported on its page, not as an error at Finish."""
+    (s.host_dir / "links.json").write_text('{"room": {"width_m": 5,}}')
+    s.plug("/dev/ttyACM0", mac=TX_MAC)
+    s.plug("/dev/ttyACM1", mac=RX_MAC)
+    s.hotspot()
+    _start_wizard(s, localize=True)
+    _flash_here(s, "/dev/ttyACM0", "TX")
+    s.next()
+    _flash_here(s, "/dev/ttyACM1", "RX", "receiver")
+    s.next()
+    s.expect(not s.nav_usable("next") and "can't be used" in s.texts(),
+             "the links page explains the problem")
+    s.fill("links.json", str(s.host_dir / "links-new.json"))
+    s.expect(s.next(), "another path works")
+    s.finish()
+    s.expect(_dialog(s, "Saved: next steps"), "the next steps stay on screen after Finish")
+
+
+def devices_label_saved_on_flash(s: Session) -> None:
+    """A label typed in the Devices tab is kept when flashing without Save."""
+    s.plug("/dev/ttyACM0", mac=TX_MAC)
+    s.click("Refresh")
+    s.select_row("/dev/ttyACM0")
+    s.fill("Transmitter (TX)", True)
+    s.fill("Label", "Kitchen TX")
+    s.click("Flash selected board")
+    s.wait_idle()
+    s.wait_idle()
+    s.expect(s.window.registry.get(TX_MAC).label == "Kitchen TX", "label saved")
+
+
+def devices_identify_then_flash_native(s: Session) -> None:
+    """Native board, chip unknown: the flash chained after Identify still runs
+    although the board is off the bus for its reset."""
+    s.plug("/dev/ttyACM0", mac=TX_MAC)
+    s.click("Refresh")
+    s.select_row("/dev/ttyACM0")
+    s.fill("Transmitter (TX)", True)
+    s.click("Flash selected board")
+    s.wait_for(lambda: s.firmware(TX_MAC) is not None, timeout=15,
+               what="the chained flash")
+
+
+def devices_swapped_bridge_board(s: Session) -> None:
+    """A board swapped on the same adapter port: the wrong-chip failure drops
+    the stale identify, and the next Flash identifies and succeeds."""
+    s.plug("/dev/ttyUSB0", chip="ESP32-C3", mac=TX_MAC, via="cp2102")
+    s.click("Refresh")
+    s.select_row("/dev/ttyUSB0")
+    s.click("Identify")
+    s.wait_idle()
+    s.plug("/dev/ttyUSB0", chip="ESP32-S3", mac=TX2_MAC, via="cp2102")   # swapped
+    s.fill("Transmitter (TX)", True)
+    s.click("Flash selected board")
+    s.wait_idle()
+    s.expect(_dialog(s, "Flash failed"), "the stale target fails")
+    s.wait_refresh()
+    s.click("Flash selected board")
+    s.wait_idle()
+    s.wait_idle()
+    s.expect(s.firmware(TX2_MAC) and s.firmware(TX2_MAC)["target"] == "esp32s3",
+             "re-identified and flashed")
+
+
 SCENARIOS = {f.__name__: f for f in (
     alert_happy_path,
     alert_telegram_failure,
@@ -405,4 +718,19 @@ SCENARIOS = {f.__name__: f for f in (
     esptool_dash_only,
     devices_tab_tour,
     devices_tab_target_follows_chip,
+    two_bridge_boards,
+    monitor_no_csi,
+    monitor_detects_motion,
+    monitor_receiver_port_moved,
+    monitor_reopen_keeps_baseline,
+    monitor_test_alert,
+    environment_reasons,
+    enter_in_label_flashes,
+    rerun_with_bridge_receiver,
+    no_boards_plugged_in,
+    unsupported_chip_status,
+    broken_links_json,
+    devices_label_saved_on_flash,
+    devices_identify_then_flash_native,
+    devices_swapped_bridge_board,
 )}

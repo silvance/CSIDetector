@@ -141,3 +141,16 @@ def test_registry_ignores_unknown_keys_and_bad_macs_on_load(tmp_path):
     }}))
     reg = dv.Registry(path)
     assert [r.mac for r in reg.all()] == ["a0:f2:62:f0:39:d8"]
+
+
+def test_stable_port_prefers_the_by_id_link(tmp_path):
+    dev = tmp_path / "ttyACM1"
+    dev.write_text("")
+    by_id = tmp_path / "by-id"
+    by_id.mkdir()
+    link = by_id / "usb-Espressif_USB_JTAG_serial_debug_unit_30:30:F9:00:00:01-if00"
+    link.symlink_to(dev)
+    assert dv.stable_port(str(dev), by_id_dir=str(by_id)) == str(link)
+    assert dv.stable_port(str(tmp_path / "ttyUSB7"), by_id_dir=str(by_id)) == \
+        str(tmp_path / "ttyUSB7")
+    assert dv.stable_port(str(dev), by_id_dir=str(tmp_path / "missing")) == str(dev)

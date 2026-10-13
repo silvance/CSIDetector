@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from csidetector.core import collector
 
@@ -45,3 +46,36 @@ def test_open_source_dispatch():
     # Just verify routing — don't actually open anything that needs hardware.
     src = collector.open_source("/tmp/nonexistent.log")
     assert src is not None  # iter_file is lazy; doesn't fail until first next()
+
+
+def test_iter_serial_stops_without_data(monkeypatch):
+    """With no CSI arriving, readline() only ever times out; a consumer that
+    checks a flag per sample could never stop it. ``stop`` must."""
+    import threading
+
+    serial = pytest.importorskip("serial")
+
+    class Silent:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def readline(self):
+            return b""                      # what pyserial returns on timeout
+
+    monkeypatch.setattr(serial, "Serial", Silent)
+    stop = threading.Event()
+    idles = []
+
+    def on_idle():
+        idles.append(1)
+        if len(idles) == 3:
+            stop.set()
+
+    assert list(collector.iter_serial("/dev/ttyACM9", stop=stop, on_idle=on_idle)) == []
+    assert len(idles) == 3

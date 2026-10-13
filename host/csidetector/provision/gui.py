@@ -43,6 +43,7 @@ from csidetector.provision import devices as dv
 from csidetector.provision import firmware as fw
 
 _OUTPUT_CAP = 256 * 1024          # chars of process output kept for hints
+_WRONG_CHIP_RE = re.compile(r"This chip is ESP32[-\w]*,? not ESP32", re.I)
 # Each command runs in its own session so Cancel can signal the whole
 # process group at once (Linux util-linux; elsewhere only the /proc walk).
 _SETSID = shutil.which("setsid") if sys.platform.startswith("linux") else None
@@ -381,6 +382,11 @@ class DevicesTab(QWidget):
         self._identified: dict[tuple[str, str], tuple[str, str]] = {}
         # (port, usb_serial) to flash once its identify finishes.
         self._flash_after_identify: Optional[tuple[str, str]] = None
+        self._listed: Optional[list[dv.AttachedBoard]] = None   # last port scan
+        self._details_for: Optional[tuple] = None    # row the details form shows
+        # (port, label) typed in the details box when a flash started: saved
+        # with the result so it isn't lost for want of clicking Save.
+        self._pending_label: Optional[tuple[str, str]] = None
 
         self.flasher = Flasher(registry, self)
         self.flasher.line.connect(self._append_log)
@@ -421,7 +427,8 @@ class DevicesTab(QWidget):
 
         self.refresh_btn = QPushButton("Refresh")
         self.identify_btn = QPushButton("Identify (esptool)")
-        self.refresh_btn.clicked.connect(self.refresh)
+        # Lambda: clicked(bool) would pass `checked` in as relist=False.
+        self.refresh_btn.clicked.connect(lambda: self.refresh())
         # Lambda, not the bound method: clicked(bool) would otherwise pass
         # `checked` in as identify_selected's esptool_cmd.
         self.identify_btn.clicked.connect(lambda: self.identify_selected())
@@ -541,6 +548,7 @@ class DevicesTab(QWidget):
         self.progress = QProgressBar()
         self.progress.setAccessibleName("Progress")
         self.progress.setRange(0, 100)
+        self.progress.setVisible(False)    # until something runs
         self.log = QPlainTextEdit()
         self.log.setAccessibleName("Log")
         self.log.setReadOnly(True)
@@ -632,14 +640,19 @@ class DevicesTab(QWidget):
         if not self.flasher.busy and self.isVisible():
             self.refresh()
 
-    def refresh(self) -> None:
+    def refresh(self, relist: bool = True) -> None:
+        """Rebuild the table. ``relist=False`` reuses the last port scan —
+        right after an identify, when a native-USB board may be off the bus
+        for its reset."""
         if self.flasher.busy:
             return      # boards reset/re-enumerate mid-flash; don't flicker
-        try:
-            boards = self._list_boards()
-        except Exception as exc:  # noqa: BLE001 — pyserial missing, sysfs errors
-            boards = []
-            self._append_log(f"[setup] could not list serial ports: {exc}")
+        if relist or self._listed is None:
+            try:
+                self._listed = self._list_boards()
+            except Exception as exc:  # noqa: BLE001 — pyserial missing, sysfs errors
+                self._listed = []
+                self._append_log(f"[setup] could not list serial ports: {exc}")
+        boards = self._listed
         present = {(b.port, b.usb_serial) for b in boards}
         self._identified = {k: v for k, v in self._identified.items() if k in present}
         for b in boards:
@@ -718,8 +731,14 @@ class DevicesTab(QWidget):
     def _on_selection(self) -> None:
         row = self._selected_row()
         rec = row.record if row else None
-        self.label_edit.setText(rec.label if rec else "")
-        self.role_combo.setCurrentIndex({"tx": 1, "rx": 2}.get(rec.role if rec else "", 0))
+        ident = row.identity() if row else None
+        if ident != self._details_for:
+            # Only when the selection moves to another board: a refresh that
+            # reselects the same row mustn't wipe a label being typed.
+            self._details_for = ident
+            self.label_edit.setText(rec.label if rec else "")
+            self.role_combo.setCurrentIndex(
+                {"tx": 1, "rx": 2}.get(rec.role if rec else "", 0))
         target = dv.chip_to_target(row.chip) if row else ""
         known = target in fw.TARGETS
         if known:
@@ -980,6 +999,10 @@ class DevicesTab(QWidget):
     def start_flash(self, job: fw.FlashJob) -> None:
         row = self._selected_row()
         board = row.board if row and row.board and row.board.port == job.port else None
+        label = self.label_edit.text().strip()
+        current = row.record.label if row and row.record else ""
+        self._pending_label = (job.port, label) if board and label and label != current \
+            else None
         self._save_settings()
         self.log.clear()
         try:
@@ -1006,8 +1029,16 @@ class DevicesTab(QWidget):
 
     def _on_started(self, phase: str) -> None:
         self.progress.setValue(0)
+        self.progress.setVisible(True)
         self.phase_label.setText(phase)
         self._update_buttons()
+
+    def _idle(self, text: str) -> None:
+        """Nothing to show progress for (failed, cancelled): an empty bar
+        reads as a text box, a full one as success."""
+        self.phase_label.setText(text)
+        self.progress.setValue(0)
+        self.progress.setVisible(False)
 
     def _on_progress(self, phase: str, pct: int) -> None:
         self.phase_label.setText("Building…" if phase == "build" else "Flashing…")
@@ -1033,12 +1064,15 @@ class DevicesTab(QWidget):
             self.phase_label.setText(f"Identified {res.chip or 'board'} {res.mac}")
             self.progress.setValue(100)
         else:
-            self.phase_label.setText("Cancelled" if res.cancelled else "Identify failed")
+            self._idle("Cancelled" if res.cancelled else "Identify failed")
             if not res.cancelled:
                 self._show_failure("Identify failed", res.output)
         self._after_process()
         if res.ok:
-            self._force_refresh()           # the row picks up the identified chip now
+            # Show the identified chip now, from the last scan: a fresh one
+            # could miss a native-USB board that's resetting after esptool.
+            self._table_sig = None
+            self.refresh(relist=False)
         if pending == (res.port, res.usb_serial) and res.ok and res.chip:
             row = self._selected_row()
             if row is not None and row.board is not None and \
@@ -1055,6 +1089,9 @@ class DevicesTab(QWidget):
                 self._append_log(f"[setup] note: {note}")
             if res.mac:
                 self._append_log(f"[setup] recorded {res.mac} as {job.role.upper()}")
+                pending = self._pending_label
+                if pending and pending[0] == job.port:
+                    self.registry.upsert(res.mac, label=pending[1])
                 if job.role == dv.ROLE_TX:
                     self._add_tx_to_filter(res.mac)
             else:
@@ -1062,11 +1099,19 @@ class DevicesTab(QWidget):
                                  "reported — click Identify to register it.")
             self.flashed.emit(res.mac, job.role)
         elif res.cancelled:
-            self.phase_label.setText("Cancelled")
+            self._idle("Cancelled")
             self._append_log("[setup] cancelled")
         else:
-            self.phase_label.setText("Flash failed")
+            self._idle("Flash failed")
+            if _WRONG_CHIP_RE.search(res.output):
+                # The cached identify is stale (a board swapped on this
+                # port): forget it, so the next Flash identifies again.
+                self._identified = {k: v for k, v in self._identified.items()
+                                    if k[0] != job.port}
+                self._append_log(f"[setup] the board on {job.port} isn't the chip "
+                                 f"identified earlier; it will be identified again.")
             self._show_failure("Flash failed", res.output)
+        self._pending_label = None
         self._after_process()
 
     def _show_failure(self, title: str, output: str) -> None:
@@ -1107,10 +1152,15 @@ class SetupWindow(QMainWindow):
         self.wizard_btn.setToolTip("Step-by-step: flash a transmitter and receiver, "
                                    "configure alerts or the room layout.")
         self.wizard_btn.clicked.connect(lambda: self.open_wizard())
+        self.monitor_btn = QPushButton("Open alert monitor")
+        self.monitor_btn.setToolTip("The live alert-mode window: calibrate, arm, "
+                                    "watch the motion score.")
+        self.monitor_btn.clicked.connect(self.show_monitor)
         header = QHBoxLayout()
         header.addWidget(QLabel("New sensor? The wizard walks through flashing and "
                                 "configuration end to end."))
         header.addStretch(1)
+        header.addWidget(self.monitor_btn)
         header.addWidget(self.wizard_btn)
         central = QWidget()
         lay = QVBoxLayout(central)
@@ -1171,11 +1221,28 @@ class SetupWindow(QMainWindow):
         self._retired_monitors.append(self._monitor)
         self._monitor = None
 
+    def show_monitor(self) -> None:
+        """Bring the alert monitor up: the open one (which may be armed),
+        else a new one with the saved settings."""
+        if self._monitor is not None and self._monitor.isVisible():
+            self._monitor.raise_()
+            self._monitor.activateWindow()
+            return
+        self.open_monitor("")
+
     def open_monitor(self, alert_config_path: str) -> None:
         from csidetector.modes.alert.gui import CSIDetectorWindow
         self.retire_monitor()
         self._monitor = CSIDetectorWindow(alert_config_path=alert_config_path)
         self._monitor.show()
+
+    def shutdown_processes(self) -> None:
+        """Stop any flash/identify. Children run in their own session (so
+        Cancel can signal the group), which also means a terminal hangup or
+        Ctrl+C no longer reaches them: they must be stopped from here."""
+        self.devices.shutdown()
+        if self.wizard is not None:
+            self.wizard.flasher.shutdown()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.devices.busy:
@@ -1213,10 +1280,28 @@ def _install_excepthook() -> None:
     sys.excepthook = hook
 
 
+def _quit_on_signals(app: QApplication) -> None:
+    """SIGINT/SIGTERM/SIGHUP end the app now; aboutToQuit then stops the
+    child process groups. exit(), not quit(): Qt 6's quit() first asks the
+    windows, and a "flash in progress, quit?" box nobody can answer (the
+    terminal is gone) would keep everything running. Python only runs
+    signal handlers when it gets control, so a no-op timer gives it the
+    chance while Qt's loop runs."""
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signum = getattr(signal, name)
+            signal.signal(signum, lambda n, _f: app.exit(128 + n))
+    timer = QTimer(app)
+    timer.timeout.connect(lambda: None)
+    timer.start(250)
+
+
 def run_setup_gui(idf_export: Optional[str] = None, wizard: bool = False) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     _install_excepthook()
     win = SetupWindow(idf_export=idf_export)
+    app.aboutToQuit.connect(win.shutdown_processes)
+    _quit_on_signals(app)
     win.show()
     if wizard:
         QTimer.singleShot(0, win.open_wizard)

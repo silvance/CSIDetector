@@ -25,7 +25,8 @@ from tests.gui_scenarios import SCENARIOS  # noqa: E402
 
 @pytest.mark.parametrize("name", list(SCENARIOS))
 def test_scenario(name):
-    with Session(None, screenshots=False, line_delay=0.001, name=name, fast_timers=True) as s:
+    with Session(None, screenshots=False, line_delay=0.001, name=name,
+                 fast_timers=True, calibrate_s=(0.3, 2.0)) as s:
         try:
             SCENARIOS[name](s)
         except DriverError as exc:
