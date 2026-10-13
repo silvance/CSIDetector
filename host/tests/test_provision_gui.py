@@ -1,8 +1,9 @@
 """Setup GUI (Devices & Flashing) under offscreen Qt.
 
 Hermetic: fake board enumeration, fake hotspot detection, a temp device
-registry, and a temp settings file. Real QProcesses are used only for the
-output-streaming and cancel tests (plain bash, no ESP-IDF).
+registry, a temp settings file and a stand-in firmware/prebuilt. Real
+QProcesses are used only for the output-streaming and cancel tests (plain
+bash; esptool itself is never run).
 """
 
 from __future__ import annotations
@@ -49,7 +50,7 @@ def _boards():
 
 
 @pytest.fixture
-def tab(qt_app, tmp_path, idf_export):
+def tab(qt_app, tmp_path, prebuilt):
     reg = dv.Registry(tmp_path / "devices.json")
     reg.upsert(FAR_TX, label="Corner TX", role=dv.ROLE_TX, chip="ESP32-S3",
                config={"channel": 11})
@@ -57,8 +58,7 @@ def tab(qt_app, tmp_path, idf_export):
                                ssid="CSIDetector", channel=11, ip="10.42.1.1")]
     t = gui.DevicesTab(reg, list_boards=_boards,
                        detect_hotspots=lambda: hotspots,
-                       settings_path=tmp_path / "setup.json",
-                       idf_export=str(idf_export), auto_refresh=False)
+                       settings_path=tmp_path / "setup.json", auto_refresh=False)
     yield t
     t.shutdown()
     t.deleteLater()
@@ -73,14 +73,14 @@ def _select(tab, port_or_mac):
 
 
 def _finish_flash(tab, job, code, output, mac="", chip=""):
-    """Drive the Flasher's completion path as if idf.py had exited."""
-    tab.flasher._pending = {"kind": "flash", "job": job, "mac": mac, "chip": chip}
+    """Drive the Flasher's completion path as if esptool had exited."""
+    tab.flasher._pending = {"kind": "flash", "job": job, "settings": None,
+                            "mac": mac, "chip": chip}
     tab.flasher._on_finished(code, output)
 
 
 def _finish_identify(tab, port, usb_serial, code, output):
-    tab.flasher._pending = {"kind": "identify", "port": port, "usb_serial": usb_serial,
-                            "cmd": "read_mac", "export": Path(tab.export_edit.text())}
+    tab.flasher._pending = {"kind": "identify", "port": port, "usb_serial": usb_serial}
     tab.flasher._on_finished(code, output)
 
 
@@ -154,10 +154,17 @@ def test_chip_target_mismatch_is_an_error(tab):
     assert any("ESP32-C3" in e for e in plan.errors)
 
 
-def test_missing_idf_export_is_an_error(tab, tmp_path):
+def test_missing_firmware_is_an_error(tab, tmp_path, monkeypatch):
     _select(tab, "/dev/ttyACM0")
-    tab.export_edit.setText(str(tmp_path / "nope.sh"))
-    assert any(fw.EXPORT_NAME in e for e in tab.plan_flash().errors)
+    monkeypatch.setenv("CSIDETECTOR_FIRMWARE_DIR", str(tmp_path / "nothing-here"))
+    assert any("prebuilt firmware is missing" in e for e in tab.plan_flash().errors)
+
+
+def test_the_label_goes_onto_the_board(tab):
+    _select(tab, "/dev/ttyACM0")
+    tab.label_edit.setText("Kitchen RX")
+    plan = tab.plan_flash()
+    assert plan.job.config.settings()["label"] == "Kitchen RX"
 
 
 def test_save_details_writes_registry(tab):
@@ -213,25 +220,13 @@ def test_identify_result_updates_row_and_registry(tab):
 
 
 def test_identify_button_click_runs_read_mac(tab, monkeypatch):
-    """Regression: clicked(bool) used to arrive as esptool_cmd=False."""
     started = []
     monkeypatch.setattr(tab.flasher._runner, "start",
                         lambda argv, env: started.append(argv))
     _select(tab, "/dev/ttyUSB0")
     tab.identify_btn.click()
-    assert started, "identify did not start"
-    # POSIX: one bash -c script; Windows: python -m esptool … directly.
-    assert " ".join(started[0]).endswith("--port /dev/ttyUSB0 read_mac")
-    assert tab.flasher._pending["cmd"] == "read_mac"
-
-
-def test_identify_retries_with_dashed_command_on_invalid_choice(tab, monkeypatch):
-    started = []
-    monkeypatch.setattr(tab.flasher._runner, "start",
-                        lambda argv, env: started.append(argv))
-    _finish_identify(tab, "/dev/ttyUSB0", "0001", 2,
-                     "esptool: error: argument operation: invalid choice: 'read_mac'")
-    assert started and " ".join(started[0]).endswith("--port /dev/ttyUSB0 read-mac")
+    assert started == [[sys.executable, "-m", "esptool", "--port", "/dev/ttyUSB0",
+                        "read-mac"]]
 
 
 def test_selection_clears_when_selected_board_disappears(qt_app, tmp_path):
@@ -322,10 +317,10 @@ def test_rx_alert_on_bridge_board_warns_about_native_usb(tab):
 
 
 @POSIX_ONLY      # Windows has no NetworkManager to ask, so no warning there
-def test_localize_plan_warns_when_no_hotspot_running(qt_app, tmp_path, idf_export):
+def test_localize_plan_warns_when_no_hotspot_running(qt_app, tmp_path, prebuilt):
     t = gui.DevicesTab(dv.Registry(tmp_path / "d.json"), list_boards=_boards,
                        detect_hotspots=lambda: [], settings_path=tmp_path / "s.json",
-                       idf_export=str(idf_export), auto_refresh=False)
+                       auto_refresh=False)
     try:
         t.select_port("/dev/ttyACM0")
         t.mode_rx_loc.setChecked(True)
@@ -390,15 +385,15 @@ def test_process_runner_streams_lines_and_progress(qt_app):
     lines, progress = [], []
     runner.line.connect(lines.append)
     runner.progress.connect(lambda ph, p: progress.append((ph, p)))
-    script = (r"echo hello; echo '[5/10] Building x'; "
+    script = (r"echo hello; "
               r"printf 'Writing at 0x0001 [==] 40.0%%\rWriting at 0x0001 [===] 90.0%%\n'; "
               r"echo bye; exit 3")
     res = _run_until_finished(runner, lambda: runner.start(["bash", "-c", script],
                                                            dict(os.environ)))
     assert res["code"] == 3
-    assert "hello" in lines and "bye" in lines and "[5/10] Building x" in lines
+    assert "hello" in lines and "bye" in lines
     assert not any(l.startswith("Writing at") for l in lines)
-    assert ("build", 50) in progress and ("flash", 40) in progress and ("flash", 90) in progress
+    assert ("flash", 40) in progress and ("flash", 90) in progress
     assert not runner.running
 
 
@@ -486,7 +481,7 @@ def test_cancel_catches_children_forked_during_cancel(qt_app):
 def test_wizard_retires_the_open_monitor_before_rewriting_its_state(qt_app, tmp_path):
     """An open monitor writes the settings it loaded at startup back on its
     next Calibrate, undoing the wizard's new receiver port."""
-    win = gui.SetupWindow(dv.Registry(tmp_path / "devices.json"), idf_export="",
+    win = gui.SetupWindow(dv.Registry(tmp_path / "devices.json"),
                           list_boards=_boards, detect_hotspots=lambda: [],
                           settings_path=tmp_path / "setup.json", auto_refresh=False)
     wiz = win.open_wizard()
@@ -525,75 +520,59 @@ def test_excepthook_reports_instead_of_aborting(qt_app, monkeypatch, capsys):
     assert "Traceback" in capsys.readouterr().err
 
 
-def test_windows_flash_captures_the_idf_environment_once(qt_app, tmp_path, monkeypatch):
-    """Windows: export.bat runs once through cmd.exe (native command line),
-    its environment is captured and cached, then idf.py runs directly in
-    it. The dumped environment never reaches the log."""
-    monkeypatch.setattr(fw, "IS_WINDOWS", True)
-    monkeypatch.setattr(fw, "_IDF_ENV_CACHE", {})
-    export = tmp_path / "esp idf" / "export.bat"
-    export.parent.mkdir()
-    export.write_text("")
-    (tmp_path / "idf" / "tools").mkdir(parents=True)
+def test_flash_writes_the_image_and_the_settings_block_then_deletes_it(
+        qt_app, tmp_path, prebuilt, monkeypatch):
+    """One esptool run writes bootloader, partition table, app and the
+    board's settings; the settings file (it holds the hotspot password) is
+    owner-only while it exists and gone afterwards, whatever the outcome."""
+    from csidetector.provision import board_settings
     flasher = gui.Flasher(dv.Registry(tmp_path / "devices.json"))
     started, lines = [], []
     flasher.line.connect(lines.append)
     monkeypatch.setattr(flasher._runner, "start",
-                        lambda argv, env, native_args=None: started.append((argv, env, native_args)))
-    job = fw.FlashJob(port="COM5", config=fw.TxConfig(), build_root=tmp_path / "build")
-    flasher.flash(job, export)
-    argv, _env, native = started[0]
-    assert argv == ["cmd.exe"] and f'call "{export}"' in native
-    env_json = json.dumps({"env": {"IDF_PATH": str(tmp_path / "idf"),
-                                   "Path": os.path.dirname(sys.executable),
-                                   "SECRET_TOKEN": "hunter22"},
-                           "python": sys.executable})
-    dump = f"Activating ESP-IDF 5.2\n{fw.ENV_MARKER}{env_json}\n"
-    for text in dump.splitlines():
-        flasher._on_line(text)
-    flasher._on_finished(0, dump)
-    argv, env, native = started[1]
-    assert native is None and argv[1] == str(tmp_path / "idf" / "tools" / "idf.py")
-    assert argv[-3:] == ["-p", "COM5", "flash"] and env["SECRET_TOKEN"] == "hunter22"
-    assert "Activating ESP-IDF 5.2" in lines
-    assert not any("hunter22" in l for l in lines)          # env dump not logged
-    # Second use: cached, no cmd.exe stage.
-    flasher._pending = None
-    started.clear()
-    flasher.identify("COM5", "", export)
-    assert started[0][0][1:] == ["-m", "esptool", "--port", "COM5", "read_mac"]
+                        lambda argv, env: started.append((argv, env)))
+    config = fw.RxConfig(channel=6, tx_macs=[TX_MAC], ssid="Lab", password="hunter22",
+                         host_ip="192.168.137.1", label="Kitchen RX")
+    for code in (0, 2):
+        started.clear()
+        flasher.flash(fw.FlashJob(port="COM5", config=config, target="esp32c6"))
+        argv, env = started[0]
+        assert argv[:7] == [sys.executable, "-m", "esptool", "--chip", "esp32c6",
+                            "--port", "COM5"]
+        assert env["PYTHONUNBUFFERED"] == "1"
+        pairs = argv[argv.index("2MB") + 1:]
+        offsets = pairs[0::2]
+        assert offsets == ["0x0", "0x8000", "0x9000", "0xf000", "0x10000"]
+        assert pairs[1].endswith("bootloader.bin") and pairs[9].endswith("csi_receiver.bin")
+        settings = Path(pairs[7])
+        values = board_settings.decode(settings.read_bytes())
+        assert values == {"role": "rx", "label": "Kitchen RX", "channel": "6",
+                          "tx_macs": TX_MAC, "ssid": "Lab", "password": "hunter22",
+                          "host_ip": "192.168.137.1", "host_port": "5566"}
+        if os.name != "nt":
+            assert settings.stat().st_mode & 0o077 == 0
+        flasher._on_finished(code, "")
+        assert not settings.exists()
+    assert not any("hunter22" in line for line in lines)
 
 
-def test_windows_failed_export_reports_a_flash_failure(qt_app, tmp_path, monkeypatch):
-    monkeypatch.setattr(fw, "IS_WINDOWS", True)
-    monkeypatch.setattr(fw, "_IDF_ENV_CACHE", {})
-    export = tmp_path / "export.bat"
-    export.write_text("")
+def test_the_settings_file_is_removed_if_the_flash_cant_start(qt_app, tmp_path, prebuilt,
+                                                             monkeypatch):
     flasher = gui.Flasher(dv.Registry(tmp_path / "devices.json"))
-    monkeypatch.setattr(flasher._runner, "start", lambda *a, **k: None)
-    results = []
-    flasher.flash_finished.connect(results.append)
-    flasher.flash(fw.FlashJob(port="COM5", config=fw.TxConfig(),
-                              build_root=tmp_path / "build"), export)
-    flasher._on_finished(97, "ERROR: tool xtensa-esp32s3-elf has no installed versions\n"
-                             "ESP-IDF export.bat failed to load\n")
-    assert results and not results[0].ok
-    assert any("environment didn't load" in h for h in fw.failure_hints(results[0].output))
+    monkeypatch.setattr(fw, "blank_file", lambda size: (_ for _ in ()).throw(OSError("full")))
+    with pytest.raises(OSError):
+        flasher.flash(fw.FlashJob(port="COM5", config=fw.RxConfig(ssid="Lab",
+                                                                 password="hunter22")))
+    assert not list((tmp_path / "cache").rglob("settings-*.bin")) and not flasher.busy
 
 
-def test_windows_refuses_export_sh(qt_app, tmp_path, monkeypatch):
-    """ESP-IDF ships export.sh next to export.bat; on Windows cmd would just
-    open it in another program, so it's refused with a clear message."""
-    monkeypatch.setattr(fw, "IS_WINDOWS", True)
-    monkeypatch.setattr(fw, "_IDF_ENV_CACHE", {})
-    export = tmp_path / "export.sh"
-    export.write_text("")
+def test_damaged_firmware_is_refused_before_anything_runs(qt_app, tmp_path, prebuilt,
+                                                         monkeypatch):
     flasher = gui.Flasher(dv.Registry(tmp_path / "devices.json"))
-    started, results, lines = [], [], []
-    monkeypatch.setattr(flasher._runner, "start", lambda *a, **k: started.append(a))
-    flasher.flash_finished.connect(results.append)
-    flasher.line.connect(lines.append)
-    flasher.flash(fw.FlashJob(port="COM5", config=fw.TxConfig(),
-                              build_root=tmp_path / "build"), export)
-    assert not started and results and not results[0].ok
-    assert any("export.bat" in l for l in lines)
+    started = []
+    monkeypatch.setattr(flasher._runner, "start", lambda *a: started.append(a))
+    (prebuilt / "csi_transmitter-esp32s3" / "csi_transmitter.bin").write_bytes(b"truncated")
+    with pytest.raises(fw.FirmwareError, match="damaged"):
+        flasher.flash(fw.FlashJob(port="COM5", config=fw.TxConfig()))
+    assert not started and not flasher.busy
+    assert not list((tmp_path / "cache").rglob("*.bin"))

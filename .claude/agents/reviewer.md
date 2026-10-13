@@ -18,13 +18,17 @@ reach hardware or a demo.
     Telegram notifier, durable SQLite outbound queue, Qt status GUI.
   - `modes/localize/` — multi-RX/TX matplotlib heatmap, 2.5D viewer,
     UDP state publisher.
-  - `provision/` — device discovery, firmware config generation, and
-    flashing via ESP-IDF (`idf.py` / esptool), plus the setup GUI.
+  - `provision/` — device discovery, per-board settings blocks
+    (`board_settings.py`), and flashing the prebuilt firmware
+    (`firmware/prebuilt/`) with esptool, plus the setup GUI.
   - `cli.py` — argparse tree. Old flat command names (`heatmap`,
     `detect`, `calibrate`, …) are back-compat aliases and must keep
     working.
 - `firmware/` — ESP-IDF projects (`csi_transmitter`, `csi_receiver`,
-  `c5_display`). Kconfig options live in `main/Kconfig.projbuild`.
+  `c5_display`). Kconfig options (`main/Kconfig.projbuild`) are only
+  defaults: per-board settings come from the csi_cfg partition
+  (`components/csi_settings`). `scripts/build_firmware.py` (run by the
+  `firmware` workflow) builds `firmware/prebuilt/`.
 - `scripts/`, `start.sh`, `idf-env.sh` — operator shell tooling.
 - Tests: `cd host && python -m pytest tests/ -q`. They must run without
   hardware, network, or a display. Qt tests gate on
@@ -33,14 +37,12 @@ reach hardware or a demo.
 
 ## What to look for (in priority order)
 
-1. **Correctness on real hardware paths** — wrong Kconfig symbol names,
-   MAC formats the firmware rejects, wrong target/project mapping,
+1. **Correctness on real hardware paths** — settings keys or formats
+   the firmware's parser rejects, MAC formats the firmware rejects, wrong target/project mapping,
    commands that work on the author's machine only.
 2. **Shell / subprocess safety** — user-supplied strings (SSIDs,
    passwords, labels, paths, serial ports) reaching a shell without
-   `shlex.quote`, or reaching a generated sdkconfig without escaping.
-   Python venv leaking into ESP-IDF's environment (the classic
-   `No module named 'click'` failure).
+   `shlex.quote`.
 3. **Concurrency** — Qt widgets touched from non-GUI threads, shared
    state mutated from both a worker and the GUI thread, QProcess
    lifetimes, threads that are never joined, a serial port opened by two

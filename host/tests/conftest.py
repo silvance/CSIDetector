@@ -33,19 +33,16 @@ def home(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def idf_export(tmp_path, monkeypatch):
-    """A stand-in ESP-IDF export script with the name the flasher expects
-    on this platform. On Windows its environment counts as already
-    captured, so a flash or identify goes straight to launching idf.py /
-    esptool (which the tests stub), as it does on POSIX."""
-    from csidetector.provision import firmware as fw
-    export = tmp_path / fw.EXPORT_NAME
-    export.write_text("")
-    monkeypatch.setattr(fw, "_IDF_ENV_CACHE", {})
-    if fw.IS_WINDOWS:
-        fw.remember_idf_env(export, fw.IdfEnv({}, sys.executable,
-                                              tmp_path / "idf" / "tools" / "idf.py"))
-    return export
+def prebuilt(tmp_path, monkeypatch):
+    """A stand-in for firmware/prebuilt (a manifest and small dummy images
+    for every supported chip), which the setup app then flashes from;
+    the settings files it writes for esptool go under tmp_path too."""
+    from tests import fake_firmware
+    root = fake_firmware.make_prebuilt(tmp_path / "prebuilt")
+    monkeypatch.setenv("CSIDETECTOR_FIRMWARE_DIR", str(root))
+    for key in ("XDG_CACHE_HOME", "LOCALAPPDATA"):
+        monkeypatch.setenv(key, str(tmp_path / "cache"))
+    return root
 
 
 @pytest.fixture

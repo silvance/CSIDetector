@@ -1,0 +1,338 @@
+{
+  "format": "csidetector-firmware/1",
+  "idf_version": "v5.5.1",
+  "source_sha256": "30a205b5c99709f67e86bd576b0090e724b70a80b9b2b1f0e6c3a0ca6eadd9f1",
+  "commit": "bd6471c2732077b34910cc23befdad29a1b771c1",
+  "images": {
+    "csi_transmitter-esp32s3": {
+      "project": "csi_transmitter",
+      "target": "esp32s3",
+      "chip": "esp32s3",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x0",
+          "path": "csi_transmitter-esp32s3/bootloader.bin",
+          "sha256": "25a7efee89b598b5d436a1d1a09ac0a90c6980085a24b3a261058fd3529c5756"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_transmitter-esp32s3/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_transmitter-esp32s3/csi_transmitter.bin",
+          "sha256": "a4664b788b61f6a173fddd82ec6add7f552a7accbd6a30108fd98fbaca3569d9"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    },
+    "csi_receiver-esp32s3": {
+      "project": "csi_receiver",
+      "target": "esp32s3",
+      "chip": "esp32s3",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x0",
+          "path": "csi_receiver-esp32s3/bootloader.bin",
+          "sha256": "dfb78c4b62fc1d1b07309a9fa4cdca2e7b97e0594e74f5d2bc4272e173213bad"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_receiver-esp32s3/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_receiver-esp32s3/csi_receiver.bin",
+          "sha256": "0876af9f25fa7c5b686c617b2502815047a10f667efee0bb7f7c66cd97d319e4"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    },
+    "csi_transmitter-esp32c3": {
+      "project": "csi_transmitter",
+      "target": "esp32c3",
+      "chip": "esp32c3",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x0",
+          "path": "csi_transmitter-esp32c3/bootloader.bin",
+          "sha256": "8ec8824d2263aa6568caa9de66a116e2c87f250c9fb96229ee813bdab7021490"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_transmitter-esp32c3/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_transmitter-esp32c3/csi_transmitter.bin",
+          "sha256": "226743f01d86d2f19d665f9c1827b1d83ff4d30951f5493efc711bc82257199d"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    },
+    "csi_receiver-esp32c3": {
+      "project": "csi_receiver",
+      "target": "esp32c3",
+      "chip": "esp32c3",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x0",
+          "path": "csi_receiver-esp32c3/bootloader.bin",
+          "sha256": "c82c86c1fc515b6c7d348515c3757595b783364a4a8a963332e7b7e9a7b25616"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_receiver-esp32c3/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_receiver-esp32c3/csi_receiver.bin",
+          "sha256": "6fbbb4942799db2db98f1a97ce24b4b234bd33622b985752a7f7356c5d7fbfa9"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    },
+    "csi_transmitter-esp32c5": {
+      "project": "csi_transmitter",
+      "target": "esp32c5",
+      "chip": "esp32c5",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x2000",
+          "path": "csi_transmitter-esp32c5/bootloader.bin",
+          "sha256": "7e683dfccd6078801fce210fb577e0dcdbcb30418b34dcd2e3e42b3dbd84760c"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_transmitter-esp32c5/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_transmitter-esp32c5/csi_transmitter.bin",
+          "sha256": "f10cdefa5c4698cf87a04392127009d07374d36b1d0b8b882224dd348ecd1a0a"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    },
+    "csi_receiver-esp32c5": {
+      "project": "csi_receiver",
+      "target": "esp32c5",
+      "chip": "esp32c5",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x2000",
+          "path": "csi_receiver-esp32c5/bootloader.bin",
+          "sha256": "29a1d35e53840e6066e1d821a7918d578dfcc9379dfa6dcc254f161eb46d1884"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_receiver-esp32c5/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_receiver-esp32c5/csi_receiver.bin",
+          "sha256": "64ea9c83b4f5a94f9b659a9d59874c0c00559c0399d62ba249bed9696fab71d7"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    },
+    "csi_transmitter-esp32c6": {
+      "project": "csi_transmitter",
+      "target": "esp32c6",
+      "chip": "esp32c6",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x0",
+          "path": "csi_transmitter-esp32c6/bootloader.bin",
+          "sha256": "31bcade358341b4f288c2d7831e0df19cd6b4a99110facf87f69844b26630244"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_transmitter-esp32c6/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_transmitter-esp32c6/csi_transmitter.bin",
+          "sha256": "45368ba384d899d11e4c00c1fd9c62de9fedcf9d8b17016f5a09bb409d839112"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    },
+    "csi_receiver-esp32c6": {
+      "project": "csi_receiver",
+      "target": "esp32c6",
+      "chip": "esp32c6",
+      "flash_mode": "dio",
+      "flash_freq": "80m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x0",
+          "path": "csi_receiver-esp32c6/bootloader.bin",
+          "sha256": "58a26f7731285e078bb4476947840b0b2f851506ecf493b24bac2c567951b71c"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_receiver-esp32c6/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_receiver-esp32c6/csi_receiver.bin",
+          "sha256": "6812629abee186ab12fd011d3a72e0c9ae1d48e266414c41573491bfd82319de"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    },
+    "csi_transmitter-esp32": {
+      "project": "csi_transmitter",
+      "target": "esp32",
+      "chip": "esp32",
+      "flash_mode": "dio",
+      "flash_freq": "40m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x1000",
+          "path": "csi_transmitter-esp32/bootloader.bin",
+          "sha256": "485308a624f39cd459437f1b80be1d9f3770c0bc6848df30e6b358c99d03b666"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_transmitter-esp32/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_transmitter-esp32/csi_transmitter.bin",
+          "sha256": "7187f6f62e75b892c855e187c0c0ccb1ef9c8776a402ecf21a78483b648cdcfd"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    },
+    "csi_receiver-esp32": {
+      "project": "csi_receiver",
+      "target": "esp32",
+      "chip": "esp32",
+      "flash_mode": "dio",
+      "flash_freq": "40m",
+      "flash_size": "2MB",
+      "files": [
+        {
+          "offset": "0x1000",
+          "path": "csi_receiver-esp32/bootloader.bin",
+          "sha256": "485308a624f39cd459437f1b80be1d9f3770c0bc6848df30e6b358c99d03b666"
+        },
+        {
+          "offset": "0x8000",
+          "path": "csi_receiver-esp32/partition-table.bin",
+          "sha256": "55d49e18eedc0c0524c0129700f77374e8e576c935080c5b7b124ead73ef7b5a"
+        },
+        {
+          "offset": "0x10000",
+          "path": "csi_receiver-esp32/csi_receiver.bin",
+          "sha256": "c1208852235fda6301203de740351797bcc5e3344b513fdba7c27e17b2c5a3e8"
+        }
+      ],
+      "settings": {
+        "offset": "0xf000",
+        "size": 4096
+      },
+      "nvs": {
+        "offset": "0x9000",
+        "size": 20480
+      }
+    }
+  }
+}

@@ -11,3 +11,12 @@ CONFIG_ESP_WIFI_ENABLE_WPA3_SAE=n
 # without a USB-UART bridge can stream over /dev/ttyACM0. UART baud above
 # is harmless on USB-CDC (the host ignores it).
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Partition table with the csi_cfg partition the setup app writes the
+# board's settings into (components/csi_settings). Prebuilt images are
+# built by scripts/build_firmware.py; reproducible so a rebuild of
+# unchanged sources gives the same binaries.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../partitions.csv"
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
+CONFIG_APP_REPRODUCIBLE_BUILD=y

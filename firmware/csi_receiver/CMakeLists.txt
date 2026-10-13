@@ -1,4 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
+# The csi_settings component (board settings written by the setup app).
+set(EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/../components")
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 # CSI rx callback in IDF v5.2.x silently never fires on some chip

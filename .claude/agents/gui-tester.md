@@ -36,15 +36,16 @@ Hardware facts that decide what "correct" means:
 ## The driver
 
 `host/tests/gui_driver.py` runs the real app against a simulated bench:
-fake `idf.py`/esptool executables read a model of plugged-in boards, so
-flashing goes through the app's real QProcess code (streaming, progress,
+a fake esptool (and a fake firmware/prebuilt) reads a model of plugged-in
+boards, so flashing goes through the app's real QProcess code (streaming, progress,
 failure hints, Cancel killing the process tree). Read its docstring and
 the `Session` methods before you start. Key calls:
 
 - Bench: `plug(port, chip=, mac=, via="native"|"cp2102"|"ch340"|"ftdi",
-  behavior="ok"|"no_connect"|"busy"|"hang"|"build_fail")`, `unplug`,
-  `set_behavior`, `hotspot(...)`, `esptool_dash_only()`,
-  `firmware(mac)` (the config a board was actually flashed with),
+  behavior="ok"|"no_connect"|"busy"|"hang"|"write_fail")`, `unplug`,
+  `set_behavior`, `hotspot(...)`,
+  `firmware(mac)` (the project, chip and settings block — label, channel,
+  tx_macs, ssid… — a board was actually flashed with),
   `leftover_processes()`, `telegram_ok = False`. Native boards drop off
   the bus briefly after esptool resets them (`reset_drop_s`).
 - CSI: `csi(port, rate=100, motion=False)` makes the receiver on `port`

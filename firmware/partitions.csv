@@ -1,0 +1,9 @@
+# Shared by csi_transmitter and csi_receiver. csi_cfg holds the per-board
+# settings the setup app writes at flash time (see
+# components/csi_settings/include/csi_settings.h); the app partition runs
+# to the end of 2 MB, the smallest flash on the supported modules.
+# Name,   Type, SubType, Offset,  Size
+nvs,      data, nvs,     0x9000,  0x5000
+phy_init, data, phy,     0xe000,  0x1000
+csi_cfg,  data, 0x40,    0xf000,  0x1000
+factory,  app,  factory, 0x10000, 0x1F0000

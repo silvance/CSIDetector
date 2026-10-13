@@ -35,7 +35,7 @@ def _start_wizard(s: Session, localize: bool = False, password: str = "hunter22"
     s.next()
     if localize:
         s.fill("Hotspot password", password)
-    s.expect(s.next(), "Environment → Transmitters")
+    s.expect(s.next(), "Wi-Fi settings → Transmitters")
 
 
 def _flash_here(s: Session, port: str, label: str = "", role: str = "transmitter") -> None:
@@ -65,14 +65,16 @@ def alert_happy_path(s: Session) -> None:
     _flash_here(s, "/dev/ttyACM0", "Desk TX")
     fwt = s.firmware(TX_MAC)
     s.expect(fwt and fwt["project"] == "csi_transmitter", "the TX got transmitter firmware")
-    s.expect(fwt and fwt["target"] == "esp32s3", "built for the S3")
+    s.expect(fwt and fwt["target"] == "esp32s3", "the S3 firmware")
+    s.expect(fwt and fwt["config"].get("label") == "Desk TX", "the label is on the board")
     s.expect(s.next(), "Transmitters → Receivers")
     s.expect("Desk TX" in s.dump(), "the receiver page names the transmitter")
     _flash_here(s, "/dev/ttyACM1", "South RX", "receiver")
     fwr = s.firmware(RX_MAC)
     s.expect(fwr and fwr["project"] == "csi_receiver", "the RX got receiver firmware")
-    s.expect(fwr and fwr["config"].get("CONFIG_CSI_RX_FILTER_TX_MAC") == TX_MAC,
+    s.expect(fwr and fwr["config"].get("tx_macs") == TX_MAC,
              "the receiver filters for the transmitter's MAC")
+    s.expect(fwr and fwr["config"].get("ssid") == "", "alert mode: no Wi-Fi, USB only")
     s.expect(s.next(), "Receivers → Telegram")
     s.expect("South RX" in s.dump(), "location defaults to the receiver's label")
     s.fill("Bot token", TOKEN)
@@ -114,7 +116,7 @@ def alert_telegram_failure(s: Session) -> None:
 
 
 def alert_bridge_receiver(s: Session) -> None:
-    """Classic ESP32 on a CP2102 as the receiver: identified, built for esp32, CSI over the bridge."""
+    """Classic ESP32 on a CP2102 as the receiver: identified, esp32 firmware, CSI over the bridge."""
     s.plug("/dev/ttyACM0", chip="ESP32-S3", mac=TX_MAC)
     _start_wizard(s)
     _flash_here(s, "/dev/ttyACM0", "Desk TX")
@@ -124,7 +126,7 @@ def alert_bridge_receiver(s: Session) -> None:
     s.click("Refresh")
     _flash_here(s, "/dev/ttyUSB0", "Bench RX", "receiver")
     fwr = s.firmware(RX_MAC)
-    s.expect(fwr and fwr["target"] == "esp32", "built for the classic ESP32")
+    s.expect(fwr and fwr["target"] == "esp32", "the classic ESP32 firmware")
     s.wait_refresh("post-flash board refresh")
     s.expect(s.nav_usable("next"), "the bridge receiver completes the page")
     s.next()
@@ -214,13 +216,16 @@ def localize_happy_path(s: Session) -> None:
     _flash_here(s, "/dev/ttyACM3", "West RX", "receiver")
     fwr = s.firmware(RX_MAC)
     cfg = fwr["config"] if fwr else {}
-    s.expect(cfg.get("CONFIG_CSI_RX_WIFI_SSID") == "CSIDetector", "RX joins the hotspot")
-    s.expect(cfg.get("CONFIG_CSI_RX_HOST_IP") == "10.42.0.1", "RX sends to this computer")
-    s.expect(cfg.get("CONFIG_CSI_RX_CHANNEL") == "6", "RX on the hotspot's channel")
-    heard = {m.strip() for m in cfg.get("CONFIG_CSI_RX_FILTER_TX_MAC", "").split(",")}
+    s.expect(cfg.get("ssid") == "CSIDetector", "RX joins the hotspot")
+    s.expect(cfg.get("host_ip") == "10.42.0.1", "RX sends to this computer")
+    s.expect(cfg.get("channel") == "6", "RX on the hotspot's channel")
+    heard = {m.strip() for m in cfg.get("tx_macs", "").split(",")}
     s.expect(heard == {TX_MAC, TX2_MAC},
              "RX hears both transmitters")
-    s.expect(cfg.get("CONFIG_CSI_RX_WIFI_PASS") == "<redacted>", "a password was set")
+    s.expect(cfg.get("password") == "<redacted>", "a password was set")
+    s.expect(cfg.get("label") == "East RX", "the label is on the board")
+    leftovers = list((s._tmp / "cache").rglob("settings-*.bin"))
+    s.expect(not leftovers, f"no settings file (with the password) left behind: {leftovers}")
     s.expect(s.next(), "Receivers → links.json")
     s.expect(s.next(), "links.json → Finish")
     if fw.IS_WINDOWS:
@@ -257,7 +262,7 @@ def localize_no_hotspot(s: Session) -> None:
 # --------------------------------------------------------------------------
 
 def flash_failures_then_success(s: Session) -> None:
-    """No-connect, busy port and build failure each explain themselves; a retry then works."""
+    """No-connect, busy port and a failed write each explain themselves; a retry then works."""
     s.plug("/dev/ttyACM0", mac=TX_MAC, behavior="no_connect")
     _start_wizard(s)
     s.choose("Board", "/dev/ttyACM0")
@@ -270,7 +275,7 @@ def flash_failures_then_success(s: Session) -> None:
     s.click("Flash as transmitter")
     s.wait_idle()
     s.expect(s.dialogs and "busy" in s.dialogs[-1].text.lower(), "busy-port hint")
-    s.set_behavior("/dev/ttyACM0", "build_fail")
+    s.set_behavior("/dev/ttyACM0", "write_fail")
     s.click("Flash as transmitter")
     s.wait_idle()
     s.expect("flash failed" in s.texts(), "status says the flash failed")
@@ -338,15 +343,6 @@ def back_and_forth(s: Session) -> None:
     s.expect("[ ] RX" in s.dump(), "the untick stuck")
 
 
-def esptool_dash_only(s: Session) -> None:
-    """A newer esptool without read_mac: identify retries with read-mac."""
-    s.esptool_dash_only()
-    s.plug("/dev/ttyACM0", mac=TX_MAC)
-    _start_wizard(s)
-    _flash_here(s, "/dev/ttyACM0", "TX")
-    s.expect(s.nav_usable("next"), "flashed after the retry")
-
-
 # --------------------------------------------------------------------------
 # Devices & Flashing tab
 # --------------------------------------------------------------------------
@@ -368,19 +364,19 @@ def devices_tab_tour(s: Session) -> None:
     s.click("Flash selected board")
     s.wait_idle()
     fwt = s.firmware(TX_MAC)
-    s.expect(fwt and fwt["target"] == "esp32c3", "the TX was built for the C3")
+    s.expect(fwt and fwt["target"] == "esp32c3", "the TX got the C3 firmware")
     s.select_row("/dev/ttyACM0")
     s.fill("Receiver — alert mode", True)
     s.expect(TX_MAC in s.field("TX MAC filter").text(), "the RX filter is prefilled with the TX")
     s.click("Flash selected board")
     s.wait_idle()
     fwr = s.firmware(RX_MAC)
-    s.expect(fwr and fwr["config"].get("CONFIG_CSI_RX_FILTER_TX_MAC") == TX_MAC,
+    s.expect(fwr and fwr["config"].get("tx_macs") == TX_MAC,
              "the RX hears the TX")
 
 
 def devices_tab_target_follows_chip(s: Session) -> None:
-    """A leftover target doesn't build the wrong firmware: unknown chips are identified first."""
+    """A leftover target doesn't flash the wrong firmware: unknown chips are identified first."""
     s.plug("/dev/ttyUSB0", chip="ESP32-C3", mac=TX_MAC, via="cp2102")
     s.plug("/dev/ttyACM0", chip="ESP32-S3", mac=RX_MAC)
     s.click("Refresh")
@@ -391,7 +387,7 @@ def devices_tab_target_follows_chip(s: Session) -> None:
     s.wait_idle()
     s.wait_idle()                             # identify, then the flash it chains to
     fwt = s.firmware(TX_MAC)
-    s.expect(fwt and fwt["target"] == "esp32c3", "built for the identified C3")
+    s.expect(fwt and fwt["target"] == "esp32c3", "the identified C3's firmware")
     target = s.field("Target chip")
     s.expect(target.currentText() == "esp32c3" and not target.isEnabled(),
              "the target follows the identified chip")
@@ -627,17 +623,16 @@ def monitor_records_csi(s: Session) -> None:
 
 
 def environment_reasons(s: Session) -> None:
-    """A disabled Next says why: ESP-IDF path, hotspot fields, short password,
-    Telegram token."""
+    """A disabled Next says why: hotspot fields, short password, Telegram token."""
     s.plug("/dev/ttyACM0", mac=TX_MAC)
     s.hotspot()
     s.click("Setup wizard")
     s.fill("Localize", True)
     s.next()
-    s.fill(f"ESP-IDF {fw.EXPORT_NAME}", "")
-    s.expect(not s.nav_usable("next") and fw.EXPORT_NAME in s.page().note.text(),
-             f"says to pick {fw.EXPORT_NAME}")
-    s.fill(f"ESP-IDF {fw.EXPORT_NAME}", str(s.export_sh.parent))    # the folder is fine
+    s.fill("Hotspot SSID", "")
+    s.expect(not s.nav_usable("next") and "SSID" in s.page().note.text(),
+             "says the SSID is missing")
+    s.fill("Hotspot SSID", "CSIDetector")
     s.fill("Hotspot password", "abc12")
     s.expect(not s.nav_usable("next") and "8–64" in s.page().note.text(),
              "a short password is caught here, not at the first receiver")
@@ -645,7 +640,7 @@ def environment_reasons(s: Session) -> None:
     s.answer("No")
     s.next()
     s.expect(_dialog(s, "No hotspot password"), "warns that blank means open network")
-    s.expect(s.page_title() == "Environment", "No stays on the page")
+    s.expect(s.page_title() == "Wi-Fi settings", "No stays on the page")
 
 
 def enter_in_label_flashes(s: Session) -> None:
@@ -1019,7 +1014,7 @@ def wizard_swapped_bridge_board(s: Session) -> None:
     s.plug("/dev/ttyUSB0", chip="ESP32-D0WD-V3", mac=TX2_MAC, via="cp2102")   # swapped
     s.click("Flash as transmitter")
     s.wait_idle()
-    s.expect(_dialog(s, "Flash failed"), "the old chip's build fails")
+    s.expect(_dialog(s, "Flash failed"), "esptool refuses the old chip's firmware")
     s.dialogs.clear()
     s.click("Flash as transmitter")
     s.wait_idle()
@@ -1041,7 +1036,6 @@ SCENARIOS = {f.__name__: f for f in (
     cancel_mid_flash,
     close_wizard_while_flashing,
     back_and_forth,
-    esptool_dash_only,
     devices_tab_tour,
     devices_tab_target_follows_chip,
     two_bridge_boards,

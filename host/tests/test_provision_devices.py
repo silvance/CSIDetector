@@ -74,11 +74,21 @@ BASE MAC:           60:55:f9:00:11:22
 MAC_EXT:            ff:fe
 """
 
+# esptool 5.5 on a C6 (and C5): the EUI-64 first, the Wi-Fi MAC after it.
+ESPTOOL_C6 = """Connected to ESP32-C6 on /dev/ttyACM0:
+Chip type:          ESP32-C6 (QFN40) (revision v0.1)
+MAC:                60:55:f9:ff:fe:f7:2c:a2
+BASE MAC:           60:55:f9:f7:2c:a2
+MAC_EXT:            ff:fe
+"""
+
 
 @pytest.mark.parametrize("output,chip,mac", [
     (ESPTOOL_V5, "ESP32-S3", "a0:f2:62:f0:39:d8"),
     (ESPTOOL_V4, "ESP32-S3", "34:85:18:aa:bb:cc"),
     (ESPTOOL_C5, "ESP32-C5", "60:55:f9:00:11:22"),
+    (ESPTOOL_C6, "ESP32-C6", "60:55:f9:f7:2c:a2"),
+    ("Chip type: ESP32-C6\nMAC: 60:55:f9:ff:fe:f7:2c:a2\n", "ESP32-C6", ""),
     ("Failed to connect to ESP32-S3: No serial data received.", "", ""),
 ])
 def test_parse_esptool_identify(output, chip, mac):

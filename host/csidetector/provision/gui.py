@@ -4,16 +4,17 @@
 
   * lists attached ESP32 boards (port, chip, MAC/serial) next to the ones
     already in the device registry, with editable labels and roles;
-  * identifies bridge-based boards via esptool ``read_mac``;
-  * flashes a selected board as a transmitter or receiver (alert-mode
-    USB-only, or localize-mode hotspot), pre-filling the receiver's TX
-    MAC filter from registered transmitters and the hotspot SSID /
-    channel / host IP from NetworkManager;
+  * identifies boards (chip and MAC) via esptool ``read-mac``;
+  * flashes a selected board with the prebuilt transmitter or receiver
+    firmware for its chip (alert-mode USB-only, or localize-mode hotspot)
+    plus its settings — label, channel, TX MAC filter (pre-filled from
+    registered transmitters), hotspot SSID / password / host IP (from
+    NetworkManager where available) — with esptool, no ESP-IDF needed;
   * warns before flashing values that can't work (host IP that isn't this
     machine's hotspot address, channel mismatches, empty MAC filter).
 
-Builds and flashes run in a QProcess on the GUI thread's event loop (no
-worker threads); output streams into the log pane.
+esptool runs in a QProcess on the GUI thread's event loop (no worker
+threads); output streams into the log pane.
 """
 
 from __future__ import annotations
@@ -88,10 +89,7 @@ class ProcessRunner(QObject):
     def running(self) -> bool:
         return self._proc is not None
 
-    def start(self, argv: list[str], env: dict, native_args: Optional[str] = None) -> None:
-        """``native_args`` (Windows): pass this command line to argv[0]
-        verbatim instead of quoting argv[1:] — for cmd.exe, whose parsing
-        doesn't follow the usual rules."""
+    def start(self, argv: list[str], env: dict) -> None:
         if self._proc is not None:
             raise RuntimeError("a process is already running")
         proc = QProcess(self)
@@ -107,11 +105,6 @@ class ProcessRunner(QObject):
         self._output = ""
         self.cancelled = False
         self._proc = proc
-        if native_args is not None and hasattr(proc, "setNativeArguments"):
-            proc.setProgram(argv[0])
-            proc.setNativeArguments(native_args)
-            proc.start()
-            return
         if _SETSID and shutil.which(argv[0]):
             # QProcess's child isn't a group leader, so setsid execs in
             # place: the pid QProcess reports is the new group's id. (A
@@ -240,73 +233,46 @@ class Flasher(QObject):
         super().__init__(parent)
         self.registry = registry
         self._runner = ProcessRunner(self)
-        self._runner.line.connect(self._on_line)
+        self._runner.line.connect(self.line)
         self._runner.progress.connect(self.progress)
         self._runner.finished.connect(self._on_finished)
         self._pending: Optional[dict] = None
-        self._mute = False      # the environment dump of an export.bat capture
-
-    def _on_line(self, text: str) -> None:
-        if text.startswith(fw.ENV_MARKER):
-            self._mute = True   # what follows is `set` output: not for the log
-        if not self._mute:
-            self.line.emit(text)
-
-    def _run(self, export: Path, argv_for: Callable, phase: str) -> None:
-        """Start argv_for(idf) — on Windows once ESP-IDF's environment has
-        been captured (first use of this export.bat: an extra stage)."""
-        self._mute = False
-        if not fw.IS_WINDOWS:
-            self._runner.start(argv_for(None), fw.idf_env())
-            self.started.emit(phase)
-            return
-        idf = fw.cached_idf_env(export)
-        if idf is not None:
-            self._runner.start(argv_for(idf), idf.env)
-            self.started.emit(phase)
-            return
-        self._pending.update(stage="env", export=export, argv_for=argv_for, phase=phase)
-        if Path(export).suffix.lower() != ".bat":
-            # export.sh on Windows would just open in some other program.
-            self.line.emit(f"[setup] {export} isn't ESP-IDF's export.bat; on Windows "
-                           f"choose export.bat (in the esp-idf folder).")
-            self._runner.finished.emit(97, "ESP-IDF export.bat failed: "
-                                           "an export.bat is needed on Windows")
-            return
-        argv, native = fw.env_capture_command(export)
-        self.line.emit("[setup] loading the ESP-IDF environment (once per session)…")
-        self._runner.start(argv, fw.windows_export_env(export, fw.idf_env()),
-                           native_args=native)
-        self.started.emit("Loading ESP-IDF…")
+        try:
+            fw.clear_stale_settings_files()
+        except OSError:
+            pass
 
     @property
     def busy(self) -> bool:
         return self._runner.running
 
-    def flash(self, job: fw.FlashJob, export: Path,
-              inferred_mac: str = "", inferred_chip: str = "") -> None:
-        """Start flashing. Raises RuntimeError if busy, OSError/ValueError
-        if the build dir can't be prepared (nothing is started then)."""
+    def flash(self, job: fw.FlashJob, inferred_mac: str = "", inferred_chip: str = "") -> None:
+        """Start flashing. Raises RuntimeError if busy, ValueError (a
+        FirmwareError: missing or damaged firmware) or OSError if it can't
+        start (nothing is started then)."""
         if self.busy:
             raise RuntimeError("a flash or identify is already running")
-        changed = fw.prepare_build_dir(job)
-        self._pending = {"kind": "flash", "job": job,
+        image = job.image()
+        fw.check_image(image)
+        settings = fw.write_settings_file(job, image)
+        try:
+            argv = fw.flash_command(job, image, settings)
+        except BaseException:
+            fw.remove_settings_file(settings)       # it holds the password
+            raise
+        self._pending = {"kind": "flash", "job": job, "settings": settings,
                          "mac": inferred_mac, "chip": inferred_chip}
-        self.line.emit(
-            f"[setup] flashing {job.project} ({job.target}) to {job.port}"
-            + ("" if changed else " — config unchanged, reusing previous build"))
-        self._run(export, lambda idf: fw.flash_command(job, export, idf), "Building…")
+        self.line.emit(f"[setup] flashing {job.project} ({job.target}) to {job.port}")
+        self._runner.start(argv, fw.esptool_env())
+        self.started.emit("Flashing…")
 
-    def identify(self, port: str, usb_serial: str, export: Path,
-                 esptool_cmd: str = "read_mac") -> None:
+    def identify(self, port: str, usb_serial: str) -> None:
         if self.busy:
             raise RuntimeError("a flash or identify is already running")
-        self._pending = {"kind": "identify", "port": port,
-                         "usb_serial": usb_serial, "cmd": esptool_cmd,
-                         "export": export}
+        self._pending = {"kind": "identify", "port": port, "usb_serial": usb_serial}
         self.line.emit(f"[setup] identifying {port} …")
-        self._run(export, lambda idf: fw.identify_command(port, export, esptool_cmd, idf),
-                  "Identifying…")
+        self._runner.start(fw.identify_command(port), fw.esptool_env())
+        self.started.emit("Identifying…")
 
     def cancel(self) -> None:
         self._runner.cancel()
@@ -321,35 +287,7 @@ class Flasher(QObject):
         if pending is None:
             return
         cancelled = self._runner.cancelled
-        if pending.get("stage") == "env":
-            idf = None if (code != 0 or cancelled) else fw.parse_env_dump(output)
-            visible = output.split(fw.ENV_MARKER, 1)[0]     # never the env dump
-            if idf is None:
-                if not cancelled and code == 0:
-                    visible += ("\nESP-IDF export.bat failed: its environment has "
-                                "no IDF_PATH, or its python isn't ESP-IDF's")
-                    self.line.emit("[setup] ESP-IDF export.bat ran, but ESP-IDF's "
-                                   "Python environment isn't set up (no IDF_PATH, or "
-                                   "esptool missing). Run ESP-IDF's install.bat, or "
-                                   "reinstall with the ESP-IDF Tools Installer.")
-                code = code or 97
-                pending.pop("stage")
-                output = visible
-            else:
-                fw.remember_idf_env(pending["export"], idf)
-                pending.pop("stage")
-                self._pending = pending
-                self._mute = False
-                self._runner.start(pending["argv_for"](idf), idf.env)
-                self.started.emit(pending["phase"])
-                return
         if pending["kind"] == "identify":
-            if (code != 0 and not cancelled and "invalid choice" in output
-                    and pending["cmd"] == "read_mac"):
-                # A future esptool without the underscore alias.
-                self.identify(pending["port"], pending["usb_serial"],
-                              pending["export"], "read-mac")
-                return
             chip, mac = dv.parse_esptool_identify(output)
             ok = code == 0 and bool(mac)
             if ok:
@@ -362,6 +300,7 @@ class Flasher(QObject):
                 output=output))
             return
 
+        fw.remove_settings_file(pending["settings"])     # it holds the password
         job: fw.FlashJob = pending["job"]
         if code != 0:
             self.flash_finished.emit(FlashResult(
@@ -394,6 +333,19 @@ class Flasher(QObject):
 # --------------------------------------------------------------------------
 # Devices & Flashing tab
 # --------------------------------------------------------------------------
+
+def _firmware_status() -> str:
+    """One line on the firmware this app flashes, for the Flash box."""
+    try:
+        manifest = fw.load_manifest()
+    except fw.FirmwareError as exc:
+        return f"⚠ {exc}"
+    chips = [t for t in fw.TARGETS
+             if all(t in fw.available_targets(p) for p in fw.PROJECTS.values())]
+    names = ", ".join(fw.chip_name(t) for t in chips) or "no chips"
+    return (f"Firmware included for {names} "
+            f"(ESP-IDF {manifest.get('idf_version', '?')}) — no other tools needed.")
+
 
 class _Row:
     __slots__ = ("board", "record")
@@ -438,7 +390,6 @@ class DevicesTab(QWidget):
                  list_boards: Callable[[], list[dv.AttachedBoard]] = dv.list_boards,
                  detect_hotspots: Callable[[], list[fw.HotspotInfo]] = fw.detect_hotspots,
                  settings_path: Optional[Path] = None,
-                 idf_export: Optional[str] = None,
                  auto_refresh: bool = True,
                  parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -467,7 +418,7 @@ class DevicesTab(QWidget):
         self.flasher.identify_finished.connect(self._on_identify_finished)
 
         self._build_ui()
-        self._load_settings(idf_export)
+        self._load_settings()
         self.refresh()
 
         self._timer = QTimer(self)
@@ -497,10 +448,10 @@ class DevicesTab(QWidget):
 
         self.refresh_btn = QPushButton("Refresh")
         self.identify_btn = QPushButton("Identify (esptool)")
+        self.identify_btn.setToolTip("Read the board's chip type and MAC address "
+                                     "from the board itself.")
         # Lambda: clicked(bool) would pass `checked` in as relist=False.
         self.refresh_btn.clicked.connect(lambda: self.refresh())
-        # Lambda, not the bound method: clicked(bool) would otherwise pass
-        # `checked` in as identify_selected's esptool_cmd.
         self.identify_btn.clicked.connect(lambda: self.identify_selected())
         top = QHBoxLayout()
         top.addWidget(QLabel("Attached boards and registered devices"))
@@ -588,16 +539,8 @@ class DevicesTab(QWidget):
         form.addRow("Host UDP port:", self.port_spin)
         self._form = form
 
-        self.export_edit = QLineEdit()
-        self.export_edit.setPlaceholderText(f"path to ESP-IDF's {fw.EXPORT_NAME}, e.g. "
-                                            f"{fw.EXPORT_EXAMPLE}")
-        self.export_edit.editingFinished.connect(self._save_settings)
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self._browse_export)
-        export_row = QHBoxLayout()
-        export_row.addWidget(QLabel("ESP-IDF:"))
-        export_row.addWidget(self.export_edit, 1)
-        export_row.addWidget(browse)
+        self.firmware_label = QLabel(_firmware_status())
+        self.firmware_label.setWordWrap(True)
 
         self.flash_btn = QPushButton("Flash selected board")
         self.cancel_btn = QPushButton("Cancel")
@@ -605,14 +548,13 @@ class DevicesTab(QWidget):
         self.cancel_btn.clicked.connect(self.flasher.cancel)
         self.cancel_btn.setEnabled(False)
         actions = QHBoxLayout()
-        actions.addStretch(1)
+        actions.addWidget(self.firmware_label, 1)
         actions.addWidget(self.cancel_btn)
         actions.addWidget(self.flash_btn)
 
         flash_box = QGroupBox("Flash")
         fb = QVBoxLayout(flash_box)
         fb.addLayout(form)
-        fb.addLayout(export_row)
         fb.addLayout(actions)
 
         # Progress + log
@@ -645,7 +587,7 @@ class DevicesTab(QWidget):
     # Settings (non-secret form values only)
     # ------------------------------------------------------------------
 
-    def _load_settings(self, idf_export: Optional[str]) -> None:
+    def _load_settings(self) -> None:
         try:
             s = json.loads(self._settings_path.read_text())
             if not isinstance(s, dict):
@@ -665,11 +607,6 @@ class DevicesTab(QWidget):
             self.ssid_edit.setText(s["ssid"])
         if isinstance(s.get("host_ip"), str):
             self.host_ip_edit.setText(s["host_ip"])
-        export = idf_export or s.get("idf_export") or ""
-        if not export:
-            found = fw.find_idf_export()
-            export = str(found) if found else ""
-        self.export_edit.setText(export)
         self._sync_form()
 
     def _save_settings(self) -> None:
@@ -681,21 +618,12 @@ class DevicesTab(QWidget):
             "ssid": self.ssid_edit.text(),
             "host_ip": self.host_ip_edit.text().strip(),
             "host_port": self.port_spin.value(),
-            "idf_export": self.export_edit.text().strip(),
         }
         try:
             self._settings_path.parent.mkdir(parents=True, exist_ok=True)
             self._settings_path.write_text(json.dumps(s, indent=2))
         except OSError as exc:
             self._append_log(f"[setup] could not save settings: {exc}")
-
-    def _browse_export(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, f"Select ESP-IDF {fw.EXPORT_NAME}", os.path.expanduser("~"),
-            f"{fw.EXPORT_NAME} ({fw.EXPORT_NAME});;All files (*)")
-        if path:
-            self.export_edit.setText(path)
-            self._save_settings()
 
     # ------------------------------------------------------------------
     # Table
@@ -824,11 +752,11 @@ class DevicesTab(QWidget):
         if known:
             self.target_combo.setCurrentText(target)
         # A known chip fixes the target; an unknown one is identified before
-        # building, so the choice here only matters for an unidentified board.
+        # flashing, so the choice here only matters for an unidentified board.
         self.target_combo.setEnabled(not known)
         self.target_combo.setToolTip(
             "Set from the board's identified chip." if known else
-            "Not identified yet: Flash identifies the chip before building.")
+            "Not identified yet: Flash identifies the chip first.")
         self._update_buttons()
 
     def _update_buttons(self) -> None:
@@ -961,11 +889,13 @@ class DevicesTab(QWidget):
             return plan
         mode = self.mode()
         channel = self.channel_spin.value()
+        label = self.label_edit.text().strip()      # stored on the board too
         if mode == MODE_TX:
-            config: fw.Config = fw.TxConfig(channel=channel,
+            config: fw.Config = fw.TxConfig(channel=channel, label=label,
                                             rate_hz=self.rate_spin.value())
         else:
-            config = fw.RxConfig(channel=channel, tx_macs=self._filter_macs())
+            config = fw.RxConfig(channel=channel, tx_macs=self._filter_macs(),
+                                 label=label)
             if mode == MODE_RX_LOCALIZE:
                 config.ssid = self.ssid_edit.text()
                 config.password = self.pass_edit.text()
@@ -976,14 +906,11 @@ class DevicesTab(QWidget):
                                        "(or choose alert mode for USB-only).")
         job = fw.FlashJob(port=row.board.port, config=config,
                           target=self.target_combo.currentText())
-        plan.errors.extend(job.validate())
         if row.chip and dv.chip_to_target(row.chip) not in fw.TARGETS:
-            plan.errors.append(f"This board is an {row.chip}, which this firmware "
-                               f"doesn't support (supported: {', '.join(fw.TARGETS)}).")
-        if not self.export_edit.text().strip() or \
-                not Path(self.export_edit.text().strip()).expanduser().is_file():
-            plan.errors.append(f"ESP-IDF {fw.EXPORT_NAME} not found — set its path "
-                               f"below the form (usually {fw.EXPORT_EXAMPLE}).")
+            plan.errors.append(f"This board is an {row.chip}, which CSIDetector "
+                               f"doesn't support (supported: {fw.supported_chips()}).")
+        else:
+            plan.errors.extend(job.validate())
         if plan.errors:
             return plan
 
@@ -1066,9 +993,6 @@ class DevicesTab(QWidget):
     # Actions
     # ------------------------------------------------------------------
 
-    def _export_path(self) -> Path:
-        return Path(self.export_edit.text().strip()).expanduser()
-
     def flash_selected(self) -> None:
         if self.flasher.busy:
             return
@@ -1077,7 +1001,7 @@ class DevicesTab(QWidget):
             # USB descriptors never name the chip, and the target dropdown
             # may still show the previous board's: identify, then flash.
             key = (row.board.port, row.board.usb_serial)
-            self._append_log("[setup] chip not known yet; identifying it before building")
+            self._append_log("[setup] chip not known yet; identifying it first")
             self.identify_selected()
             if self.flasher.busy:
                 self._flash_after_identify = key
@@ -1105,25 +1029,18 @@ class DevicesTab(QWidget):
         self._save_settings()
         self.log.clear()
         try:
-            self.flasher.flash(job, self._export_path(),
-                               inferred_mac=board.mac if board else "",
+            self.flasher.flash(job, inferred_mac=board.mac if board else "",
                                inferred_chip=board.chip if board else "")
         except (OSError, ValueError, RuntimeError) as exc:
             QMessageBox.warning(self, "Can't flash", f"Could not start the flash: {exc}")
             return
         self._update_buttons()
 
-    def identify_selected(self, esptool_cmd: str = "read_mac") -> None:
+    def identify_selected(self) -> None:
         row = self._selected_row()
         if self.flasher.busy or row is None or row.board is None:
             return
-        export = self._export_path()
-        if not export.is_file():
-            QMessageBox.warning(self, "ESP-IDF not found",
-                                f"Set the path to ESP-IDF's {fw.EXPORT_NAME} first.")
-            return
-        self.flasher.identify(row.board.port, row.board.usb_serial, export,
-                              esptool_cmd)
+        self.flasher.identify(row.board.port, row.board.usb_serial)
         self._update_buttons()
 
     def _on_started(self, phase: str) -> None:
@@ -1140,7 +1057,7 @@ class DevicesTab(QWidget):
         self.progress.setVisible(False)
 
     def _on_progress(self, phase: str, pct: int) -> None:
-        self.phase_label.setText("Building…" if phase == "build" else "Flashing…")
+        self.phase_label.setText("Flashing…")
         self.progress.setValue(pct)
 
     def _append_log(self, text: str) -> None:
@@ -1236,15 +1153,14 @@ class DevicesTab(QWidget):
 # --------------------------------------------------------------------------
 
 class SetupWindow(QMainWindow):
-    def __init__(self, registry: Optional[dv.Registry] = None,
-                 idf_export: Optional[str] = None, **tab_kwargs):
+    def __init__(self, registry: Optional[dv.Registry] = None, **tab_kwargs):
         super().__init__()
         self.setWindowTitle("CSIDetector Setup")
         self.resize(980, 880)
         self.registry = registry or dv.Registry()
         self._list_boards = tab_kwargs.get("list_boards", dv.list_boards)
         self._detect_hotspots = tab_kwargs.get("detect_hotspots", fw.detect_hotspots)
-        self.devices = DevicesTab(self.registry, idf_export=idf_export, **tab_kwargs)
+        self.devices = DevicesTab(self.registry, **tab_kwargs)
         from csidetector.provision import wizard as wizard_module
         from csidetector.provision.floorplan import RoomTab
         self.room = RoomTab(self.registry, wizard_module.default_host_dir() / "links.json")
@@ -1299,7 +1215,6 @@ class SetupWindow(QMainWindow):
             return self.wizard
         wiz = SetupWizard(self.registry, list_boards=self._list_boards,
                           detect_hotspots=self._detect_hotspots,
-                          idf_export=self.devices.export_edit.text().strip(),
                           before_alert_apply=self.retire_monitor,
                           parent=self)
         wiz.finished.connect(lambda result: self._wizard_closed(wiz, result))
@@ -1425,10 +1340,10 @@ def _quit_on_signals(app: QApplication) -> None:
     timer.start(250)
 
 
-def run_setup_gui(idf_export: Optional[str] = None, wizard: bool = False) -> int:
+def run_setup_gui(wizard: bool = False) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     _install_excepthook()
-    win = SetupWindow(idf_export=idf_export)
+    win = SetupWindow()
     app.aboutToQuit.connect(win.shutdown_processes)
     _quit_on_signals(app)
     win.show()

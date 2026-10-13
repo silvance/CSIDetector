@@ -43,8 +43,7 @@ def qt_app():
 
 
 @pytest.fixture
-def env(qt_app, tmp_path, monkeypatch, idf_export):
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+def env(qt_app, tmp_path, monkeypatch, prebuilt):
     monkeypatch.setattr(dv, "stable_port", lambda port, mac="", by_id_dir=None: port)
     monkeypatch.setattr(alert_gui, "_STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(alert_gui, "_STATE_PATH", tmp_path / "state" / "state.json")
@@ -61,11 +60,10 @@ def env(qt_app, tmp_path, monkeypatch, idf_export):
     # Fresh copies each call, like the real list_boards(): page code must
     # not rely on mutating a listed board.
     wiz = wz.SetupWizard(reg, list_boards=lambda: [dataclasses.replace(b) for b in boards],
-                         detect_hotspots=lambda: hotspots,
-                         idf_export=str(idf_export), host_dir=host_dir)
+                         detect_hotspots=lambda: hotspots, host_dir=host_dir)
     started = []
     monkeypatch.setattr(wiz.flasher._runner, "start",
-                        lambda argv, environ, native_args=None: started.append(argv))
+                        lambda argv, environ: started.append(argv))
     # Never block a test on a modal dialog.
     monkeypatch.setattr(wiz, "confirm", lambda *a: True)
     shown = []
@@ -258,7 +256,8 @@ def test_telegram_skip_writes_no_credentials(env):
     assert alert_gui._PersistedState.load().alert_config_path == ""
 
 
-def test_environment_page_requires_export_and_localize_fields(env, tmp_path):
+def test_environment_page_requires_firmware_and_localize_fields(env, tmp_path,
+                                                                monkeypatch):
     wiz = env.wiz
     wiz.page(wz.PAGE_MODE).localize.setChecked(True)
     wiz.next()
@@ -267,8 +266,9 @@ def test_environment_page_requires_export_and_localize_fields(env, tmp_path):
     page.host_ip.setText("10.42.1")
     assert not page.isComplete()
     page.host_ip.setText("10.42.1.1")
-    page.export_edit.setText(str(tmp_path / "missing.sh"))
-    assert not page.isComplete()
+    assert page.isComplete()
+    monkeypatch.setenv("CSIDETECTOR_FIRMWARE_DIR", str(tmp_path / "nothing-here"))
+    assert not page.isComplete() and "firmware is missing" in page.note.text()
 
 
 def test_failed_flash_is_not_ticked(env):
@@ -307,9 +307,9 @@ def _to_page(wiz, page_id):
         wiz.next()
 
 
-def test_unknown_chip_is_identified_before_building(env):
+def test_unknown_chip_is_identified_before_flashing(env):
     """A bridge board's chip isn't in its USB descriptor: the wizard must
-    identify it and build for that chip, not silently for an S3."""
+    identify it and flash that chip's firmware, not silently the S3's."""
     env.boards.append(dv.AttachedBoard("/dev/ttyUSB0", 0x10C4, 0xEA60, "0001", "CP2102"))
     wiz = env.wiz
     _to_page(wiz, wz.PAGE_TX)
@@ -565,11 +565,7 @@ def test_windows_localize_flow_without_networkmanager(env, monkeypatch):
     and the finish steps are Command Prompt commands, not start.sh."""
     monkeypatch.setattr(fw, "IS_WINDOWS", True)
     monkeypatch.setattr(fw, "local_ipv4_addresses", lambda: ["192.168.1.20", "192.168.137.1"])
-    monkeypatch.setattr(fw, "_IDF_ENV_CACHE", {})
     wiz = env.wiz
-    # export.bat's environment already captured (that stage has its own test).
-    fw.remember_idf_env(Path(wiz.state.export),
-                        fw.IdfEnv({}, sys.executable, Path("/idf/tools/idf.py")))
     wiz.detect_hotspots = lambda: []
     wiz.page(wz.PAGE_MODE).localize.setChecked(True)
     wiz.next()

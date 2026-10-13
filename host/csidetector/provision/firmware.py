@@ -1,49 +1,46 @@
-"""Firmware configuration, flash-command construction, and output parsing.
+"""Firmware images, per-board settings, esptool commands and output parsing.
 
-Flashing never touches the developer's hand-edited ``sdkconfig`` in the
-firmware project. Each (project, target) pair gets its own build
-directory under ``~/.cache/csidetector/firmware/`` with a generated
-``sdkconfig.setup`` defaults overlay; ``idf.py`` is pointed at that
-directory with ``-B`` / ``-D SDKCONFIG`` / ``-D SDKCONFIG_DEFAULTS``.
-Reflashing a second board with an identical config reuses the build, so
-only the first flash pays the full compile.
+The firmware is prebuilt once per chip (firmware/prebuilt/, built by
+scripts/build_firmware.py in CI) and flashed with esptool — a pip
+package installed with the app — so setting up boards needs no ESP-IDF
+or compiler. What differs per board (channel, transmitter MAC filter,
+hotspot SSID/password, label) goes into the board's csi_cfg partition as
+a settings block (board_settings.py), written in the same esptool run as
+the firmware.
 
-On Linux/macOS, ESP-IDF commands run through ``bash -c '. export.sh &&
-…'``. On Windows there's no bash: ``export.bat`` is run once through
-``cmd.exe`` to capture the environment it sets up (cached per export.bat),
-then ``python idf.py …`` / ``python -m esptool …`` run directly in it — no
-cmd quoting rules in the way. Either way the host Python venv is stripped
-first — otherwise the venv's python shadows IDF's and ``idf.py`` dies
-with ``No module named 'click'``.
+esptool runs as ``python -m esptool`` with this app's own Python.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import glob
 import hashlib
 import ipaddress
 import json
-import ntpath
 import os
 import re
-import shlex
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Callable, Optional, Union
 
+from csidetector.provision import board_settings
 from csidetector.provision.devices import ROLE_RX, ROLE_TX, normalize_mac
 
 # Firmware MAC filter capacity — see MAX_FILTER_MACS in
 # firmware/csi_receiver/main/main.c.
 MAX_FILTER_MACS = 4
 DEFAULT_TARGET = "esp32s3"
-TARGETS = ("esp32s3", "esp32c3", "esp32c5", "esp32s2", "esp32")
+# Chips the prebuilt firmware is built for (scripts/build_firmware.py).
+TARGETS = ("esp32s3", "esp32c3", "esp32c5", "esp32c6", "esp32")
 # Chips with a USB-Serial/JTAG controller. The receiver's
 # sdkconfig.defaults routes its console (and the CSI stream) there, so on
 # these chips UART-mode CSI arrives on the native USB port only.
-USB_JTAG_TARGETS = frozenset({"esp32s3", "esp32c3", "esp32c5"})
+USB_JTAG_TARGETS = frozenset({"esp32s3", "esp32c3", "esp32c5", "esp32c6"})
+FLASH_BAUD = 460800
+MANIFEST_FORMAT = "csidetector-firmware/1"
 
 PROJECTS = {
     ROLE_TX: "csi_transmitter",
@@ -51,10 +48,6 @@ PROJECTS = {
 }
 
 IS_WINDOWS = os.name == "nt"
-EXPORT_NAME = "export.bat" if IS_WINDOWS else "export.sh"
-# Where ESP-IDF usually puts it, for messages.
-EXPORT_EXAMPLE = (r"C:\Espressif\frameworks\esp-idf-v5.x\export.bat" if IS_WINDOWS
-                  else "~/esp/esp-idf/export.sh")
 # The default Windows Mobile hotspot address.
 WINDOWS_HOTSPOT_IP = "192.168.137.1"
 
@@ -87,32 +80,27 @@ def repo_firmware_root() -> Path:
     return Path(__file__).resolve().parents[3] / "firmware"
 
 
-def cache_root() -> Path:
-    """Where builds go. On Windows: %LOCALAPPDATA% (private to the user —
-    generated sdkconfigs hold the hotspot password), short names, and no
-    spaces (ESP-IDF can't build in a path with spaces; a user name can
-    have them)."""
-    if os.environ.get("CSIDETECTOR_BUILD_DIR"):
-        return Path(os.environ["CSIDETECTOR_BUILD_DIR"])
+def prebuilt_root() -> Path:
+    """The prebuilt firmware: firmware/prebuilt, or $CSIDETECTOR_FIRMWARE_DIR
+    (a developer's own scripts/build_firmware.py --out DIR)."""
+    if os.environ.get("CSIDETECTOR_FIRMWARE_DIR"):
+        return Path(os.environ["CSIDETECTOR_FIRMWARE_DIR"])
+    return repo_firmware_root() / "prebuilt"
+
+
+def private_dir() -> Path:
+    """Owner-only folder for the settings files esptool writes to boards
+    (they can hold the hotspot password). On Windows %LOCALAPPDATA%, which
+    is private to the user."""
     if os.environ.get("XDG_CACHE_HOME"):
-        return Path(os.environ["XDG_CACHE_HOME"]) / "csidetector" / "firmware"
-    if IS_WINDOWS and os.environ.get("LOCALAPPDATA"):
-        base = Path(os.environ["LOCALAPPDATA"])
-        if " " in str(base):
-            base = Path(_short_path(str(base)))
-        return base / "csid" / "fw"
-    return Path(os.path.expanduser("~/.cache")) / "csidetector" / "firmware"
-
-
-def _short_path(path: str) -> str:
-    """Windows 8.3 short form of an existing path (no spaces), else as is."""
-    try:
-        import ctypes
-        buf = ctypes.create_unicode_buffer(1024)
-        if ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf)):
-            return buf.value
-    except (AttributeError, OSError):
-        pass
+        base = Path(os.environ["XDG_CACHE_HOME"]) / "csidetector"
+    elif IS_WINDOWS and os.environ.get("LOCALAPPDATA"):
+        base = Path(os.environ["LOCALAPPDATA"]) / "csidetector"
+    else:
+        base = Path(os.path.expanduser("~/.cache")) / "csidetector"
+    path = base / "board-settings"
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
     return path
 
 
@@ -124,26 +112,32 @@ def _has_control_chars(s: str) -> bool:
     return any(ord(c) < 0x20 or ord(c) == 0x7F for c in s)
 
 
+def _validate_label(label: str) -> list[str]:
+    if _has_control_chars(label or ""):
+        return ["The label contains control characters."]
+    return []
+
+
 @dataclasses.dataclass
 class TxConfig:
     channel: int = 11
     rate_hz: int = 100
+    label: str = ""              # stored on the board (see fit_label)
 
     role = ROLE_TX
 
     def validate(self) -> list[str]:
-        errors = []
+        errors = _validate_label(self.label)
         if not 1 <= int(self.channel) <= 13:
             errors.append("Channel must be between 1 and 13.")
         if not 1 <= int(self.rate_hz) <= 500:
             errors.append("Broadcast rate must be between 1 and 500 Hz.")
         return errors
 
-    def kconfig(self) -> dict[str, Union[int, str]]:
-        return {
-            "CSI_TX_CHANNEL": int(self.channel),
-            "CSI_TX_RATE_HZ": int(self.rate_hz),
-        }
+    def settings(self) -> dict[str, Union[int, str]]:
+        """What the board's settings block holds."""
+        return {"role": ROLE_TX, "label": board_settings.fit_label(self.label),
+                "channel": int(self.channel), "rate_hz": int(self.rate_hz)}
 
     def summary(self) -> dict:
         return {"channel": int(self.channel), "rate_hz": int(self.rate_hz)}
@@ -157,6 +151,7 @@ class RxConfig:
     password: str = ""
     host_ip: str = "10.42.0.1"
     host_port: int = 5566
+    label: str = ""
 
     role = ROLE_RX
 
@@ -165,7 +160,7 @@ class RxConfig:
         return not self.ssid
 
     def validate(self) -> list[str]:
-        errors = []
+        errors = _validate_label(self.label)
         if not 1 <= int(self.channel) <= 13:
             errors.append("Channel must be between 1 and 13.")
         if len(self.tx_macs) > MAX_FILTER_MACS:
@@ -180,11 +175,15 @@ class RxConfig:
             if _has_control_chars(self.ssid) or len(self.ssid.encode()) > 32:
                 errors.append("SSID must be at most 32 bytes with no "
                               "control characters.")
-            if self.password and not 8 <= len(self.password) <= 64:
+            if self.password and not 8 <= len(self.password.encode()) <= 64:
                 errors.append("Wi-Fi password must be empty (open hotspot) "
                               "or 8–64 characters.")
             if _has_control_chars(self.password):
                 errors.append("Wi-Fi password contains control characters.")
+            elif len(self.password) == 64 and not re.fullmatch(r"[0-9A-Fa-f]{64}",
+                                                               self.password):
+                errors.append("A 64-character Wi-Fi key must be hexadecimal (0-9, "
+                              "a-f); a passphrase is 8–63 characters.")
             try:
                 ipaddress.IPv4Address(self.host_ip)
             except (ipaddress.AddressValueError, ValueError):
@@ -194,17 +193,19 @@ class RxConfig:
                 errors.append("Host UDP port must be between 1 and 65535.")
         return errors
 
-    def kconfig(self) -> dict[str, Union[int, str]]:
-        macs = ", ".join(normalize_mac(m) for m in self.tx_macs)
+    def settings(self) -> dict[str, Union[int, str]]:
+        """What the board's settings block holds (the password included:
+        it never leaves the settings file esptool writes)."""
         values: dict[str, Union[int, str]] = {
-            "CSI_RX_CHANNEL": int(self.channel),
-            "CSI_RX_FILTER_TX_MAC": macs,
-            "CSI_RX_WIFI_SSID": self.ssid,
-            "CSI_RX_WIFI_PASS": self.password if self.ssid else "",
+            "role": ROLE_RX, "label": board_settings.fit_label(self.label),
+            "channel": int(self.channel),
+            "tx_macs": ", ".join(normalize_mac(m) for m in self.tx_macs),
+            "ssid": self.ssid,
+            "password": self.password if self.ssid else "",
         }
         if self.ssid:
-            values["CSI_RX_HOST_IP"] = self.host_ip
-            values["CSI_RX_HOST_PORT"] = int(self.host_port)
+            values["host_ip"] = self.host_ip
+            values["host_port"] = int(self.host_port)
         return values
 
     def summary(self) -> dict:
@@ -223,23 +224,103 @@ class RxConfig:
 Config = Union[TxConfig, RxConfig]
 
 
-def kconfig_escape(value: str) -> str:
-    """Escape a string for a ``CONFIG_X="..."`` line in sdkconfig."""
-    if _has_control_chars(value):
-        raise ValueError("config strings may not contain control characters")
-    return value.replace("\\", "\\\\").replace('"', '\\"')
+# --------------------------------------------------------------------------
+# Prebuilt firmware
+# --------------------------------------------------------------------------
+
+class FirmwareError(ValueError):
+    """The prebuilt firmware is missing, damaged, or not built for a chip.
+    The message is for the user."""
 
 
-def render_sdkconfig_defaults(values: dict[str, Union[int, str]]) -> str:
-    lines = ["# Generated by `python run.py setup` — do not edit by hand."]
-    for key, value in values.items():
-        if isinstance(value, bool):
-            raise TypeError(f"{key}: bool values are not supported")
-        if isinstance(value, int):
-            lines.append(f"CONFIG_{key}={value}")
-        else:
-            lines.append(f'CONFIG_{key}="{kconfig_escape(value)}"')
-    return "\n".join(lines) + "\n"
+@dataclasses.dataclass
+class FirmwareImage:
+    project: str
+    target: str
+    chip: str                                  # esptool --chip
+    flash_mode: str
+    flash_freq: str
+    flash_size: str
+    files: list[tuple[int, Path, str]]         # (offset, path, sha256)
+    settings_offset: int
+    settings_size: int
+    nvs_offset: int = 0                        # blanked on every flash (0: not)
+    nvs_size: int = 0
+
+
+def chip_name(target: str) -> str:
+    """esp32c5 → ESP32-C5."""
+    return "ESP32" + ("-" + target[5:].upper() if len(target) > 5 else "")
+
+
+def supported_chips() -> str:
+    return ", ".join(chip_name(t) for t in TARGETS)
+
+
+def load_manifest(root: Optional[Path] = None) -> dict:
+    root = Path(root) if root else prebuilt_root()
+    path = root / "manifest.json"
+    try:
+        manifest = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise FirmwareError(
+            f"The prebuilt firmware is missing ({path}). Download CSIDetector "
+            f"again, or get the firmware/prebuilt folder from the repository.") from None
+    except (OSError, ValueError) as exc:
+        raise FirmwareError(f"The prebuilt firmware's manifest ({path}) can't be "
+                            f"read: {exc}") from None
+    if not isinstance(manifest, dict) or manifest.get("format") != MANIFEST_FORMAT:
+        raise FirmwareError(f"{path} isn't a firmware manifest this version of the "
+                            f"setup app understands. Update CSIDetector.")
+    return manifest
+
+
+def available_targets(project: str, root: Optional[Path] = None) -> list[str]:
+    try:
+        images = load_manifest(root).get("images", {})
+    except FirmwareError:
+        return []
+    return [t for t in TARGETS if f"{project}-{t}" in images]
+
+
+def find_image(project: str, target: str, root: Optional[Path] = None) -> FirmwareImage:
+    """The prebuilt image for (project, target). Raises FirmwareError."""
+    root = Path(root) if root else prebuilt_root()
+    manifest = load_manifest(root)
+    entry = manifest.get("images", {}).get(f"{project}-{target}")
+    if not isinstance(entry, dict):
+        built = sorted({chip_name(v.get("target", "")) for v in
+                        manifest.get("images", {}).values() if isinstance(v, dict)})
+        raise FirmwareError(f"There's no prebuilt {project} firmware for the "
+                            f"{chip_name(target)} (built for: {', '.join(built) or 'none'}).")
+    try:
+        return FirmwareImage(
+            project=project, target=target, chip=str(entry["chip"]),
+            flash_mode=str(entry["flash_mode"]), flash_freq=str(entry["flash_freq"]),
+            flash_size=str(entry["flash_size"]),
+            files=[(int(f["offset"], 0), root / f["path"], str(f["sha256"]))
+                   for f in entry["files"]],
+            settings_offset=int(entry["settings"]["offset"], 0),
+            settings_size=int(entry["settings"]["size"]),
+            nvs_offset=int(entry.get("nvs", {}).get("offset", "0"), 0),
+            nvs_size=int(entry.get("nvs", {}).get("size", 0)))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise FirmwareError(f"The firmware manifest's entry for {project}-{target} is "
+                            f"incomplete ({exc}). Update CSIDetector.") from None
+
+
+def check_image(image: FirmwareImage) -> None:
+    """Raise FirmwareError unless every file is there and intact (a partial
+    download, or a git checkout that mangled the binaries)."""
+    for _, path, digest in image.files:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            raise FirmwareError(f"Firmware file missing: {path}. Download "
+                                f"CSIDetector again.") from None
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise FirmwareError(f"Firmware file damaged: {path} (checksum mismatch). "
+                                f"Download CSIDetector again.")
 
 
 # --------------------------------------------------------------------------
@@ -251,8 +332,7 @@ class FlashJob:
     port: str
     config: Config
     target: str = DEFAULT_TARGET
-    firmware_root: Path = dataclasses.field(default_factory=repo_firmware_root)
-    build_root: Path = dataclasses.field(default_factory=cache_root)
+    firmware_root: Path = dataclasses.field(default_factory=prebuilt_root)
 
     @property
     def role(self) -> str:
@@ -262,350 +342,106 @@ class FlashJob:
     def project(self) -> str:
         return PROJECTS[self.role]
 
-    @property
-    def project_dir(self) -> Path:
-        return self.firmware_root / self.project
-
-    @property
-    def build_dir(self) -> Path:
-        # Per-target build dir: idf.py refuses to reuse a build dir that
-        # was configured for a different chip.
-        return self.build_root / f"{self.project}-{self.target}"
-
-    @property
-    def sdkconfig_path(self) -> Path:
-        return self.build_dir / "sdkconfig"
-
-    @property
-    def overlay_path(self) -> Path:
-        return self.build_dir / "sdkconfig.setup"
+    def image(self) -> FirmwareImage:
+        return find_image(self.project, self.target, self.firmware_root)
 
     def validate(self) -> list[str]:
         errors = list(self.config.validate())
         if self.target not in TARGETS:
-            errors.append(f"Unsupported target: {self.target}")
+            errors.append(f"{chip_name(self.target)} boards aren't supported "
+                          f"(supported: {supported_chips()}).")
+        else:
+            try:
+                self.image()
+            except FirmwareError as exc:
+                errors.append(str(exc))
         if not self.port:
             errors.append("No serial port selected.")
-        if not (self.project_dir / "CMakeLists.txt").is_file():
-            errors.append(f"Firmware project not found: {self.project_dir}")
-        for what, path in (("The CSIDetector folder", self.firmware_root.parent),
-                           ("The build folder", self.build_root)):
-            if " " in str(path):
-                errors.append(
-                    f"{what} is in a path with spaces ({path}), which ESP-IDF "
-                    f"can't build in. Move it to a path without spaces, e.g. "
-                    + (r"C:\csidetector" if IS_WINDOWS else "~/csidetector")
-                    + (" (or set CSIDETECTOR_BUILD_DIR)." if what.startswith("The build")
-                       else "."))
         return errors
 
 
-def _base_defaults_fingerprint(job: FlashJob) -> str:
-    """Hash of the project's own defaults files that idf.py will load.
+_STALE_SETTINGS_S = 600
 
-    kconfgen lets an existing sdkconfig win over defaults, so a `git pull`
-    that changes the project's sdkconfig.defaults would otherwise never
-    reach a cached build.
-    """
-    h = hashlib.sha256()
-    for name in ("sdkconfig.defaults", f"sdkconfig.defaults.{job.target}"):
-        path = job.project_dir / name
-        h.update(name.encode() + b"\0")
+
+def write_settings_file(job: FlashJob, image: FirmwareImage) -> Path:
+    """The board's settings block, in a new owner-only file for esptool to
+    write. The caller deletes it once esptool is done; leftovers from a
+    crash are removed here, next time."""
+    blob = board_settings.encode(job.config.settings(), image.settings_size)
+    folder = private_dir()
+    clear_stale_settings_files(folder)
+    fd, name = tempfile.mkstemp(prefix="settings-", suffix=".bin", dir=folder)
+    with os.fdopen(fd, "wb") as f:
+        f.write(blob)
+    if not IS_WINDOWS:
+        os.chmod(name, 0o600)
+    return Path(name)
+
+
+def blank_file(size: int) -> Path:
+    """``size`` bytes of erased flash (0xFF), for blanking a region."""
+    path = private_dir() / f"blank-{size:x}.bin"
+    if not path.is_file() or path.stat().st_size != size:
+        path.write_bytes(b"\xff" * size)
+    return path
+
+
+def clear_stale_settings_files(folder: Optional[Path] = None) -> None:
+    """Remove settings files a crash left behind (older than a flash takes)."""
+    folder = folder or private_dir()
+    now = time.time()
+    for old in folder.glob("settings-*.bin"):
         try:
-            h.update(path.read_bytes())
+            if now - old.stat().st_mtime > _STALE_SETTINGS_S:
+                old.unlink()
         except OSError:
-            h.update(b"<absent>")
-    return h.hexdigest()
+            pass
 
 
-def _private_dir(path: Path) -> None:
-    """mkdir -p, then 0700: generated sdkconfig / sdkconfig.h files under
-    the build dir carry the hotspot password and are written 0644."""
-    path.mkdir(parents=True, exist_ok=True)
-    os.chmod(path, 0o700)
-
-
-def prepare_build_dir(job: FlashJob) -> bool:
-    """Write the sdkconfig overlay; return True when it changed.
-
-    SDKCONFIG_DEFAULTS only seeds values missing from an existing
-    sdkconfig, so when the overlay or the project's own defaults change we
-    delete the generated sdkconfig to force the new values in. When
-    neither changed the previous build is reused and only the flash step
-    runs.
-    """
-    content = (f"# base-defaults-sha256: {_base_defaults_fingerprint(job)}\n"
-               + render_sdkconfig_defaults(job.config.kconfig()))
-    _private_dir(job.build_root)
-    _private_dir(job.build_dir)
-    try:
-        previous = job.overlay_path.read_text()
-    except OSError:
-        previous = None
-    if previous == content and job.sdkconfig_path.exists():
-        return False
-    # The overlay may hold the hotspot password: owner-only.
-    fd = os.open(job.overlay_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
-                 | getattr(os, "O_BINARY", 0), 0o600)
-    # newline="\n": on Windows text mode would write \r\n, read back
-    # differently, and every flash would look like a config change.
-    with os.fdopen(fd, "w", newline="\n") as f:
-        f.write(content)
-    os.chmod(job.overlay_path, 0o600)
-    try:
-        job.sdkconfig_path.unlink()
-    except FileNotFoundError:
-        pass
-    return True
+def remove_settings_file(path: Optional[Path]) -> None:
+    if path is not None:
+        try:
+            Path(path).unlink()
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
-# ESP-IDF shell
+# esptool
 # --------------------------------------------------------------------------
 
-def find_idf_export(env: Optional[dict] = None,
-                    windows: bool = IS_WINDOWS) -> Optional[Path]:
-    """Locate ESP-IDF's export script ($IDF_EXPORT, $IDF_PATH,
-    ~/esp/esp-idf; on Windows also the ESP-IDF installer's
-    C:\\Espressif\\frameworks\\esp-idf-v*, newest first)."""
-    env = os.environ if env is None else env
-    name = "export.bat" if windows else "export.sh"
-    candidates = []
-    if env.get("IDF_EXPORT"):
-        candidates.append(Path(env["IDF_EXPORT"]).expanduser())
-    if env.get("IDF_PATH"):
-        candidates.append(Path(env["IDF_PATH"]).expanduser() / name)
-    candidates.append(Path(os.path.expanduser("~")) / "esp" / "esp-idf" / name)
-    if windows:
-        drive = env.get("SystemDrive", "C:")
-        for root in (env.get("IDF_TOOLS_PATH"), f"{drive}\\Espressif"):
-            if root:
-                found = sorted(glob.glob(os.path.join(root, "frameworks",
-                                                      "esp-idf-v*", name)),
-                               key=_version_key, reverse=True)
-                candidates += [Path(f) for f in found]
-        candidates.append(Path(f"{drive}\\esp\\esp-idf") / name)
-    for c in candidates:
-        if c.is_file():
-            return c
-    return None
+def esptool_env() -> dict:
+    """The environment for esptool: this app's, with output unbuffered (so
+    progress streams) and UTF-8 (a Windows pipe defaults to the ANSI code
+    page)."""
+    return dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
 
 
-def _version_key(path: str) -> tuple:
-    m = re.search(r"esp-idf-v(\d+)\.(\d+)(?:\.(\d+))?", path)
-    return tuple(int(g or 0) for g in m.groups()) if m else (0,)
+def _esptool() -> list[str]:
+    return [sys.executable, "-m", "esptool"]
 
 
-def idf_env(base: Optional[dict] = None) -> dict:
-    """Copy of the environment with any Python venv removed from it."""
-    env = dict(os.environ if base is None else base)
-    strip = set()
-    scripts = "Scripts" if IS_WINDOWS else "bin"
-    venv = env.pop("VIRTUAL_ENV", None)
-    if venv:
-        strip.add(os.path.join(venv, scripts))
-    if base is None and sys.prefix != sys.base_prefix:
-        strip.add(os.path.join(sys.prefix, scripts))
-    for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV_PROMPT"):
-        env.pop(key, None)
-    if "PATH" in env and strip:
-        norm = {os.path.normpath(s) for s in strip}
-        env["PATH"] = os.pathsep.join(
-            p for p in env["PATH"].split(os.pathsep)
-            if os.path.normpath(p) not in norm)
-    return env
+def flash_command(job: FlashJob, image: FirmwareImage, settings_file: Path) -> list[str]:
+    """esptool write-flash: the bootloader, partition table, app and the
+    board's settings block in one go, with NVS blanked. ``--chip`` makes
+    esptool refuse a board that isn't the chip the image is for."""
+    pairs = [(offset, path) for offset, path, _ in image.files]
+    pairs.append((image.settings_offset, settings_file))
+    if image.nvs_size:
+        pairs.append((image.nvs_offset, blank_file(image.nvs_size)))
+    argv = [*_esptool(), "--chip", image.chip, "--port", job.port,
+            "--baud", str(FLASH_BAUD), "--before", "default-reset",
+            "--after", "hard-reset", "write-flash",
+            "--flash-mode", image.flash_mode, "--flash-freq", image.flash_freq,
+            "--flash-size", image.flash_size]
+    for offset, path in sorted(pairs):
+        argv += [hex(offset), str(path)]
+    return argv
 
 
-def _idf_shell(export_sh: Path, command: list[str]) -> list[str]:
-    script = (f". {shlex.quote(str(export_sh))} >/dev/null 2>&1 || "
-              f"{{ echo 'ESP-IDF export.sh failed to load' >&2; exit 97; }}; "
-              f"exec {shlex.join(command)}")
-    return ["bash", "-c", script]
-
-
-# -- Windows: capture export.bat's environment once ---------------------------
-
-ENV_MARKER = "__CSIDETECTOR_IDF_ENV__"
-
-
-@dataclasses.dataclass
-class IdfEnv:
-    """ESP-IDF's environment as export.bat sets it up, and what to run."""
-    env: dict
-    python: str            # IDF's own python.exe
-    idf_py: Path           # %IDF_PATH%\\tools\\idf.py
-
-
-_IDF_ENV_CACHE: dict[str, tuple[float, IdfEnv]] = {}
-
-
-# Run by the python export.bat puts first on PATH. It must be ESP-IDF's
-# own (it can import esptool): export.bat can exit 0 after failing to
-# find IDF's virtualenv, leaving the host's python in front. JSON with
-# ensure_ascii keeps the dump ASCII — `set` would print in the console's
-# code page, mangling e.g. a user name with an accent in TEMP.
-_DUMP_ENV = ("import json,os,sys,esptool;"
-             f"print('{ENV_MARKER}'+json.dumps({{'env':dict(os.environ),"
-             "'python':sys.executable}))")
-
-
-def env_capture_command(export_bat: Path) -> tuple[list[str], str]:
-    """(argv, native command line) for cmd.exe: run export.bat (its output
-    shows in the log), then have IDF's python print the environment.
-
-    The native command line is passed verbatim (QProcess.setNativeArguments):
-    cmd.exe doesn't follow the quoting rules other programs use, so a path
-    with spaces would otherwise break."""
-    native = (f'/d /s /c "call "{export_bat}" || (echo ESP-IDF export.bat failed '
-              f'to load & exit /b 97) & python -c "{_DUMP_ENV}""')
-    return ["cmd.exe"], native
-
-
-def windows_export_env(export_bat: Path, base: dict) -> dict:
-    """The environment to run export.bat in. export.bat needs python and git
-    on PATH, and finds IDF's virtualenv under IDF_TOOLS_PATH; the ESP-IDF
-    Tools Installer's own shortcut adds its bundled ones first. For that
-    layout (<root>\\frameworks\\esp-idf-v*\\export.bat), do the same. MSYSTEM
-    (set in Git Bash / MSYS2) makes export.bat refuse to run at all."""
-    env = dict(base)
-    for key in [k for k in env if k.upper() == "MSYSTEM"]:
-        del env[key]
-    framework = Path(export_bat).parent
-    if framework.parent.name.lower() != "frameworks":
-        return env
-    root = framework.parent.parent
-    if not _env_get(env, "IDF_TOOLS_PATH"):
-        env["IDF_TOOLS_PATH"] = str(root)
-    key = next((k for k in env if k.upper() == "PATH"), "PATH")
-    path = [p for p in env.get(key, "").split(";") if p]     # Windows separator
-    venv = _env_get(env, "IDF_PYTHON_ENV_PATH")
-    if venv and _ntnorm(ntpath.join(venv, "Scripts")) in {_ntnorm(p) for p in path}:
-        # Started from an "ESP-IDF CMD" prompt: IDF's virtualenv is already
-        # first on PATH and export.bat won't add it again, so the bare
-        # installer python must not go in front of it.
-        return env
-    # export.bat finds the virtualenv under IDF_TOOLS_PATH (the installer
-    # keeps it in the registry, so it can name another root).
-    front = _installer_python(root, Path(_env_get(env, "IDF_TOOLS_PATH")), framework.name)
-    front += _newest(glob.glob(os.path.join(root, "tools", "idf-git", "*", "cmd")),
-                     lambda p: os.path.basename(os.path.dirname(p)))
-    if front:
-        env[key] = ";".join(front + path)
-    return env
-
-
-def _ntnorm(path: str) -> str:
-    return ntpath.normcase(ntpath.normpath(path))
-
-
-def _installer_python(root: Path, tools_path: Path, framework_name: str) -> list[str]:
-    """The ESP-IDF Tools Installer's python for this ESP-IDF: export.bat
-    looks for the virtualenv named after the python it runs under
-    (<tools_path>\\python_env\\idf5.2_py3.11_env), so with several installer
-    generations under one root (3.8 for IDF 4.4, 3.11 for 5.x) the one with
-    a matching virtualenv is the one to use; else the newest."""
-    pythons = glob.glob(os.path.join(root, "tools", "idf-python", "*"))
-    if not pythons:
-        return []
-    m = re.search(r"esp-idf-v(\d+\.\d+)", framework_name)
-    if m:
-        venvs = glob.glob(os.path.join(tools_path, "python_env", f"idf{m.group(1)}_py*_env"))
-        wanted = {w for v in venvs for w in re.findall(r"_py(\d+\.\d+)_env$", v)}
-        matching = [p for p in pythons
-                    if ".".join(os.path.basename(p).split(".")[:2]) in wanted]
-        if matching:
-            return _newest(matching, os.path.basename)
-    return _newest(pythons, os.path.basename)
-
-
-def _newest(paths: list[str], name_of) -> list[str]:
-    """The path whose version-like name is highest (as a list: [] if none).
-    A string sort would put 3.8.7 after 3.11.2."""
-    if not paths:
-        return []
-    return [max(paths, key=lambda p: tuple(int(n) for n in re.findall(r"\d+", name_of(p))))]
-
-
-def _env_get(env: dict, key: str) -> str:
-    """Windows environment names are case-insensitive (``set`` prints Path)."""
-    for k, v in env.items():
-        if k.upper() == key.upper():
-            return v
-    return ""
-
-
-def parse_env_dump(output: str) -> Optional[IdfEnv]:
-    """The IdfEnv from env_capture_command's output, or None if the dump
-    isn't there (export.bat failed, or the python it left first on PATH
-    isn't IDF's) or names no IDF_PATH."""
-    if ENV_MARKER not in output:
-        return None
-    line = output.split(ENV_MARKER, 1)[1].splitlines()[0]
-    try:
-        data = json.loads(line)
-        env = {str(k): str(v) for k, v in data["env"].items()}
-        python = str(data["python"])
-    except (ValueError, KeyError, TypeError, AttributeError, IndexError):
-        return None
-    idf_path = _env_get(env, "IDF_PATH")
-    if not idf_path or not python:
-        return None
-    return IdfEnv(env, python, Path(idf_path) / "tools" / "idf.py")
-
-
-def cached_idf_env(export_bat: Path) -> Optional[IdfEnv]:
-    """The captured environment for this export.bat, unless it changed."""
-    key = str(Path(export_bat))
-    try:
-        mtime = Path(export_bat).stat().st_mtime
-    except OSError:
-        return None
-    hit = _IDF_ENV_CACHE.get(key)
-    return hit[1] if hit and hit[0] == mtime else None
-
-
-def remember_idf_env(export_bat: Path, idf: IdfEnv) -> None:
-    try:
-        _IDF_ENV_CACHE[str(Path(export_bat))] = (Path(export_bat).stat().st_mtime, idf)
-    except OSError:
-        pass
-
-
-def _flash_args(job: FlashJob) -> list[str]:
-    defaults = f"{job.project_dir / 'sdkconfig.defaults'};{job.overlay_path}"
-    return [
-        "-C", str(job.project_dir),
-        "-B", str(job.build_dir),
-        "-D", f"SDKCONFIG={job.sdkconfig_path}",
-        "-D", f"SDKCONFIG_DEFAULTS={defaults}",
-        "-D", f"IDF_TARGET={job.target}",
-        "-p", job.port,
-        "flash",
-    ]
-
-
-def flash_command(job: FlashJob, export_sh: Path,
-                  idf: Optional[IdfEnv] = None) -> list[str]:
-    """``idf: IdfEnv`` on Windows (run directly in the captured environment);
-    otherwise through bash and export.sh."""
-    if idf is not None:
-        return [idf.python, str(idf.idf_py), *_flash_args(job)]
-    return _idf_shell(export_sh, ["idf.py", *_flash_args(job)])
-
-
-def identify_command(port: str, export_sh: Path, esptool_cmd: str = "read_mac",
-                     idf: Optional[IdfEnv] = None) -> list[str]:
-    """esptool read_mac through IDF's Python (which ships esptool).
-
-    ``read_mac`` works on esptool v4 and v5 (v5 also accepts
-    ``read-mac``); callers retry with the dashed form if a future
-    esptool drops the underscore alias ("invalid choice").
-    """
-    if idf is not None:
-        return [idf.python, "-m", "esptool", "--port", port, esptool_cmd]
-    return _idf_shell(export_sh, [
-        "python", "-m", "esptool", "--port", port, esptool_cmd,
-    ])
+def identify_command(port: str) -> list[str]:
+    """esptool read-mac: prints the chip type and the factory MAC."""
+    return [*_esptool(), "--port", port, "read-mac"]
 
 
 def descendant_pids(root: int, proc_dir: str = "/proc") -> list[int]:
@@ -668,18 +504,12 @@ def terminate_tree(root: int, sig: int = 15) -> None:
 # Output parsing
 # --------------------------------------------------------------------------
 
-_BUILD_STEP_RE = re.compile(r"^\[(\d+)/(\d+)\]")
 _FLASH_PCT_RE = re.compile(
     r"Writing at 0x[0-9a-fA-F]+.*?(\d{1,3}(?:\.\d+)?)\s*%")
 
 
 def parse_progress(line: str) -> Optional[tuple[str, int]]:
-    """("build", pct) for ninja steps, ("flash", pct) for esptool writes."""
-    m = _BUILD_STEP_RE.match(line)
-    if m:
-        done, total = int(m.group(1)), int(m.group(2))
-        if total > 0:
-            return "build", min(100, done * 100 // total)
+    """("flash", pct) for esptool's write progress (per file written)."""
     m = _FLASH_PCT_RE.search(line)
     if m:
         return "flash", min(100, int(float(m.group(1))))
@@ -691,27 +521,21 @@ _HINTS = [
                 r"|multiple access on port|Access is denied", re.I),
      "The serial port is busy, unplugged, or not permitted. Close anything "
      "else using it (the alert monitor, a serial monitor such as PuTTY or "
-     "the Arduino IDE, `idf.py monitor`, the heatmap) and check the cable."
+     "the Arduino IDE, the heatmap) and check the cable."
      + ("" if IS_WINDOWS else " On Linux your user also needs to be in the "
         "`dialout` group.")),
-    (re.compile(r"Failed to connect to ESP32|No serial data received|"
+    (re.compile(r"Failed to connect to (?:ESP32|Espressif)|No serial data received|"
                 r"Wrong boot mode detected", re.I),
      "The chip didn't enter download mode. Hold BOOT, tap RESET (or "
      "unplug and replug while holding BOOT), release BOOT, then retry."),
-    (re.compile(r"No module named 'click'|idf\.py: command not found|"
-                r"ESP-IDF export\.(?:sh|bat) failed|is not recognized as an internal"
-                r"|No module named '?esptool'?", re.I),
-     f"ESP-IDF's environment didn't load. Check the {EXPORT_NAME} path in "
-     f"the setup window, or run ESP-IDF's "
-     f"{'install.bat' if IS_WINDOWS else 'install.sh'} once"
-     + (" (or use the ESP-IDF Tools Installer)." if IS_WINDOWS else ".")),
-    (re.compile(r"This chip is ESP32[-\w]*,? not ESP32|Wrong --chip argument", re.I),
-     "The board is a different chip than the firmware was built for (was "
-     "it swapped?). Click Identify, or just Flash again: an unidentified "
-     "board is identified before building."),
-    (re.compile(r"Target settings are not consistent", re.I),
-     f"The cached build was configured for another chip. Delete "
-     f"{cache_root()} and retry."),
+    (re.compile(r"No module named '?esptool'?", re.I),
+     "esptool isn't installed for this Python. "
+     + ("Run setup-windows.bat again (it installs it)." if IS_WINDOWS else
+        "Run: python -m pip install -r requirements.txt (in the host folder).")),
+    (re.compile(r"This chip is ESP32[-\w]*,? not ESP32|Wrong (?:--)?chip argument", re.I),
+     "The board is a different chip than the one selected (was it "
+     "swapped?). Click Identify, or just Flash again: an unidentified "
+     "board is identified first."),
 ]
 
 
