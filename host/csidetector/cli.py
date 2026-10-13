@@ -132,6 +132,11 @@ def cmd_alert_gui(args: argparse.Namespace) -> int:
     )
 
 
+def cmd_setup(args: argparse.Namespace) -> int:
+    from csidetector.provision.gui import run_setup_gui
+    return run_setup_gui(idf_export=args.idf_export, wizard=args.wizard)
+
+
 def cmd_heatmap(args: argparse.Namespace) -> int:
     from csidetector.modes.localize import heatmap
     return heatmap.run_heatmap(args.source, args.links,
@@ -388,6 +393,15 @@ def _attach_alert_gui(p: argparse.ArgumentParser) -> None:
     p.set_defaults(func=cmd_alert_gui)
 
 
+def _attach_setup(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--idf-export", default=None,
+                   help="path to ESP-IDF's export.sh (default: $IDF_EXPORT, "
+                        "$IDF_PATH/export.sh, or ~/esp/esp-idf/export.sh)")
+    p.add_argument("--wizard", action="store_true",
+                   help="open the step-by-step setup wizard straight away")
+    p.set_defaults(func=cmd_setup)
+
+
 def _attach_heatmap(p: argparse.ArgumentParser) -> None:
     p.add_argument("source", help="udp:<port> typically")
     p.add_argument("--links", required=True,
@@ -495,6 +509,9 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- Top-level back-compat aliases (existing scripts keep working) ----
     _attach_capture(sub.add_parser("capture",
                                    help="dump raw CSI lines to a log file"))
+    _attach_setup(sub.add_parser("setup",
+                                 help="setup GUI: device inventory + one-click "
+                                      "firmware flashing"))
     _attach_calibrate(sub.add_parser("calibrate",
                                      help="alert-mode: estimate still-room baseline"))
     _attach_detect(sub.add_parser("detect",
