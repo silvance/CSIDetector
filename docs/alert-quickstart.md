@@ -9,12 +9,14 @@ reading and follow it linearly; troubleshooting is in §11 at the end.
 
 ## 0. What you need (5 min)
 
-- 2× ESP32-S3 dev boards (one TX, one RX) and 2× USB-C cables
-- A computer (Linux / macOS) with Python ≥3.11 and Docker (for tests, optional)
+- 2× ESP32 dev boards (S3, C3, C5, C6 or classic ESP32; one TX, one RX)
+  and 2× USB data cables
+- A computer (Linux / macOS / Windows) with Python ≥3.11
 - A phone with the [Telegram](https://telegram.org/) app installed
-- ESP-IDF v5.3+ installed and working (the `idf.py` command exists). If
-  not, install it: <https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/get-started/index.html>
-- This repo cloned somewhere
+- This repo cloned (or downloaded) somewhere
+
+No ESP-IDF or other firmware tools: the setup app flashes the prebuilt
+firmware itself.
 
 That's it. No hotspot, no router config, no Wi-Fi credentials anywhere.
 
@@ -44,68 +46,40 @@ the bot — go back to step 2.1.
 
 ---
 
-## 3. Flash the transmitter (3 min)
-
-1. Plug **only the TX board** in. Note its `/dev/ttyACM*` (Linux) or
-   `/dev/cu.usbmodem*` (macOS).
-2. From repo root:
-   ```sh
-   ./idf-env.sh csi_transmitter
-   idf.py set-target esp32s3
-   idf.py menuconfig
-   ```
-3. In menuconfig, navigate to `CSI Transmitter Configuration`:
-   - `CSI_TX_CHANNEL`: leave at default (11)
-   - `CSI_TX_RATE_HZ`: leave at default (100)
-4. Save (`S`), exit (`Q`).
-5. Flash + watch boot:
-   ```sh
-   idf.py -p /dev/ttyACM0 flash monitor
-   ```
-6. **Copy the line that starts `TX up: mac=`.** You need this MAC for
-   step 4.3. Example output:
-   ```
-   I (412) csi_tx: TX up: mac=ac:a7:04:2c:42:54 ch=11 rate=100Hz
-   ```
-7. `Ctrl-]` to exit monitor. Unplug TX.
-
-## 4. Flash the receiver (3 min)
-
-1. Plug **only the RX board** in.
-2. From repo root:
-   ```sh
-   ./idf-env.sh csi_receiver
-   idf.py set-target esp32s3
-   idf.py menuconfig
-   ```
-3. In menuconfig, navigate to `CSI Receiver Configuration`:
-   - `CSI_RX_CHANNEL`: must match TX (11)
-   - `CSI_RX_FILTER_TX_MAC`: paste the TX MAC from step 3.6
-   - `CSI_RX_WIFI_SSID`: **leave blank** ← this is what makes it
-     UART-mode instead of hotspot-mode
-4. Save, exit.
-5. Flash + monitor:
-   ```sh
-   idf.py -p /dev/ttyACM0 flash monitor
-   ```
-6. You should see lines starting with `CSI_DATA,` streaming past at
-   ~100/s. If yes: TX is broadcasting and RX is hearing it. **Hit
-   `Ctrl-]` to exit.**
-7. **Plug the TX into a USB charger** (any phone charger works). It
-   needs power but not the host. Place it 2-3 m from where the RX
-   will sit.
-
-If step 4.6 shows no `CSI_DATA,` lines after 30 seconds, jump to §11.
-
----
-
-## 5. Set up the host (2 min)
+## 3. Set up the host (2 min)
 
 ```sh
 cd host
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+(Windows: double-click `setup-windows.bat` instead; it does this and
+opens the setup app.)
+
+## 4. Flash both boards (3 min)
+
+1. Start the setup app: `python run.py setup`.
+2. Plug in the **TX board**. Select its row (the chip and MAC show up;
+   for a board on a USB-serial adapter click **Identify**), type a
+   **Label** such as `Desk TX`, pick **Transmitter (TX)**, and click
+   **Flash selected board**. The channel defaults to 11.
+3. Plug in the **RX board**, select it, label it, pick **Receiver —
+   alert mode (USB only)** and flash it. Its TX MAC filter is filled in
+   with the transmitter you just flashed.
+4. **Plug the TX into a USB charger** (any phone charger works). It
+   needs power but not the host. Place it 2-3 m from where the RX
+   will sit. The RX stays plugged into this computer.
+
+(`python run.py setup --wizard` walks through the same flashing and then
+also does steps 6–7 for you.)
+
+## 5. Check the receiver hears the transmitter (1 min)
+
+Step 7's calibration reports how many CSI samples it got. If it says
+there's no CSI data after 30 seconds, jump to §11.
+
+---
 
 ## 6. Configure Telegram alerts
 
@@ -187,16 +161,15 @@ them try.
 
 ## 11. Troubleshooting
 
-### No `CSI_DATA,` lines from the RX (step 4.6)
+### No CSI data from the RX (step 5)
 
-- TX is on a different channel than RX. Re-run `idf.py menuconfig` on
-  both, confirm `CSI_TX_CHANNEL` == `CSI_RX_CHANNEL`.
-- TX MAC mismatch. The RX only forwards CSI from frames whose source
-  MAC is in `CSI_RX_FILTER_TX_MAC`. Re-flash the TX with monitor and
-  copy the MAC again — case-sensitive only for hex digits.
+- TX is on a different channel than RX. In the setup app's device list,
+  check both were flashed with the same channel; reflash one if not.
+- TX MAC mismatch. The RX only forwards CSI from the transmitters in its
+  TX MAC filter. Reflash the RX with **Use registered TXs**.
 - TX is unpowered. Look for the blue boot LED on the TX.
-- RX is in Wi-Fi-STA mode by accident. Confirm `CSI_RX_WIFI_SSID` is
-  **empty**, not the literal string `""` or `CSIDetector`.
+- RX was flashed in localize (hotspot) mode by accident. Reflash it as
+  **Receiver — alert mode (USB only)**.
 
 ### Calibration baseline is < 0.001 or > 1.0 (step 7.2)
 
@@ -242,12 +215,6 @@ them try.
 - The RX is in an EMI hot zone (next to a 3D printer, microwave, USB3
   hub, switching power supply, fluorescent ballast). Move it.
 - The baseline drifted because the RF environment changed. Re-run §7.
-
-### "command not found: idf.py"
-
-- ESP-IDF isn't on PATH. Run `./idf-env.sh` from repo root — it sources
-  `~/esp/esp-idf/export.sh` for you. If your IDF lives elsewhere,
-  set `IDF_EXPORT=/path/to/your/export.sh ./idf-env.sh`.
 
 ---
 

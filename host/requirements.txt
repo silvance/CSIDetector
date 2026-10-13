@@ -1,5 +1,7 @@
 numpy>=1.24
 pyserial>=3.5
+# Flashes the prebuilt firmware (firmware/prebuilt) from the setup app.
+esptool>=5.0,<6
 matplotlib>=3.7
 # matplotlib needs an interactive backend for the live viewer; ship one
 # explicitly so a fresh "pip install -r requirements.txt" produces a

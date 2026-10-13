@@ -43,45 +43,42 @@ build.
 
 ### Hardware
 
-- **TX**: ESP32-S3 board (1 minimum; 2+ for localize). The S2 / C3 / C5
-  also work in principle but the firmware has only been exercised on S3.
-- **RX**: ESP32-S3 board (1 for alert; 4+ for localize).
+- **TX**: an ESP32-S3, C3, C5, C6 or classic ESP32 board (1 minimum; 2+
+  for localize). Most testing so far has been on the S3.
+- **RX**: the same chips (1 for alert; 4+ for localize).
 - **Host**: any computer with Python 3.11+. Localize mode also needs
-  a 2.4 GHz Wi-Fi adapter that supports AP mode (built-in card or any
-  cheap USB dongle).
+  a 2.4 GHz Wi-Fi network the receivers and the host share (a hotspot on
+  the host, or a router).
 
 ### Firmware
 
-Both firmware projects target **ESP-IDF v5.3 or newer** (tested on v5.5).
-A helper script drops you into a subshell with IDF activated:
+You don't need ESP-IDF or any other tool to set boards up: the setup app
+(below) flashes the **prebuilt firmware in `firmware/prebuilt/`** with
+esptool, which comes with the Python requirements. It holds the
+transmitter and receiver for each supported chip; what differs per board
+(label, channel, transmitter MAC filter, hotspot SSID / password / host
+IP) is written into a small settings partition on the board at flash
+time, so nothing is compiled per board.
 
-```sh
-./idf-env.sh csi_transmitter      # TX side
-./idf-env.sh csi_receiver         # RX side
-idf.py set-target esp32s3         # one-time per project
-idf.py menuconfig                 # Wi-Fi creds, channel, MAC filter
-idf.py -p /dev/ttyACM0 flash monitor
-```
+The firmware is built from `firmware/csi_transmitter` and
+`firmware/csi_receiver` (ESP-IDF v5.5) by `scripts/build_firmware.py`.
+The `firmware` GitHub workflow runs it whenever the firmware sources
+change and commits the result to `firmware/prebuilt/`.
 
 The TX firmware pins broadcasts to 11n HT20 MCS0 via
 `esp_now_set_peer_rate_config` — without this, ESP-NOW falls back to
 11b 1 Mbps DSSS (no HT-LTF) and the receiver's CSI engine never fires.
-Note the TX MAC: every receiver needs it in its filter.
+A receiver with no hotspot SSID runs **UART-only** — exactly what alert
+mode wants: it prints CSI rows over USB and the host reads them directly.
 
-Required `menuconfig` values on the receiver depend on which workflow
-you're running:
-
-| Setting | Localize (multi-RX) | Alert (single-RX) |
-|---|---|---|
-| `CSI_RX_CHANNEL` | matches TX (e.g. 11) | matches TX (e.g. 11) |
-| `CSI_RX_FILTER_TX_MAC` | comma-separated TX MAC list | the one TX's MAC |
-| `CSI_RX_WIFI_SSID` | `CSIDetector` (the hotspot) | **leave blank** |
-| `CSI_RX_WIFI_PASS` | blank (open hotspot) | n/a |
-| `CSI_RX_HOST_IP` | `10.42.0.1` (host on hotspot) | n/a |
-
-Leaving `CSI_RX_WIFI_SSID` blank disables Wi-Fi STA + UDP and falls
-back to **UART-only** mode — exactly what alert mode wants. The receiver
-then prints CSI rows over USB-CDC and the host reads them directly.
+**Working on the firmware itself** (needs ESP-IDF v5.3+): build and flash
+from source as usual (`./idf-env.sh csi_receiver`, then `idf.py
+set-target esp32s3`, `idf.py menuconfig`, `idf.py -p /dev/ttyACM0 flash
+monitor`). The menuconfig values are only defaults: a board the setup
+app has flashed keeps the settings it wrote (`idf.py erase-flash` clears
+them). To flash your own build from the setup app instead, run
+`python scripts/build_firmware.py --out /some/dir` and start the app with
+`CSIDETECTOR_FIRMWARE_DIR=/some/dir`.
 
 ### Host setup
 
@@ -134,29 +131,27 @@ the heatmap can't use (no receivers, a self-crossing outline), and keeps
 a backup of the previous file. After a localize wizard run it opens with
 the new boards marked as not yet placed.
 
-Builds go to `~/.cache/csidetector/firmware/` (on Windows,
-`%LOCALAPPDATA%\csid\fw`) with a generated sdkconfig
-overlay; the firmware projects' own `sdkconfig` files are never modified,
-and reflashing more boards with the same settings skips the rebuild.
-ESP-IDF is found via `$IDF_EXPORT`, `$IDF_PATH`, `~/esp/esp-idf`, or
-(Windows) `C:\Espressif\frameworks\esp-idf-v*`.
+Every flash writes the board's chip-specific firmware and its settings
+in one esptool run; esptool checks that the board really is the chip the
+firmware is for. The **Label** you give a board is stored on it too
+(it prints it at boot). Changing a receiver's Wi-Fi name or password
+means flashing it again from the app (a few seconds; nothing is
+rebuilt). The Wi-Fi password is never saved on this computer: it goes
+straight into the board's settings, through a temporary owner-only file
+that is deleted as soon as esptool is done.
 
 #### On Windows
 
 1. Install **Python 3.11 or newer** from
    [python.org](https://www.python.org/downloads/) and tick *Add python.exe
    to PATH* in the installer.
-2. Install **ESP-IDF v5.x** with Espressif's
-   [Windows installer](https://dl.espressif.com/dl/esp-idf/) (the default
-   `C:\Espressif` location is found automatically).
-3. Put CSIDetector in a folder **without spaces** in its path, e.g.
-   `C:\csidetector` (`git clone`, or download the ZIP and extract it there).
-   ESP-IDF can't build in paths with spaces; the app says so if it is.
-4. Double-click **`setup-windows.bat`**. The first run creates a Python
-   environment and installs the requirements; after that it just opens the
-   setup app.
+2. Get CSIDetector (`git clone`, or download the ZIP and extract it).
+3. Double-click **`setup-windows.bat`**. The first run creates a Python
+   environment and installs the requirements (esptool included); after
+   that it just opens the setup app.
 
-Boards with native USB (ESP32-S3/C3/C5 "USB" port) need no driver. Boards
+No ESP-IDF, Arduino IDE or other tool is needed. Boards with native USB
+(the ESP32-S3/C3/C5/C6 "USB" port) need no driver. Boards
 whose USB goes through a CP210x or CH340 chip may need that chip's driver
 from Silicon Labs or WCH before they show up.
 
@@ -201,7 +196,7 @@ Suite is ~60 tests, runs in <5 seconds.
 ### GUI walkthroughs (setup app)
 
 `host/tests/gui_driver.py` drives the real setup window and wizard
-against simulated boards: fake `idf.py`/esptool read a model of what's
+against simulated boards: a fake esptool reads a model of what's
 plugged in, so flashing runs the app's real process handling. Each step
 saves a screenshot and a text dump of the screen.
 

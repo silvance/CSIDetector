@@ -4,13 +4,14 @@ Runs the real SetupWindow / SetupWizard against a simulated bench:
 
 * Boards are plugged and unplugged in a model: native USB-Serial/JTAG or
   a CP2102 / CH340 / FTDI bridge, any chip, with scripted behaviour
-  ("ok", "no_connect", "busy", "hang", "build_fail"). The app enumerates
+  ("ok", "no_connect", "busy", "hang", "write_fail"). The app enumerates
   them through the real ``list_boards()`` parsing.
-* Fake ``idf.py`` and ``python -m esptool`` executables read that model,
-  so the app's real QProcess path runs end to end: output streaming,
-  progress parsing, failure hints, esptool's wrong-chip error, and
-  Cancel's process-tree kill. Each successful flash records the
-  firmware config the board now carries (``Session.firmware(mac)``).
+* A fake ``esptool`` package (tests/fake_firmware.py, first on
+  PYTHONPATH) reads that model, so the app's real QProcess path runs end
+  to end: output streaming, progress parsing, failure hints, esptool's
+  wrong-chip error, and Cancel's process-tree kill. The app flashes a
+  fake firmware/prebuilt; each successful flash records the settings
+  block the board now carries (``Session.firmware(mac)``).
 * A receiver can stream simulated CSI (``csi(port)``; still or motion),
   read through the collector's real serial loop via a fake
   ``serial.Serial``, so the alert monitor can be calibrated, armed and
@@ -24,7 +25,7 @@ Runs the real SetupWindow / SetupWizard against a simulated bench:
   to ``out_dir``; ``report.md`` indexes them.
 
 Everything the app writes (registry, settings, monitor state, alert.toml,
-links.json, build dirs) goes to a temp dir, never the real home or repo.
+links.json, settings files) goes to a temp dir, never the real home or repo.
 
 Script usage (from host/)::
 
@@ -86,6 +87,7 @@ from csidetector.provision import devices as dv  # noqa: E402
 from csidetector.provision import firmware as fw  # noqa: E402
 from csidetector.provision import gui  # noqa: E402
 from csidetector.provision import wizard as wz  # noqa: E402
+from tests import fake_firmware  # noqa: E402
 
 _REAL_LIST_BOARDS = dv.list_boards
 
@@ -96,7 +98,7 @@ VIA = {
     "ch340": (0x1A86, 0x7523, "USB Serial"),
     "ftdi": (0x0403, 0x6001, "FT232R USB UART"),
 }
-BEHAVIORS = ("ok", "no_connect", "busy", "hang", "build_fail")
+BEHAVIORS = ("ok", "no_connect", "busy", "hang", "write_fail")
 QT_NOISE = ("propagateSizeHints",)
 
 
@@ -136,155 +138,6 @@ class Step:
     problems: list = dataclasses.field(default_factory=list)
 
 
-# --------------------------------------------------------------------------
-# Fake ESP-IDF tools
-# --------------------------------------------------------------------------
-
-_COMMON = r'''
-import json, os, subprocess, sys, time
-BENCH = {bench!r}
-
-def load(name, default):
-    try:
-        with open(os.path.join(BENCH, name)) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return default
-
-CTL = load("control.json", {{}})
-DELAY = float(CTL.get("line_delay", 0.01))
-
-def out(line):
-    print(line, flush=True)
-    time.sleep(DELAY)
-
-PREFIXES = ("C61", "S3", "S2", "C2", "C3", "C5", "C6", "H2", "P4")
-
-def chip_target(chip):
-    chip = chip.upper()
-    for p in PREFIXES:
-        if chip.startswith("ESP32-" + p):
-            return "esp32" + p.lower()
-    return "esp32" if chip.startswith("ESP32") else ""
-
-def target_name(target):
-    return "ESP32" + ("-" + target[5:].upper() if len(target) > 5 else "")
-
-def hard_reset(port):
-    """The chip resets: a native-USB board leaves the bus for a moment."""
-    out("Hard resetting via RTS pin...")
-    os.makedirs(os.path.join(BENCH, "reset"), exist_ok=True)
-    with open(os.path.join(BENCH, "reset", port.replace("/", "_")), "w") as f:
-        f.write(str(time.time()))
-'''
-
-_FAKE_IDF = _COMMON + r'''
-args = sys.argv[1:]
-
-def opt(flag):
-    return args[args.index(flag) + 1] if flag in args else ""
-
-defs = {{}}
-for i, a in enumerate(args):
-    if a == "-D" and i + 1 < len(args) and "=" in args[i + 1]:
-        k, v = args[i + 1].split("=", 1)
-        defs[k] = v
-port = opt("-p")
-target = defs.get("IDF_TARGET", "esp32")
-project = os.path.basename(opt("-C").rstrip("/"))
-board = load("boards.json", {{}}).get(port)
-behavior = board["behavior"] if board else "absent"
-
-out("Executing action: all (aliases: build)")
-out("Running ninja in directory " + opt("-B"))
-for i in range(1, 41):
-    out("[%d/40] Building C object esp-idf/main/CMakeFiles/__idf_main.dir/main.c.obj" % i)
-if behavior == "build_fail":
-    out("FAILED: esp-idf/main/CMakeFiles/__idf_main.dir/main.c.obj")
-    out("main.c:42:5: error: 'CONFIG_CSI_RX_FILTER_TX_MAC' undeclared (first use in this function)")
-    out("ninja: build stopped: subcommand failed.")
-    sys.exit(2)
-out("Project build complete.")
-out("Executing action: flash")
-out("esptool.py --chip %s -p %s -b 460800 write_flash ..." % (target, port))
-out("Serial port " + port)
-if behavior == "busy":
-    out("serial.serialutil.SerialException: [Errno 16] could not open port %s: "
-        "[Errno 16] Device or resource busy: '%s'" % (port, port))
-    sys.exit(1)
-out("Connecting....")
-if behavior in ("absent", "no_connect"):
-    out("A fatal error occurred: Failed to connect to %s: No serial data received."
-        % target_name(target))
-    sys.exit(2)
-chip = board["chip"]
-if chip_target(chip) != target:
-    out("A fatal error occurred: This chip is %s not %s. Wrong --chip argument?"
-        % (target_name(chip_target(chip)), target_name(target)))
-    sys.exit(2)
-out("Chip is %s (revision v0.2)" % chip)
-out("Features: WiFi, BLE")
-out("MAC: " + board["mac"])
-out("Uploading stub...")
-out("Running stub...")
-if behavior == "hang":
-    # esptool, as a grandchild (python, so it exists on Windows too)
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
-    with open(os.path.join(BENCH, "children.txt"), "a") as f:
-        f.write("%d\n" % child.pid)
-    out("Writing at 0x00010000... (10 %)")
-    child.wait()
-    sys.exit(1)
-for pct in range(0, 101, 10):
-    out("Writing at 0x%08x... (%d %%)" % (0x10000 + pct * 0x800, pct))
-out("Wrote 812345 bytes (512345 compressed) at 0x00010000 in 6.1 seconds")
-out("Hash of data verified.")
-hard_reset(port)
-
-cfg = {{}}
-overlay = defs.get("SDKCONFIG_DEFAULTS", "").split(";")[-1]
-try:
-    with open(overlay) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("CONFIG_") and "=" in line:
-                k, v = line.split("=", 1)
-                cfg[k] = "<redacted>" if "PASS" in k else v.strip('"')
-except OSError:
-    pass
-os.makedirs(os.path.join(BENCH, "firmware"), exist_ok=True)
-with open(os.path.join(BENCH, "firmware", board["mac"].replace(":", "") + ".json"), "w") as f:
-    json.dump({{"project": project, "target": target, "port": port, "config": cfg}}, f, indent=1)
-out("Done")
-'''
-
-_FAKE_ESPTOOL = _COMMON + r'''
-args = sys.argv[1:]
-port = args[args.index("--port") + 1] if "--port" in args else ""
-cmd = args[-1] if args else ""
-ok_cmds = ("read-mac",) if CTL.get("esptool_dash_only") else ("read_mac", "read-mac")
-if cmd not in ok_cmds:
-    out("esptool: error: argument operation: invalid choice: '%s'" % cmd)
-    sys.exit(2)
-board = load("boards.json", {{}}).get(port)
-behavior = board["behavior"] if board else "absent"
-out("esptool.py v4.7.0")
-out("Serial port " + port)
-if behavior == "busy":
-    out("serial.serialutil.SerialException: [Errno 16] could not open port %s: "
-        "[Errno 16] Device or resource busy: '%s'" % (port, port))
-    sys.exit(1)
-out("Connecting....")
-if behavior in ("absent", "no_connect"):
-    out("A fatal error occurred: Failed to connect to Espressif device: No serial data received.")
-    sys.exit(2)
-out("Detecting chip type... " + target_name(chip_target(board["chip"])))
-out("Chip is %s (revision v0.2)" % board["chip"])
-out("MAC: " + board["mac"])
-hard_reset(port)
-'''
-
-
 def _alive(pid: int) -> bool:
     """Is the process running (not a zombie)? os.kill(pid, 0) can't be
     used on Windows: signal 0 there is CTRL_C_EVENT."""
@@ -317,11 +170,6 @@ def _kill(pid: int) -> None:
         os.kill(pid, signal.SIGKILL)
     except OSError:
         pass
-
-
-def _write_exe(path: Path, text: str) -> None:
-    path.write_text(text)
-    path.chmod(0o755)
 
 
 # --------------------------------------------------------------------------
@@ -451,7 +299,6 @@ class Session:
         self._sync_bench()
         self.window = gui.SetupWindow(
             dv.Registry(self.home / ".csidetector" / "devices.json"),
-            idf_export=str(self.export_sh),
             list_boards=self._list_boards, detect_hotspots=lambda: list(self.hotspots),
             settings_path=self.home / ".csidetector" / "setup.json")
         self.window.show()
@@ -496,9 +343,14 @@ class Session:
         self._restore.append(lambda: setattr(obj, attr, old))
 
     def _patch_environment(self) -> None:
+        pythonpath = os.pathsep.join(
+            p for p in (str(self._tmp / "fakebin"), os.environ.get("PYTHONPATH")) if p)
         for key, value in (("XDG_CACHE_HOME", str(self._tmp / "cache")),
                            ("HOME", str(self.home)),
-                           ("USERPROFILE", str(self.home))):      # ~ on Windows
+                           ("USERPROFILE", str(self.home)),       # ~ on Windows
+                           ("LOCALAPPDATA", str(self._tmp / "cache")),
+                           ("CSIDETECTOR_FIRMWARE_DIR", str(self._tmp / "prebuilt")),
+                           ("PYTHONPATH", pythonpath)):           # the fake esptool
             old = os.environ.get(key)
             os.environ[key] = value
             self._restore.append(lambda k=key, o=old: os.environ.__setitem__(k, o)
@@ -547,48 +399,9 @@ class Session:
         self._restore.append(lambda: qInstallMessageHandler(None))
 
     def _install_fake_tools(self) -> None:
-        if fw.IS_WINDOWS:
-            self._install_fake_tools_windows()
-            return
-        fakebin = self._tmp / "fakebin"
-        py = sys.executable
-        _write_exe(fakebin / "idf.py",
-                   f"#!{py}\n" + _FAKE_IDF.format(bench=str(self.bench)))
-        _write_exe(fakebin / "fake_esptool.py",
-                   f"#!{py}\n" + _FAKE_ESPTOOL.format(bench=str(self.bench)))
-        _write_exe(fakebin / "python", textwrap.dedent(f"""\
-            #!/bin/sh
-            if [ "$1" = "-m" ] && [ "$2" = "esptool" ]; then
-                shift 2
-                exec {py} {fakebin / 'fake_esptool.py'} "$@"
-            fi
-            exec {py} "$@"
-            """))
-        self.export_sh = self._tmp / "esp-idf" / "export.sh"
-        self.export_sh.parent.mkdir()
-        self.export_sh.write_text(f'export PATH="{fakebin}:$PATH"\n')
+        fake_firmware.make_prebuilt(self._tmp / "prebuilt")
+        fake_firmware.install_esptool(self._tmp / "fakebin", self.bench)
 
-    def _install_fake_tools_windows(self) -> None:
-        """Windows: an export.bat (in a folder with a space, so cmd.exe's
-        quoting is exercised) that sets IDF_PATH to a fake IDF whose
-        tools\\idf.py is the fake, and PYTHONPATH so ``python -m esptool``
-        finds a fake esptool package. The app runs them with the python on
-        the captured PATH, as with real ESP-IDF."""
-        fakeidf = self._tmp / "fake idf"
-        (fakeidf / "tools").mkdir(parents=True)
-        (fakeidf / "tools" / "idf.py").write_text(_FAKE_IDF.format(bench=str(self.bench)))
-        pkg = self._tmp / "fakebin" / "esptool"
-        pkg.mkdir(parents=True)
-        (pkg / "__init__.py").write_text("")
-        (pkg / "__main__.py").write_text(_FAKE_ESPTOOL.format(bench=str(self.bench)))
-        self.export_sh = self._tmp / "esp idf" / "export.bat"
-        self.export_sh.parent.mkdir()
-        self.export_sh.write_text(
-            "@echo off\r\n"
-            "echo Activating ESP-IDF (fake)\r\n"
-            f'set "IDF_PATH={fakeidf}"\r\n'
-            f'set "PYTHONPATH={self._tmp / "fakebin"}"\r\n'
-            f'set "PATH={os.path.dirname(sys.executable)};%PATH%"\r\n')
     # -- the bench -------------------------------------------------------
 
     def plug(self, port: str, chip: str = "ESP32-S3", mac: str = "",
@@ -684,9 +497,8 @@ class Session:
         subcarriers (guard / DC zeroed), amplitude noisier with motion."""
         fwr = self.firmware(self.boards[port].mac) or {}
         cfg = fwr.get("config", {})
-        tx = (cfg.get("CONFIG_CSI_RX_FILTER_TX_MAC", "").split(",")[0].strip()
-              or "aa:bb:cc:dd:ee:ff")
-        channel = cfg.get("CONFIG_CSI_RX_CHANNEL", "11")
+        tx = cfg.get("tx_macs", "").split(",")[0].strip() or "aa:bb:cc:dd:ee:ff"
+        channel = cfg.get("channel", "11")
         sigma = 4.0 if stream["motion"] else 0.6
         iq = []
         for k in range(64):
@@ -699,18 +511,14 @@ class Session:
                   "0", '"' + json.dumps(iq).replace(" ", "") + '"']
         return ",".join(fields) + "\n"
 
-    def esptool_dash_only(self, on: bool = True) -> None:
-        """Simulate an esptool that only accepts ``read-mac``."""
-        self._control["esptool_dash_only"] = on
-        self._sync_bench()
-
     def firmware(self, mac: str) -> Optional[dict]:
-        """What the fake flasher last wrote to this board (password redacted)."""
+        """What the fake esptool last wrote to this board: project, target,
+        port, and ``config`` — the settings block (password redacted)."""
         path = self.bench / "firmware" / (dv.normalize_mac(mac).replace(":", "") + ".json")
         return json.loads(path.read_text()) if path.exists() else None
 
     def leftover_processes(self) -> list[int]:
-        """Fake esptool grandchildren (from behavior="hang") still alive."""
+        """Processes the fake esptool started (behavior="hang") still alive."""
         path = self.bench / "children.txt"
         return [int(pid) for pid in (path.read_text().split() if path.exists() else [])
                 if _alive(int(pid))]

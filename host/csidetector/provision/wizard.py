@@ -50,7 +50,6 @@ def default_host_dir() -> Path:
 class WizardState:
     def __init__(self) -> None:
         self.mode = MODE_ALERT
-        self.export = ""
         self.channel = 11
         self.ssid = ""
         self.password = ""
@@ -107,15 +106,6 @@ def _note() -> QLabel:
     return label
 
 
-def _export_browse_dir() -> str:
-    """Where ESP-IDF usually is, to start the file dialog there."""
-    for d in ((os.path.expandvars(r"%SystemDrive%\Espressif\frameworks"),)
-              if fw.IS_WINDOWS else ()) + (os.path.expanduser("~/esp"),):
-        if os.path.isdir(d):
-            return d
-    return os.path.expanduser("~")
-
-
 def _hint(text: str) -> QLabel:
     label = QLabel(text)
     label.setWordWrap(True)
@@ -127,13 +117,7 @@ class EnvironmentPage(QWizardPage):
     def __init__(self, wiz: "SetupWizard"):
         super().__init__()
         self.wiz = wiz
-        self.setTitle("Environment")
-        self.export_edit = QLineEdit()
-        browse = QPushButton("Browse…")
-        browse.clicked.connect(self._browse)
-        row = QHBoxLayout()
-        row.addWidget(self.export_edit, 1)
-        row.addWidget(browse)
+        self.setTitle("Wi-Fi settings")
         self.channel = QSpinBox()
         self.channel.setRange(1, 13)
 
@@ -150,7 +134,6 @@ class EnvironmentPage(QWizardPage):
         self.port.setRange(1, 65535)
 
         form = QFormLayout(self)
-        form.addRow(f"ESP-IDF {fw.EXPORT_NAME}:", row)
         form.addRow("Wi-Fi channel:", self.channel)
         form.addRow(self.hotspot_status)
         form.addRow("", self.detect_btn)
@@ -162,12 +145,11 @@ class EnvironmentPage(QWizardPage):
         form.addRow(self.note)
         self._form = form
         self._hotspots: list[fw.HotspotInfo] = []
-        for w in (self.export_edit, self.ssid, self.host_ip, self.password):
+        for w in (self.ssid, self.host_ip, self.password):
             w.textChanged.connect(self.completeChanged)
 
     def initializePage(self) -> None:  # noqa: N802
         st = self.wiz.state
-        self.export_edit.setText(st.export)
         self.channel.setValue(st.channel)
         self.ssid.setText(st.ssid)
         self.password.setText(st.password)
@@ -221,36 +203,12 @@ class EnvironmentPage(QWizardPage):
             f"✓ Hotspot '{hs.connection}' on {hs.iface}: SSID {hs.ssid!r}, "
             f"channel {hs.channel or '?'}, this computer is {hs.ip or '?'}.")
 
-    def _browse(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, f"Select ESP-IDF {fw.EXPORT_NAME}", _export_browse_dir(),
-            f"{fw.EXPORT_NAME} ({fw.EXPORT_NAME});;All files (*)")
-        if path:
-            self.export_edit.setText(path)
-
-    def export_path(self) -> Optional[Path]:
-        """export.sh from the field; a folder containing one counts too."""
-        text = self.export_edit.text().strip()
-        if not text:
-            return None
-        path = Path(text).expanduser()
-        if path.is_dir() and (path / fw.EXPORT_NAME).is_file():
-            path = path / fw.EXPORT_NAME
-        return path if path.is_file() else None
-
     def problems(self) -> list[str]:
         out = []
-        text = self.export_edit.text().strip()
-        if self.export_path() is None:
-            if not text:
-                out.append(f"Select ESP-IDF's {fw.EXPORT_NAME} (usually "
-                           f"{fw.EXPORT_EXAMPLE}). If ESP-IDF isn't installed "
-                           "yet, see the README's Firmware section.")
-            elif Path(text).expanduser().is_dir():
-                out.append(f"That folder has no {fw.EXPORT_NAME}. Select the "
-                           f"esp-idf folder, or its {fw.EXPORT_NAME}.")
-            else:
-                out.append(f"No {fw.EXPORT_NAME} at {text}.")
+        try:
+            fw.load_manifest()
+        except fw.FirmwareError as exc:
+            out.append(str(exc))
         if self.wiz.state.mode == MODE_LOCALIZE:
             if not self.ssid.text():
                 out.append("Enter the hotspot's name (SSID).")
@@ -303,7 +261,6 @@ class EnvironmentPage(QWizardPage):
                     "Continue with an open network?")):
             return False
         st = self.wiz.state
-        st.export = str(self.export_path() or self.export_edit.text().strip())
         st.channel = self.channel.value()
         if st.mode == MODE_LOCALIZE:
             st.ssid = self.ssid.text()
@@ -610,19 +567,23 @@ class FlashPage(QWizardPage):
 
     # -- flashing --------------------------------------------------------
 
-    def build_job(self, board: dv.AttachedBoard) -> fw.FlashJob:
+    def build_job(self, board: dv.AttachedBoard, label: str = "") -> fw.FlashJob:
         st = self.wiz.state
+        if not label:                      # the board keeps the name it had
+            mac = self._board_mac(board)
+            rec = self.wiz.registry.get(mac) if mac else None
+            label = rec.label if rec else ""
         if self.role == dv.ROLE_TX:
-            config: fw.Config = fw.TxConfig(channel=st.channel)
+            config: fw.Config = fw.TxConfig(channel=st.channel, label=label)
         else:
-            config = fw.RxConfig(channel=st.channel,
+            config = fw.RxConfig(channel=st.channel, label=label,
                                  tx_macs=list(st.txs)[:fw.MAX_FILTER_MACS])
             if st.mode == MODE_LOCALIZE:
                 config.ssid = st.ssid
                 config.password = st.password
                 config.host_ip = st.host_ip
                 config.host_port = st.host_port
-        # No silent default: flashing an S3 build onto a C3 fails, and an
+        # No silent default: flashing S3 firmware onto a C3 fails, and an
         # unknown chip is identified before we get here.
         return fw.FlashJob(port=board.port, config=config,
                            target=dv.chip_to_target(self._board_chip(board)))
@@ -650,7 +611,7 @@ class FlashPage(QWizardPage):
         self.progress.setVisible(True)
 
     def _not_flashed(self, text: str) -> None:
-        """Clear a stale "Identifying…"/"Building…" after we stop short."""
+        """Clear a stale "Identifying…"/"Flashing…" after we stop short."""
         self.status.setText(text)
         self.progress.setValue(0)
         self.progress.setVisible(False)
@@ -660,8 +621,7 @@ class FlashPage(QWizardPage):
         self._set_running("Identifying the chip…")
         self._identifying = (board, label, then_flash)
         try:
-            self.wiz.flasher.identify(board.port, board.usb_serial,
-                                      Path(self.wiz.state.export).expanduser())
+            self.wiz.flasher.identify(board.port, board.usb_serial)
         except RuntimeError as exc:
             self._identifying = (None, "", False)
             self._not_flashed("Couldn't identify the chip")
@@ -705,16 +665,16 @@ class FlashPage(QWizardPage):
                 self.log.appendPlainText(f"[hint] {hint}")
             QMessageBox.warning(
                 self, "Couldn't identify the chip",
-                "The wizard needs to know which ESP32 this is to build the right "
+                "The wizard needs to know which ESP32 this is to flash the right "
                 "firmware.\n\n" + ("\n\n".join(hints) if hints else
                                    "See the log for details."))
 
     def _flash_board(self, board: dv.AttachedBoard, label: str) -> None:
-        job = self.build_job(board)
+        job = self.build_job(board, label)
         errors = job.validate()
         if job.target not in fw.TARGETS:
             errors = [f"{self._board_chip(board) or 'This chip'} isn't supported "
-                      f"by this firmware (supported: {', '.join(fw.TARGETS)})."]
+                      f"(supported: {fw.supported_chips()})."]
         if errors:
             self._not_flashed("Not flashed")
             QMessageBox.warning(self, "Can't flash", "\n\n".join(errors))
@@ -742,11 +702,10 @@ class FlashPage(QWizardPage):
                 self._not_flashed("Not flashed")
                 return
         self.log.clear()
-        self._set_running("Building…")
+        self._set_running("Flashing…")
         self._flashing = (board, label)
         try:
-            self.wiz.flasher.flash(job, Path(self.wiz.state.export).expanduser(),
-                                   inferred_mac=mac, inferred_chip=board.chip)
+            self.wiz.flasher.flash(job, inferred_mac=mac, inferred_chip=board.chip)
         except (OSError, ValueError, RuntimeError) as exc:
             self._flashing = (None, "")
             self._not_flashed("Can't flash")
@@ -760,7 +719,7 @@ class FlashPage(QWizardPage):
 
     def _on_progress(self, phase: str, pct: int) -> None:
         if self._current():
-            self.status.setText("Building…" if phase == "build" else "Flashing…")
+            self.status.setText("Flashing…")
             self.progress.setValue(pct)
 
     def _on_finished(self, res: FlashResult) -> None:
@@ -1183,7 +1142,6 @@ class SetupWizard(QWizard):
     def __init__(self, registry: dv.Registry,
                  list_boards: Callable[[], list[dv.AttachedBoard]] = dv.list_boards,
                  detect_hotspots: Callable[[], list[fw.HotspotInfo]] = fw.detect_hotspots,
-                 idf_export: str = "",
                  host_dir: Optional[Path] = None,
                  parent: Optional[QWidget] = None,
                  before_alert_apply: Optional[Callable[[], None]] = None):
@@ -1208,8 +1166,6 @@ class SetupWizard(QWizard):
         # identifying them here (their USB serial isn't the MAC). Shared by
         # both flash pages.
         self.bridge_ports: dict[str, str] = {}
-        found = fw.find_idf_export()
-        self.state.export = idf_export or (str(found) if found else "")
         # What the caller should do after accept().
         self.open_monitor = False
         self.alert_config_path = ""

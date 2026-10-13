@@ -19,22 +19,17 @@ POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX-only (bash, file 
 REPO_FIRMWARE = fw.repo_firmware_root()
 
 
-def _kconfig_symbols(project: str) -> set[str]:
-    text = (REPO_FIRMWARE / project / "main" / "Kconfig.projbuild").read_text()
-    return set(re.findall(r"^config\s+(\w+)", text, re.MULTILINE))
-
-
 # --------------------------------------------------------------------------
 # Configs
 # --------------------------------------------------------------------------
 
-def test_kconfig_symbols_exist_in_firmware():
-    """Generated keys must match the firmware's Kconfig exactly —
-    a typo here silently flashes the default value instead."""
-    tx_keys = set(fw.TxConfig().kconfig())
-    rx_keys = set(fw.RxConfig(ssid="CSIDetector").kconfig())
-    assert tx_keys <= _kconfig_symbols("csi_transmitter")
-    assert rx_keys <= _kconfig_symbols("csi_receiver")
+def test_settings_keys_are_ones_the_firmware_reads():
+    """A key the firmware's parser doesn't know is silently ignored there,
+    so a typo here would flash the default value instead."""
+    parser = (REPO_FIRMWARE / "components" / "csi_settings" / "csi_settings_parse.c").read_text()
+    known = set(re.findall(r'KEY\("(\w+)"\)', parser))
+    assert set(fw.TxConfig().settings()) <= known
+    assert set(fw.RxConfig(ssid="CSIDetector").settings()) <= known
 
 
 def test_tx_config_validation():
@@ -46,10 +41,10 @@ def test_tx_config_validation():
 def test_rx_uart_only_leaves_hotspot_settings_unset():
     cfg = fw.RxConfig(tx_macs=["A0F262F039D8"])
     assert cfg.validate() == []
-    k = cfg.kconfig()
-    assert k["CSI_RX_WIFI_SSID"] == ""
-    assert k["CSI_RX_FILTER_TX_MAC"] == "a0:f2:62:f0:39:d8"
-    assert "CSI_RX_HOST_IP" not in k
+    k = cfg.settings()
+    assert k["ssid"] == "" and k["password"] == ""
+    assert k["tx_macs"] == "a0:f2:62:f0:39:d8"
+    assert "host_ip" not in k
     assert cfg.summary()["mode"] == "uart"
 
 
@@ -58,10 +53,16 @@ def test_rx_hotspot_config_and_summary_excludes_password():
                       ssid="CSIDetector", password="hunter22",
                       host_ip="10.42.1.1", host_port=5566)
     assert cfg.validate() == []
-    k = cfg.kconfig()
-    assert k["CSI_RX_FILTER_TX_MAC"] == "a0:f2:62:f0:39:d8, ac:a7:04:2c:24:cc"
-    assert k["CSI_RX_HOST_IP"] == "10.42.1.1"
+    k = cfg.settings()
+    assert k["tx_macs"] == "a0:f2:62:f0:39:d8, ac:a7:04:2c:24:cc"
+    assert k["host_ip"] == "10.42.1.1" and k["password"] == "hunter22"
     assert "hunter22" not in repr(cfg.summary())
+
+
+def test_labels_are_cut_to_what_the_board_holds():
+    cfg = fw.TxConfig(label="  " + "Küche " * 20)
+    assert len(cfg.settings()["label"].encode()) <= 63
+    assert fw.TxConfig(label="bad\nlabel").validate()
 
 
 @pytest.mark.parametrize("kwargs,needle", [
@@ -79,145 +80,73 @@ def test_rx_config_validation_errors(kwargs, needle):
 
 
 # --------------------------------------------------------------------------
-# sdkconfig rendering
+# Prebuilt firmware
 # --------------------------------------------------------------------------
 
-def test_render_sdkconfig_escapes_quotes_and_backslashes():
-    text = fw.render_sdkconfig_defaults({"CSI_RX_WIFI_PASS": 'a"b\\c', "N": 5})
-    assert 'CONFIG_CSI_RX_WIFI_PASS="a\\"b\\\\c"' in text
-    assert "CONFIG_N=5" in text
+def test_the_shipped_firmware_is_complete():
+    """firmware/prebuilt (built by CI from the sources) has both projects
+    for every supported chip, intact, with the settings partition."""
+    for target in fw.TARGETS:
+        for project in fw.PROJECTS.values():
+            image = fw.find_image(project, target, REPO_FIRMWARE / "prebuilt")
+            fw.check_image(image)
+            assert image.chip == target
+            assert (image.settings_offset, image.settings_size) == (0xF000, 0x1000)
+            assert (image.nvs_offset, image.nvs_size) == (0x9000, 0x5000)
+            app = max(image.files)
+            assert app[0] == 0x10000 and app[1].name == f"{project}.bin"
 
 
-def test_render_sdkconfig_rejects_newline_injection():
-    with pytest.raises(ValueError):
-        fw.render_sdkconfig_defaults(
-            {"CSI_RX_WIFI_SSID": 'x"\nCONFIG_CSI_RX_HOST_IP="6.6.6.6'})
-
-
-# --------------------------------------------------------------------------
-# Flash job + build dir
-# --------------------------------------------------------------------------
-
-def _job(tmp_path, config, target="esp32s3", port="/dev/ttyACM0"):
-    return fw.FlashJob(port=port, config=config, target=target,
-                       firmware_root=REPO_FIRMWARE, build_root=tmp_path)
-
-
-def test_flash_job_paths_are_per_project_and_target(tmp_path):
-    rx = _job(tmp_path, fw.RxConfig())
-    tx = _job(tmp_path, fw.TxConfig(), target="esp32c3")
-    assert rx.build_dir == tmp_path / "csi_receiver-esp32s3"
-    assert tx.build_dir == tmp_path / "csi_transmitter-esp32c3"
+def test_flash_job_finds_its_image(prebuilt):
+    rx = fw.FlashJob(port="/dev/ttyACM0", config=fw.RxConfig())
+    tx = fw.FlashJob(port="/dev/ttyACM0", config=fw.TxConfig(), target="esp32c5")
     assert rx.validate() == [] and tx.validate() == []
+    assert rx.image().project == "csi_receiver" and tx.image().target == "esp32c5"
+    assert tx.image().files[0][0] == 0x2000           # the C5's bootloader offset
 
 
-def test_flash_job_validate_catches_missing_project(tmp_path):
-    job = fw.FlashJob(port="/dev/ttyACM0", config=fw.TxConfig(),
-                      firmware_root=tmp_path / "nowhere", build_root=tmp_path)
-    assert any("not found" in e for e in job.validate())
+def test_unsupported_or_missing_firmware_is_explained(prebuilt, tmp_path, monkeypatch):
+    job = fw.FlashJob(port="/dev/ttyACM0", config=fw.TxConfig(), target="esp32h2")
+    assert any("ESP32-H2 boards aren't supported" in e for e in job.validate())
+    (prebuilt / "manifest.json").write_text(json.dumps(
+        {"format": fw.MANIFEST_FORMAT, "images": {}}))
+    assert any("no prebuilt csi_transmitter firmware for the ESP32-S3" in e
+               for e in fw.FlashJob(port="x", config=fw.TxConfig()).validate())
+    monkeypatch.setenv("CSIDETECTOR_FIRMWARE_DIR", str(tmp_path / "nowhere"))
+    assert any("firmware is missing" in e
+               for e in fw.FlashJob(port="x", config=fw.TxConfig()).validate())
+    (prebuilt / "manifest.json").write_text('{"format": "csidetector-firmware/9"}')
+    monkeypatch.setenv("CSIDETECTOR_FIRMWARE_DIR", str(prebuilt))
+    with pytest.raises(fw.FirmwareError, match="Update CSIDetector"):
+        fw.load_manifest()
 
 
-@POSIX_ONLY
-def test_prepare_build_dir_reuses_build_when_config_unchanged(tmp_path):
-    job = _job(tmp_path, fw.RxConfig(ssid="CSIDetector", password="hunter22"))
-    assert fw.prepare_build_dir(job) is True
-    mode = stat.S_IMODE(os.stat(job.overlay_path).st_mode)
-    assert mode == 0o600, oct(mode)          # overlay may hold the password
-
-    # Simulate idf.py having generated an sdkconfig from the overlay.
-    job.sdkconfig_path.write_text("CONFIG_FROM_BUILD=y\n")
-    assert fw.prepare_build_dir(job) is False
-    assert job.sdkconfig_path.exists()       # reused → fast reflash
-
-    job.config.channel = 6
-    assert fw.prepare_build_dir(job) is True
-    assert not job.sdkconfig_path.exists()   # forced regeneration
-    assert "CONFIG_CSI_RX_CHANNEL=6" in job.overlay_path.read_text()
-
-
-def test_prepare_build_dir_rebuilds_when_project_defaults_change(tmp_path):
-    """A `git pull` that edits the project's sdkconfig.defaults must reach
-    the cached build — kconfgen would otherwise keep the stale value."""
-    root = tmp_path / "firmware"
-    proj = root / "csi_transmitter"
-    proj.mkdir(parents=True)
-    (proj / "CMakeLists.txt").write_text("")
-    (proj / "sdkconfig.defaults").write_text("CONFIG_A=y\n")
-    job = fw.FlashJob(port="/dev/ttyACM0", config=fw.TxConfig(),
-                      firmware_root=root, build_root=tmp_path / "cache")
-    assert fw.prepare_build_dir(job) is True
-    job.sdkconfig_path.write_text("generated\n")
-    assert fw.prepare_build_dir(job) is False
-
-    (proj / "sdkconfig.defaults").write_text("CONFIG_A=n\n")
-    assert fw.prepare_build_dir(job) is True
-    assert not job.sdkconfig_path.exists()
-
-    # A target-specific defaults file appearing counts too.
-    job.sdkconfig_path.write_text("generated\n")
-    (proj / "sdkconfig.defaults.esp32s3").write_text("CONFIG_B=y\n")
-    assert fw.prepare_build_dir(job) is True
+def test_flash_command_names_the_chip_and_every_part(prebuilt, tmp_path):
+    job = fw.FlashJob(port="COM7", config=fw.TxConfig(), target="esp32")
+    image = job.image()
+    argv = fw.flash_command(job, image, tmp_path / "s.bin")
+    assert argv[:3] == [sys.executable, "-m", "esptool"]
+    assert argv[argv.index("--chip") + 1] == "esp32"     # esptool refuses another chip
+    assert argv[argv.index("--port") + 1] == "COM7"
+    assert "write-flash" in argv and argv[argv.index("--flash-size") + 1] == "2MB"
+    tail = argv[argv.index("2MB") + 1:]
+    assert tail[0::2] == ["0x1000", "0x8000", "0x9000", "0xf000", "0x10000"]
+    assert tail[7] == str(tmp_path / "s.bin")
+    assert Path(tail[5]).read_bytes() == b"\xff" * 0x5000     # NVS blanked
+    assert fw.identify_command("COM7")[-3:] == ["--port", "COM7", "read-mac"]
 
 
 @POSIX_ONLY
-def test_build_dirs_are_private(tmp_path):
-    """Generated sdkconfig / sdkconfig.h hold the hotspot password and are
-    written 0644 by kconfgen, so the directories must block other users."""
-    job = _job(tmp_path / "cache", fw.RxConfig(ssid="X", password="hunter22"))
-    fw.prepare_build_dir(job)
-    assert stat.S_IMODE(os.stat(job.build_dir).st_mode) == 0o700
-    assert stat.S_IMODE(os.stat(job.build_root).st_mode) == 0o700
-
-
-@POSIX_ONLY
-def test_flash_command_quotes_paths_and_keeps_secrets_out(tmp_path):
-    export = tmp_path / "esp idf" / "export.sh"
-    job = _job(tmp_path, fw.RxConfig(ssid="My Hotspot", password="hunter22"))
-    argv = fw.flash_command(job, export)
-    assert argv[:2] == ["bash", "-c"]
-    script = argv[2]
-    tokens = shlex.split(script)
-    assert str(export) in tokens                       # space-safe
-    assert "-p" in tokens and "/dev/ttyACM0" in tokens
-    assert tokens[-1] == "flash"
-    defaults = next(t for t in tokens if t.startswith("SDKCONFIG_DEFAULTS="))
-    assert defaults.endswith(f";{job.overlay_path}")
-    # Wi-Fi credentials go through the 0600 overlay, never argv.
-    assert "hunter22" not in script and "My Hotspot" not in script
-
-
-@POSIX_ONLY
-def test_identify_command_uses_idf_python_esptool(tmp_path):
-    argv = fw.identify_command("/dev/ttyACM0", tmp_path / "export.sh")
-    tokens = shlex.split(argv[2])
-    assert tokens[-6:] == ["python", "-m", "esptool", "--port", "/dev/ttyACM0",
-                           "read_mac"]
-
-
-@POSIX_ONLY
-def test_idf_env_strips_active_venv():
-    base = {
-        "VIRTUAL_ENV": "/home/u/proj/.venv",
-        "PATH": "/home/u/proj/.venv/bin:/usr/local/bin:/usr/bin",
-        "PYTHONHOME": "/x",
-        "HOME": "/home/u",
-    }
-    env = fw.idf_env(base)
-    assert "VIRTUAL_ENV" not in env and "PYTHONHOME" not in env
-    assert env["PATH"] == "/usr/local/bin:/usr/bin"
-    assert env["HOME"] == "/home/u"
-
-
-def test_find_idf_export_priority(tmp_path):
-    explicit = tmp_path / "a" / fw.EXPORT_NAME
-    idf_path = tmp_path / "b"
-    explicit.parent.mkdir()
-    explicit.write_text("")
-    idf_path.mkdir()
-    (idf_path / fw.EXPORT_NAME).write_text("")
-    assert fw.find_idf_export({"IDF_EXPORT": str(explicit),
-                               "IDF_PATH": str(idf_path)}) == explicit
-    assert fw.find_idf_export({"IDF_PATH": str(idf_path)}) == idf_path / fw.EXPORT_NAME
+def test_settings_files_are_private_and_stale_ones_are_cleared(prebuilt, tmp_path):
+    job = fw.FlashJob(port="x", config=fw.RxConfig(ssid="Lab", password="hunter22"))
+    old = fw.write_settings_file(job, job.image())
+    os.utime(old, (0, 0))                      # from a crash long ago
+    new = fw.write_settings_file(job, job.image())
+    assert not old.exists() and new.exists()
+    assert stat.S_IMODE(new.stat().st_mode) == 0o600
+    assert stat.S_IMODE(new.parent.stat().st_mode) == 0o700
+    fw.remove_settings_file(new)
+    assert not new.exists()
 
 
 # --------------------------------------------------------------------------
@@ -225,7 +154,7 @@ def test_find_idf_export_priority(tmp_path):
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("line,expected", [
-    ("[512/1024] Building C object esp-idf/main/CMakeFiles/main.c.obj", ("build", 50)),
+    ("[512/1024] Building C object esp-idf/main/CMakeFiles/main.c.obj", None),
     ("Writing at 0x00010000... (25 %)", ("flash", 25)),
     ("Writing at 0x00010000 [=====>         ]  32.4% 123/456 bytes", ("flash", 32)),
     ("Hash of data verified.", None),
@@ -240,8 +169,6 @@ def test_failure_hints():
         "serial.serialutil.SerialException: could not open port /dev/ttyACM0"))
     assert any("BOOT" in h for h in fw.failure_hints(
         "A fatal error occurred: Failed to connect to ESP32-S3: No serial data received."))
-    assert any(fw.EXPORT_NAME in h for h in fw.failure_hints(
-        f"ESP-IDF {fw.EXPORT_NAME} failed to load"))
     assert any("different chip" in h for h in fw.failure_hints(
         "A fatal error occurred: This chip is ESP32-C3, not ESP32-S3. "
         "Wrong --chip argument?"))
@@ -307,92 +234,6 @@ def test_detect_hotspots_survives_missing_nmcli():
     assert fw.detect_hotspots(run) == []
 
 
-def test_find_idf_export_windows_installer_layout(tmp_path):
-    root = tmp_path / "Espressif" / "frameworks"
-    for v in ("esp-idf-v5.1.2", "esp-idf-v5.2.1", "esp-idf-v5.10.0"):
-        (root / v).mkdir(parents=True)
-        (root / v / "export.bat").write_text("")
-    env = {"IDF_TOOLS_PATH": str(tmp_path / "Espressif"), "SystemDrive": str(tmp_path / "nowhere")}
-    assert fw.find_idf_export(env, windows=True) == root / "esp-idf-v5.10.0" / "export.bat"
-
-
-def test_paths_with_spaces_are_refused(tmp_path):
-    job = _job(tmp_path / "build dir", fw.TxConfig())
-    assert any("path with spaces" in e for e in job.validate())
-
-
-def test_env_dump_parsing():
-    env = {"IDF_PATH": "/opt/idf", "Path": "/bin", "TEMP": "C:\\Users\\José\\Temp"}
-    dump = json.dumps({"env": env, "python": "/opt/idf-env/python.exe"})   # ASCII-only
-    out = f"Activating ESP-IDF 5.5\nnoise=ignored\n{fw.ENV_MARKER}{dump}\n"
-    idf = fw.parse_env_dump(out)
-    assert idf.idf_py == Path("/opt/idf/tools/idf.py") and idf.python == "/opt/idf-env/python.exe"
-    assert idf.env["TEMP"].endswith("José\\Temp") and "noise" not in idf.env
-    assert fw.parse_env_dump("export.bat failed") is None
-    # export.bat "succeeded" but IDF's python wasn't first on PATH: the dump
-    # (which imports esptool) never ran, so there's no marker.
-    assert fw.parse_env_dump("Activating ESP-IDF\nNo module named esptool\n") is None
-    no_idf = json.dumps({"env": {"Path": "/bin"}, "python": "x"})
-    assert fw.parse_env_dump(f"{fw.ENV_MARKER}{no_idf}\n") is None
-
-
-def test_windows_export_env_for_the_installer_layout(tmp_path):
-    root = tmp_path / "Espressif"
-    export = root / "frameworks" / "esp-idf-v5.4.1" / "export.bat"
-    export.parent.mkdir(parents=True)
-    (root / "tools" / "idf-python" / "3.11.2").mkdir(parents=True)
-    (root / "tools" / "idf-git" / "2.44.0" / "cmd").mkdir(parents=True)
-    env = fw.windows_export_env(export, {"Path": "/usr/bin", "MSYSTEM": "MINGW64"})
-    assert "MSYSTEM" not in env                      # export.bat refuses to run with it
-    assert env["IDF_TOOLS_PATH"] == str(root)
-    parts = env["Path"].split(";")
-    assert parts[0].endswith("3.11.2") and parts[1].endswith("cmd") and parts[-1] == "/usr/bin"
-    other = fw.windows_export_env(tmp_path / "esp-idf" / "export.bat", {"PATH": "/bin"})
-    assert other == {"PATH": "/bin"}                 # not the installer layout: as is
-
-
-def test_windows_export_env_picks_the_python_the_idf_virtualenv_was_made_with(tmp_path):
-    """Two installer generations under one root: IDF 4.4's python 3.8 and
-    IDF 5.x's 3.11. export.bat under the wrong one looks for a virtualenv
-    that doesn't exist (idf5.2_py3.8_env), and a string sort puts 3.8.7
-    after 3.11.2."""
-    root = tmp_path / "Espressif"
-    for v in ("3.8.7", "3.11.2"):
-        (root / "tools" / "idf-python" / v).mkdir(parents=True)
-    for v in ("2.9.0", "2.44.0"):
-        (root / "tools" / "idf-git" / v / "cmd").mkdir(parents=True)
-    (root / "python_env" / "idf4.4_py3.8_env").mkdir(parents=True)
-    (root / "python_env" / "idf5.2_py3.11_env").mkdir()
-    for idf in ("esp-idf-v5.2.1", "esp-idf-v4.4.7", "esp-idf-v5.5"):
-        (root / "frameworks" / idf).mkdir(parents=True)
-
-    def front(idf, base=None):
-        env = fw.windows_export_env(root / "frameworks" / idf / "export.bat",
-                                    base or {"Path": "/bin"})
-        return [os.path.basename(os.path.dirname(p)) if p.endswith("cmd")
-                else os.path.basename(p) for p in env["Path"].split(";")[:2]]
-
-    assert front("esp-idf-v5.2.1") == ["3.11.2", "2.44.0"]
-    assert front("esp-idf-v4.4.7") == ["3.8.7", "2.44.0"]
-    assert front("esp-idf-v5.5") == ["3.11.2", "2.44.0"]     # no virtualenv yet: newest
-    # export.bat looks under IDF_TOOLS_PATH when that's set (the installer
-    # keeps it in the registry): a second root with only a 3.8 virtualenv.
-    other = tmp_path / "Other"
-    (other / "python_env" / "idf5.2_py3.8_env").mkdir(parents=True)
-    assert front("esp-idf-v5.2.1", {"Path": "/bin", "IDF_TOOLS_PATH": str(other)}) \
-        == ["3.8.7", "2.44.0"]
-    # Started from an "ESP-IDF 5.2 CMD" prompt: the virtualenv is already
-    # on PATH and export.bat won't re-add it, so nothing goes in front.
-    venv = "C:\\Espressif\\python_env\\idf5.2_py3.11_env"
-    prompt = {"Path": f"{venv}\\scripts;C:\\Windows", "IDF_PYTHON_ENV_PATH": venv}
-    env = fw.windows_export_env(root / "frameworks" / "esp-idf-v5.2.1" / "export.bat", prompt)
-    assert env["Path"] == prompt["Path"] and env["IDF_TOOLS_PATH"] == str(root)
-    # Only the variable set (a hand-made override), nothing on PATH: export.bat
-    # still needs python and git in front.
-    assert front("esp-idf-v5.2.1", {"Path": "C:\\Windows", "IDF_PYTHON_ENV_PATH": venv}) \
-        == ["3.11.2", "2.44.0"]
-
-
 def test_esptool_missing_hint():
-    assert any("environment didn't load" in h for h in fw.failure_hints(
+    assert any("esptool isn't installed" in h for h in fw.failure_hints(
         "C:\\py\\python.exe: No module named esptool"))
