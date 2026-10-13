@@ -102,6 +102,34 @@ The CLI is the same `python run.py …` you've always used; new subcommands
 are added under `localize` and `alert` namespaces and the old top-level
 names (`heatmap`, `detect`, …) continue to work as aliases.
 
+### Setup app (flash and configure without menuconfig)
+
+```sh
+python run.py setup            # device inventory + one-click flashing
+python run.py setup --wizard   # step-by-step: boards → alert or room layout
+```
+
+The **Devices & Flashing** tab lists attached boards with their MACs (read
+from the USB serial number for native-USB boards; **Identify** runs
+esptool for boards behind a USB-UART bridge), keeps a registry of labels
+and roles in `~/.csidetector/devices.json`, and flashes a selected board
+as a transmitter or receiver. The receiver's TX MAC filter fills in from
+registered transmitters. **Detect from hotspot** reads SSID, channel, and
+this computer's hotspot IP from NetworkManager, and the app warns before
+flashing values that can't work (wrong host IP, channel mismatches, empty
+filter).
+
+The **Setup wizard** goes from bare boards to a working sensor: pick
+alert or localize, flash transmitters and receivers, then it writes
+`alert.toml` (alert mode, owner-only) and opens the live monitor, or
+merges the new boards into `links.json` (localize mode) without touching
+the room shape or nodes that are already placed.
+
+Builds go to `~/.cache/csidetector/firmware/` with a generated sdkconfig
+overlay; the firmware projects' own `sdkconfig` files are never modified,
+and reflashing more boards with the same settings skips the rebuild.
+ESP-IDF is found via `$IDF_EXPORT`, `$IDF_PATH`, or `~/esp/esp-idf`.
+
 ### Run the test suite
 
 Locally (uses your venv's matplotlib if installed; skips the matplotlib-

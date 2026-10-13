@@ -134,7 +134,7 @@ def cmd_alert_gui(args: argparse.Namespace) -> int:
 
 def cmd_setup(args: argparse.Namespace) -> int:
     from csidetector.provision.gui import run_setup_gui
-    return run_setup_gui(idf_export=args.idf_export)
+    return run_setup_gui(idf_export=args.idf_export, wizard=args.wizard)
 
 
 def cmd_heatmap(args: argparse.Namespace) -> int:
@@ -397,6 +397,8 @@ def _attach_setup(p: argparse.ArgumentParser) -> None:
     p.add_argument("--idf-export", default=None,
                    help="path to ESP-IDF's export.sh (default: $IDF_EXPORT, "
                         "$IDF_PATH/export.sh, or ~/esp/esp-idf/export.sh)")
+    p.add_argument("--wizard", action="store_true",
+                   help="open the step-by-step setup wizard straight away")
     p.set_defaults(func=cmd_setup)
 
 

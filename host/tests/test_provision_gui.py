@@ -69,6 +69,18 @@ def _select(tab, port_or_mac):
     raise AssertionError(f"no row for {port_or_mac}")
 
 
+def _finish_flash(tab, job, code, output, mac="", chip=""):
+    """Drive the Flasher's completion path as if idf.py had exited."""
+    tab.flasher._pending = {"kind": "flash", "job": job, "mac": mac, "chip": chip}
+    tab.flasher._on_finished(code, output)
+
+
+def _finish_identify(tab, port, usb_serial, code, output, tmp_path):
+    tab.flasher._pending = {"kind": "identify", "port": port, "usb_serial": usb_serial,
+                            "cmd": "read_mac", "export": tmp_path / "export.sh"}
+    tab.flasher._on_finished(code, output)
+
+
 def test_table_lists_attached_and_registered_devices(tab):
     ports = [tab.table.item(i, 0).text() for i in range(tab.table.rowCount())]
     assert ports == ["/dev/ttyACM0", "/dev/ttyUSB0", "(not connected)"]
@@ -167,8 +179,7 @@ def test_successful_flash_records_board(tab):
     assert plan.errors == []
     got = []
     tab.flashed.connect(lambda mac, role: got.append((mac, role)))
-    tab._pending = {"kind": "flash", "job": plan.job, "mac": RX_MAC, "chip": "ESP32-S3"}
-    tab._on_process_finished(0, "Hash of data verified.\n")
+    _finish_flash(tab, plan.job, 0, "Hash of data verified.\n", mac=RX_MAC, chip="ESP32-S3")
     rec = tab.registry.get(RX_MAC)
     assert rec.role == dv.ROLE_TX and rec.firmware == "csi_transmitter"
     assert rec.config == {"channel": 11, "rate_hz": 100} and rec.last_flashed > 0
@@ -181,18 +192,16 @@ def test_failed_flash_shows_hints_without_recording(tab, monkeypatch):
                         lambda *a, **k: shown.append(a[2]))
     _select(tab, "/dev/ttyACM0")
     plan = tab.plan_flash()
-    tab._pending = {"kind": "flash", "job": plan.job, "mac": RX_MAC, "chip": ""}
-    tab._on_process_finished(2, "serial.serialutil.SerialException: could not open port")
+    _finish_flash(tab, plan.job, 2, "serial.serialutil.SerialException: could not open port", mac=RX_MAC, chip="")
     assert tab.registry.get(RX_MAC) is None
     assert shown and "busy" in shown[0]
     assert "[hint]" in tab.log.toPlainText()
 
 
-def test_identify_result_updates_row_and_registry(tab):
+def test_identify_result_updates_row_and_registry(tab, tmp_path):
     _select(tab, "/dev/ttyUSB0")
-    tab._pending = {"kind": "identify", "port": "/dev/ttyUSB0",
-                    "usb_serial": "0001", "cmd": "read_mac"}
-    tab._on_process_finished(0, "Chip is ESP32-S3 (QFN56)\nMAC: 34:85:18:aa:bb:cc\n")
+    _finish_identify(tab, "/dev/ttyUSB0", "0001", 0,
+                     "Chip is ESP32-S3 (QFN56)\nMAC: 34:85:18:aa:bb:cc\n", tmp_path)
     tab._force_refresh()
     row = _select(tab, "/dev/ttyUSB0")
     assert row.mac == "34:85:18:aa:bb:cc" and row.chip == "ESP32-S3"
@@ -203,12 +212,23 @@ def test_identify_result_updates_row_and_registry(tab):
 def test_identify_button_click_runs_read_mac(tab, monkeypatch):
     """Regression: clicked(bool) used to arrive as esptool_cmd=False."""
     started = []
-    monkeypatch.setattr(tab, "_start", lambda argv, phase: started.append(argv))
+    monkeypatch.setattr(tab.flasher._runner, "start",
+                        lambda argv, env: started.append(argv))
     _select(tab, "/dev/ttyUSB0")
     tab.identify_btn.click()
     assert started, "identify did not start"
     assert started[0][-1].endswith("--port /dev/ttyUSB0 read_mac")
-    assert tab._pending["cmd"] == "read_mac"
+    assert tab.flasher._pending["cmd"] == "read_mac"
+
+
+def test_identify_retries_with_dashed_command_on_invalid_choice(tab, monkeypatch, tmp_path):
+    started = []
+    monkeypatch.setattr(tab.flasher._runner, "start",
+                        lambda argv, env: started.append(argv))
+    _finish_identify(tab, "/dev/ttyUSB0", "0001", 2,
+                     "esptool: error: argument operation: invalid choice: 'read_mac'",
+                     tmp_path)
+    assert started and started[0][-1].endswith("--port /dev/ttyUSB0 read-mac")
 
 
 def test_selection_clears_when_selected_board_disappears(qt_app, tmp_path):
@@ -234,8 +254,7 @@ def test_flashing_a_tx_adds_it_to_the_rx_filter(tab):
     _select(tab, "/dev/ttyACM0")
     tab.mode_tx.setChecked(True)
     plan = tab.plan_flash()
-    tab._pending = {"kind": "flash", "job": plan.job, "mac": RX_MAC, "chip": ""}
-    tab._on_process_finished(0, "")
+    _finish_flash(tab, plan.job, 0, "", mac=RX_MAC, chip="")
     assert tab.macs_edit.text() == f"{FAR_TX}, {RX_MAC}"
 
 
@@ -253,8 +272,7 @@ def test_flash_output_mac_wins_over_inferred_mac(tab):
     tab.mode_tx.setChecked(True)
     plan = tab.plan_flash()
     stale = "11:11:11:11:11:11"              # e.g. from an Identify on a swapped board
-    tab._pending = {"kind": "flash", "job": plan.job, "mac": stale, "chip": ""}
-    tab._on_process_finished(0, "Chip is ESP32-S3 (QFN56)\nMAC: 34:85:18:aa:bb:cc\n")
+    _finish_flash(tab, plan.job, 0, "Chip is ESP32-S3 (QFN56)\nMAC: 34:85:18:aa:bb:cc\n", mac=stale, chip="")
     assert tab.registry.get(stale) is None
     rec = tab.registry.get("34:85:18:aa:bb:cc")
     assert rec.role == dv.ROLE_TX and rec.chip == "ESP32-S3"
@@ -264,8 +282,7 @@ def test_bridge_board_flash_registers_mac_without_identify(tab):
     _select(tab, "/dev/ttyUSB0")
     tab.mode_tx.setChecked(True)
     plan = tab.plan_flash()
-    tab._pending = {"kind": "flash", "job": plan.job, "mac": "", "chip": ""}
-    tab._on_process_finished(0, "Chip type:   ESP32-S3 (QFN56)\nMAC:   34:85:18:aa:bb:dd\n")
+    _finish_flash(tab, plan.job, 0, "Chip type:   ESP32-S3 (QFN56)\nMAC:   34:85:18:aa:bb:dd\n", mac="", chip="")
     assert tab.registry.get("34:85:18:aa:bb:dd").role == dv.ROLE_TX
 
 

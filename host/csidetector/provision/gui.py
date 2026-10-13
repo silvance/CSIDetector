@@ -18,6 +18,7 @@ worker threads); output streams into the log pane.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -155,6 +156,142 @@ class ProcessRunner(QObject):
 
 
 # --------------------------------------------------------------------------
+# Flasher: flash / identify orchestration shared by the Devices tab and
+# the setup wizard. Owns the registry writes so there's one source of
+# truth for "what got recorded after a flash".
+# --------------------------------------------------------------------------
+
+@dataclasses.dataclass
+class FlashResult:
+    ok: bool
+    cancelled: bool
+    job: fw.FlashJob
+    mac: str            # MAC recorded in the registry ("" if unknown)
+    chip: str
+    output: str
+    notes: list[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class IdentifyResult:
+    ok: bool
+    cancelled: bool
+    port: str
+    usb_serial: str
+    chip: str
+    mac: str
+    output: str
+
+
+class Flasher(QObject):
+    line = pyqtSignal(str)
+    progress = pyqtSignal(str, int)
+    started = pyqtSignal(str)              # phase label
+    flash_finished = pyqtSignal(object)    # FlashResult
+    identify_finished = pyqtSignal(object) # IdentifyResult
+
+    def __init__(self, registry: dv.Registry, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        self.registry = registry
+        self._runner = ProcessRunner(self)
+        self._runner.line.connect(self.line)
+        self._runner.progress.connect(self.progress)
+        self._runner.finished.connect(self._on_finished)
+        self._pending: Optional[dict] = None
+
+    @property
+    def busy(self) -> bool:
+        return self._runner.running
+
+    def flash(self, job: fw.FlashJob, export: Path,
+              inferred_mac: str = "", inferred_chip: str = "") -> None:
+        """Start flashing. Raises RuntimeError if busy, OSError/ValueError
+        if the build dir can't be prepared (nothing is started then)."""
+        if self.busy:
+            raise RuntimeError("a flash or identify is already running")
+        changed = fw.prepare_build_dir(job)
+        self._pending = {"kind": "flash", "job": job,
+                         "mac": inferred_mac, "chip": inferred_chip}
+        self.line.emit(
+            f"[setup] flashing {job.project} ({job.target}) to {job.port}"
+            + ("" if changed else " — config unchanged, reusing previous build"))
+        self._runner.start(fw.flash_command(job, export), fw.idf_env())
+        self.started.emit("Building…")
+
+    def identify(self, port: str, usb_serial: str, export: Path,
+                 esptool_cmd: str = "read_mac") -> None:
+        if self.busy:
+            raise RuntimeError("a flash or identify is already running")
+        self._pending = {"kind": "identify", "port": port,
+                         "usb_serial": usb_serial, "cmd": esptool_cmd,
+                         "export": export}
+        self.line.emit(f"[setup] identifying {port} …")
+        self._runner.start(fw.identify_command(port, export, esptool_cmd),
+                           fw.idf_env())
+        self.started.emit("Identifying…")
+
+    def cancel(self) -> None:
+        self._runner.cancel()
+
+    def shutdown(self, wait_ms: int = 3000) -> None:
+        if self._runner.running:
+            self._runner.cancel()
+            self._runner.wait(wait_ms)
+
+    def _on_finished(self, code: int, output: str) -> None:
+        pending, self._pending = self._pending, None
+        if pending is None:
+            return
+        cancelled = self._runner.cancelled
+        if pending["kind"] == "identify":
+            if (code != 0 and not cancelled and "invalid choice" in output
+                    and pending["cmd"] == "read_mac"):
+                # A future esptool without the underscore alias.
+                self.identify(pending["port"], pending["usb_serial"],
+                              pending["export"], "read-mac")
+                return
+            chip, mac = dv.parse_esptool_identify(output)
+            ok = code == 0 and bool(mac)
+            if ok:
+                rec = self.registry.get(mac)
+                if rec is None or (chip and rec.chip != chip):
+                    self.registry.upsert(mac, chip=chip or (rec.chip if rec else ""))
+            self.identify_finished.emit(IdentifyResult(
+                ok=ok, cancelled=cancelled, port=pending["port"],
+                usb_serial=pending["usb_serial"], chip=chip, mac=mac,
+                output=output))
+            return
+
+        job: fw.FlashJob = pending["job"]
+        if code != 0:
+            self.flash_finished.emit(FlashResult(
+                ok=False, cancelled=cancelled, job=job, mac="", chip="",
+                output=output))
+            return
+        # esptool prints the chip and MAC as it connects — that's the board
+        # actually written, so it wins over the MAC inferred from the USB
+        # serial or an earlier Identify (stale if a bridge board was
+        # swapped mid-session).
+        out_chip, out_mac = dv.parse_esptool_identify(output)
+        mac = out_mac or pending["mac"]
+        notes = []
+        if out_mac and pending["mac"] and out_mac != pending["mac"]:
+            notes.append(f"esptool reports MAC {out_mac}, not {pending['mac']}; "
+                         f"recording {out_mac}.")
+        chip = out_chip or pending["chip"]
+        if mac:
+            rec = self.registry.get(mac)
+            chip = chip or (rec.chip if rec else "")
+            self.registry.upsert(
+                mac, role=job.role, firmware=job.project,
+                last_flashed=time.time(), config=job.config.summary(),
+                chip=chip)
+        self.flash_finished.emit(FlashResult(
+            ok=True, cancelled=False, job=job, mac=mac, chip=chip,
+            output=output, notes=notes))
+
+
+# --------------------------------------------------------------------------
 # Devices & Flashing tab
 # --------------------------------------------------------------------------
 
@@ -213,12 +350,13 @@ class DevicesTab(QWidget):
         self._table_sig: Optional[str] = None
         # (port, usb_serial) → (chip, mac) learned via esptool.
         self._identified: dict[tuple[str, str], tuple[str, str]] = {}
-        self._pending: Optional[dict] = None
 
-        self._runner = ProcessRunner(self)
-        self._runner.line.connect(self._append_log)
-        self._runner.progress.connect(self._on_progress)
-        self._runner.finished.connect(self._on_process_finished)
+        self.flasher = Flasher(registry, self)
+        self.flasher.line.connect(self._append_log)
+        self.flasher.progress.connect(self._on_progress)
+        self.flasher.started.connect(self._on_started)
+        self.flasher.flash_finished.connect(self._on_flash_finished)
+        self.flasher.identify_finished.connect(self._on_identify_finished)
 
         self._build_ui()
         self._load_settings(idf_export)
@@ -352,7 +490,7 @@ class DevicesTab(QWidget):
         self.flash_btn = QPushButton("Flash selected board")
         self.cancel_btn = QPushButton("Cancel")
         self.flash_btn.clicked.connect(self.flash_selected)
-        self.cancel_btn.clicked.connect(self._runner.cancel)
+        self.cancel_btn.clicked.connect(self.flasher.cancel)
         self.cancel_btn.setEnabled(False)
         actions = QHBoxLayout()
         actions.addStretch(1)
@@ -456,11 +594,11 @@ class DevicesTab(QWidget):
         return MODE_RX_ALERT
 
     def _auto_refresh(self) -> None:
-        if not self._runner.running and self.isVisible():
+        if not self.flasher.busy and self.isVisible():
             self.refresh()
 
     def refresh(self) -> None:
-        if self._runner.running:
+        if self.flasher.busy:
             return      # boards reset/re-enumerate mid-flash; don't flicker
         try:
             boards = self._list_boards()
@@ -553,7 +691,7 @@ class DevicesTab(QWidget):
         self._update_buttons()
 
     def _update_buttons(self) -> None:
-        busy = self._runner.running
+        busy = self.flasher.busy
         row = self._selected_row()
         attached = row is not None and row.board is not None
         self.refresh_btn.setEnabled(not busy)
@@ -754,7 +892,7 @@ class DevicesTab(QWidget):
         return Path(self.export_edit.text().strip()).expanduser()
 
     def flash_selected(self) -> None:
-        if self._runner.running:
+        if self.flasher.busy:
             return
         plan = self.plan_flash()
         if plan.errors:
@@ -773,43 +911,33 @@ class DevicesTab(QWidget):
     def start_flash(self, job: fw.FlashJob) -> None:
         row = self._selected_row()
         board = row.board if row and row.board and row.board.port == job.port else None
-        try:
-            changed = fw.prepare_build_dir(job)
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "Can't flash", f"Could not prepare build: {exc}")
-            return
         self._save_settings()
         self.log.clear()
-        self._append_log(
-            f"[setup] flashing {job.project} ({job.target}) to {job.port}"
-            + ("" if changed else " — config unchanged, reusing previous build"))
-        self._pending = {
-            "kind": "flash", "job": job,
-            "mac": board.mac if board else "",
-            "chip": board.chip if board else "",
-        }
-        self._start(fw.flash_command(job, self._export_path()), "Building…")
+        try:
+            self.flasher.flash(job, self._export_path(),
+                               inferred_mac=board.mac if board else "",
+                               inferred_chip=board.chip if board else "")
+        except (OSError, ValueError, RuntimeError) as exc:
+            QMessageBox.warning(self, "Can't flash", f"Could not start the flash: {exc}")
+            return
+        self._update_buttons()
 
     def identify_selected(self, esptool_cmd: str = "read_mac") -> None:
         row = self._selected_row()
-        if self._runner.running or row is None or row.board is None:
+        if self.flasher.busy or row is None or row.board is None:
             return
         export = self._export_path()
         if not export.is_file():
             QMessageBox.warning(self, "ESP-IDF not found",
                                 "Set the path to esp-idf/export.sh first.")
             return
-        board = row.board
-        self._pending = {"kind": "identify", "port": board.port,
-                         "usb_serial": board.usb_serial, "cmd": esptool_cmd}
-        self._append_log(f"[setup] identifying {board.port} …")
-        self._start(fw.identify_command(board.port, export, esptool_cmd),
-                    "Identifying…")
+        self.flasher.identify(row.board.port, row.board.usb_serial, export,
+                              esptool_cmd)
+        self._update_buttons()
 
-    def _start(self, argv: list[str], phase: str) -> None:
+    def _on_started(self, phase: str) -> None:
         self.progress.setValue(0)
         self.phase_label.setText(phase)
-        self._runner.start(argv, fw.idf_env())
         self._update_buttons()
 
     def _on_progress(self, phase: str, pct: int) -> None:
@@ -819,21 +947,7 @@ class DevicesTab(QWidget):
     def _append_log(self, text: str) -> None:
         self.log.appendPlainText(text)
 
-    def _on_process_finished(self, code: int, output: str) -> None:
-        pending, self._pending = self._pending, None
-        cancelled = self._runner.cancelled
-        if pending is None:
-            self._update_buttons()
-            return
-        if pending["kind"] == "identify":
-            if code != 0 and "invalid choice" in output and pending["cmd"] == "read_mac":
-                # A future esptool without the underscore alias.
-                self._update_buttons()
-                self.identify_selected("read-mac")
-                return
-            self._finish_identify(pending, code, output, cancelled)
-        else:
-            self._finish_flash(pending, code, output, cancelled)
+    def _after_process(self) -> None:
         self._update_buttons()
         # Native-USB boards drop off the bus while resetting; look again
         # once they're back.
@@ -843,57 +957,39 @@ class DevicesTab(QWidget):
         self._table_sig = None
         self.refresh()
 
-    def _finish_identify(self, pending: dict, code: int, output: str,
-                         cancelled: bool) -> None:
-        chip, mac = dv.parse_esptool_identify(output)
-        if code == 0 and mac:
-            self._identified[(pending["port"], pending["usb_serial"])] = (chip, mac)
-            rec = self.registry.get(mac)
-            if rec is None or (chip and rec.chip != chip):
-                self.registry.upsert(mac, chip=chip or (rec.chip if rec else ""))
-            self.phase_label.setText(f"Identified {chip or 'board'} {mac}")
+    def _on_identify_finished(self, res: "IdentifyResult") -> None:
+        if res.ok:
+            self._identified[(res.port, res.usb_serial)] = (res.chip, res.mac)
+            self.phase_label.setText(f"Identified {res.chip or 'board'} {res.mac}")
             self.progress.setValue(100)
-            return
-        self.phase_label.setText("Cancelled" if cancelled else "Identify failed")
-        if not cancelled:
-            self._show_failure("Identify failed", output)
+        else:
+            self.phase_label.setText("Cancelled" if res.cancelled else "Identify failed")
+            if not res.cancelled:
+                self._show_failure("Identify failed", res.output)
+        self._after_process()
 
-    def _finish_flash(self, pending: dict, code: int, output: str,
-                      cancelled: bool) -> None:
-        job: fw.FlashJob = pending["job"]
-        if code == 0:
+    def _on_flash_finished(self, res: "FlashResult") -> None:
+        job = res.job
+        if res.ok:
             self.progress.setValue(100)
             self.phase_label.setText("Flashed ✓")
-            # esptool prints the chip and MAC as it connects. That's the
-            # board that was actually written, so it wins over the MAC we
-            # inferred from the USB serial or an earlier Identify (which
-            # can be stale if a bridge board was swapped mid-session).
-            out_chip, out_mac = dv.parse_esptool_identify(output)
-            mac = out_mac or pending["mac"]
-            if out_mac and pending["mac"] and out_mac != pending["mac"]:
-                self._append_log(f"[setup] note: esptool reports MAC {out_mac}, "
-                                 f"not {pending['mac']}; recording {out_mac}.")
-            if mac:
-                rec = self.registry.get(mac)
-                self.registry.upsert(
-                    mac, role=job.role, firmware=job.project,
-                    last_flashed=time.time(), config=job.config.summary(),
-                    chip=out_chip or pending["chip"] or (rec.chip if rec else ""))
-                self._append_log(f"[setup] recorded {mac} as {job.role.upper()}")
+            for note in res.notes:
+                self._append_log(f"[setup] note: {note}")
+            if res.mac:
+                self._append_log(f"[setup] recorded {res.mac} as {job.role.upper()}")
                 if job.role == dv.ROLE_TX:
-                    self._add_tx_to_filter(mac)
-                self.flashed.emit(mac, job.role)
+                    self._add_tx_to_filter(res.mac)
             else:
                 self._append_log("[setup] flashed OK, but the board's MAC wasn't "
                                  "reported — click Identify to register it.")
-                self.flashed.emit("", job.role)
-            return
-        if cancelled:
+            self.flashed.emit(res.mac, job.role)
+        elif res.cancelled:
             self.phase_label.setText("Cancelled")
             self._append_log("[setup] cancelled")
-            return
-        self.phase_label.setText("Flash failed")
-        self._show_failure("Flash failed", output)
+        else:
+            self.phase_label.setText("Flash failed")
+            self._show_failure("Flash failed", res.output)
+        self._after_process()
 
     def _show_failure(self, title: str, output: str) -> None:
         hints = fw.failure_hints(output)
@@ -906,14 +1002,11 @@ class DevicesTab(QWidget):
 
     @property
     def busy(self) -> bool:
-        return self._runner.running
+        return self.flasher.busy
 
     def shutdown(self) -> None:
         self._timer.stop()
-        if self._runner.running:
-            self._runner.cancel()
-            self._runner.wait(3000)
-
+        self.flasher.shutdown()
 
 # --------------------------------------------------------------------------
 # Main window
@@ -924,12 +1017,50 @@ class SetupWindow(QMainWindow):
                  idf_export: Optional[str] = None, **tab_kwargs):
         super().__init__()
         self.setWindowTitle("CSIDetector Setup")
-        self.resize(980, 860)
+        self.resize(980, 880)
         self.registry = registry or dv.Registry()
+        self._list_boards = tab_kwargs.get("list_boards", dv.list_boards)
+        self._detect_hotspots = tab_kwargs.get("detect_hotspots", fw.detect_hotspots)
         self.devices = DevicesTab(self.registry, idf_export=idf_export, **tab_kwargs)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.devices, "Devices && Flashing")
-        self.setCentralWidget(self.tabs)
+
+        self.wizard_btn = QPushButton("Setup wizard…")
+        self.wizard_btn.setToolTip("Step-by-step: flash a transmitter and receiver, "
+                                   "configure alerts or the room layout.")
+        self.wizard_btn.clicked.connect(lambda: self.open_wizard())
+        header = QHBoxLayout()
+        header.addWidget(QLabel("New sensor? The wizard walks through flashing and "
+                                "configuration end to end."))
+        header.addStretch(1)
+        header.addWidget(self.wizard_btn)
+        central = QWidget()
+        lay = QVBoxLayout(central)
+        lay.addLayout(header)
+        lay.addWidget(self.tabs)
+        self.setCentralWidget(central)
+        self._monitor = None
+
+    def open_wizard(self) -> int:
+        from csidetector.provision.wizard import SetupWizard
+        if self.devices.busy:
+            QMessageBox.information(self, "Flash in progress",
+                                    "Wait for the current flash to finish first.")
+            return 0
+        wiz = SetupWizard(self.registry, list_boards=self._list_boards,
+                          detect_hotspots=self._detect_hotspots,
+                          idf_export=self.devices.export_edit.text().strip(),
+                          parent=self)
+        result = wiz.exec()
+        self.devices._force_refresh()
+        if result and wiz.open_monitor:
+            self.open_monitor(wiz.alert_config_path)
+        return result
+
+    def open_monitor(self, alert_config_path: str) -> None:
+        from csidetector.modes.alert.gui import CSIDetectorWindow
+        self._monitor = CSIDetectorWindow(alert_config_path=alert_config_path)
+        self._monitor.show()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.devices.busy:
@@ -945,8 +1076,10 @@ class SetupWindow(QMainWindow):
         super().closeEvent(event)
 
 
-def run_setup_gui(idf_export: Optional[str] = None) -> int:
+def run_setup_gui(idf_export: Optional[str] = None, wizard: bool = False) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     win = SetupWindow(idf_export=idf_export)
     win.show()
+    if wizard:
+        QTimer.singleShot(0, win.open_wizard)
     return app.exec()
