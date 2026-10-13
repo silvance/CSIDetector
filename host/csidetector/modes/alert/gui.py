@@ -59,6 +59,19 @@ _STATE_PATH = _STATE_DIR / "state.json"
 _SPARKLINE_LEN = 200
 # How often we recompute the pkt-rate readout (s).
 _PKT_RATE_WINDOW_S = 3.0
+# Calibration: time to leave the room, then still-room recording time (s).
+CALIBRATE_SETTLE_S = 30.0
+CALIBRATE_RECORD_S = 30.0
+# Say so after this long without a single CSI sample (s).
+NO_DATA_WARN_S = 3.0
+
+
+def _friendly_source_error(source: str, exc: Exception) -> str:
+    text = f"{type(exc).__name__}: {exc}"
+    if "could not open port" in str(exc):
+        return (f"Couldn't open the receiver's port {source}. Is the receiver "
+                f"plugged into this computer?\n\n({text})")
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -74,6 +87,11 @@ class _PersistedState:
     exit_ratio: float = 1.3
     location: str = ""
     alert_config_path: str = ""
+    # Which boards the baseline was calibrated with (set by the setup
+    # wizard), and how to find the receiver again if its port number
+    # changes.
+    receiver_mac: str = ""
+    transmitter_mac: str = ""
 
     @classmethod
     def load(cls) -> "_PersistedState":
@@ -102,6 +120,7 @@ class _DetectWorker(QObject):
     state_changed = pyqtSignal(str)             # 'INIT' | 'STILL' | 'MOTION'
     pkt_rate_updated = pyqtSignal(float)
     alert_sent = pyqtSignal(float)              # ts of the alert
+    no_data = pyqtSignal(float)                 # seconds without CSI; 0 = resumed
     error_occurred = pyqtSignal(str)
     finished = pyqtSignal()
 
@@ -129,7 +148,7 @@ class _DetectWorker(QObject):
         try:
             self._run_loop()
         except Exception as exc:  # noqa: BLE001
-            self.error_occurred.emit(f"{type(exc).__name__}: {exc}")
+            self.error_occurred.emit(_friendly_source_error(self._source, exc))
         finally:
             try:
                 self._notifier.close()
@@ -144,17 +163,32 @@ class _DetectWorker(QObject):
             exit_ratio=self._exit,
         )
         det: Optional[detector.MotionDetector] = None
-        last_motion = False
+        # None until the detector is warmed up, so its first verdict (STILL
+        # included) is reported; the badge says INITIALIZING until then.
+        last_motion: Optional[bool] = None
         last_alert_ts = 0.0
         ts_history: list[float] = []   # recent push timestamps for pkt rate
         last_rate_emit = 0.0
         self.state_changed.emit("INIT")
         settle_until = time.time() + self._settle_s
+        quiet = {"since": time.time(), "warned": False}
 
-        for sample in csi_collector.open_source(self._source):
+        def idle() -> None:
+            gap = time.time() - quiet["since"]
+            if gap >= NO_DATA_WARN_S:
+                quiet["warned"] = True
+                self.no_data.emit(gap)
+                self.pkt_rate_updated.emit(0.0)
+
+        for sample in csi_collector.open_source(self._source, stop=self._stop,
+                                                on_idle=idle):
             if self._stop.is_set():
                 return
             now = time.time()
+            quiet["since"] = now
+            if quiet["warned"]:
+                quiet["warned"] = False
+                self.no_data.emit(0.0)
             ts_history.append(now)
             cutoff = now - _PKT_RATE_WINDOW_S
             while ts_history and ts_history[0] < cutoff:
@@ -176,6 +210,8 @@ class _DetectWorker(QObject):
                 det = detector.MotionDetector(idx, self._baseline, cfg)
 
             score, motion = det.update(sample.amplitude)
+            if not det.ready:
+                continue                  # no score until the window is full
             ratio = score / det.baseline if det.baseline else 0.0
             self.ratio_updated.emit(score, ratio)
 
@@ -212,15 +248,17 @@ class _CalibrateWorker(QObject):
 
     phase_changed = pyqtSignal(str, float)   # phase name, remaining seconds
     done = pyqtSignal(float, int)             # baseline, n_samples
+    no_data = pyqtSignal(float)               # seconds without CSI; 0 = resumed
     error_occurred = pyqtSignal(str)
     finished = pyqtSignal()
 
-    def __init__(self, source: str, settle_s: float = 30.0,
-                 record_s: float = 30.0, window: int = 50):
+    def __init__(self, source: str, settle_s: Optional[float] = None,
+                 record_s: Optional[float] = None, window: int = 50):
         super().__init__()
         self._source = source
-        self._settle_s = settle_s
-        self._record_s = record_s
+        # Looked up at call time (not as default args) so they can be tuned.
+        self._settle_s = CALIBRATE_SETTLE_S if settle_s is None else settle_s
+        self._record_s = CALIBRATE_RECORD_S if record_s is None else record_s
         self._window = window
         self._stop = threading.Event()
 
@@ -232,31 +270,49 @@ class _CalibrateWorker(QObject):
         try:
             self._run_inner()
         except Exception as exc:  # noqa: BLE001
-            self.error_occurred.emit(f"{type(exc).__name__}: {exc}")
+            self.error_occurred.emit(_friendly_source_error(self._source, exc))
         finally:
             self.finished.emit()
 
     def _run_inner(self) -> None:
-        src = csi_collector.open_source(self._source)
         rows: list[np.ndarray] = []
         idx: Optional[np.ndarray] = None
         start = time.time()
         settle_until = start + self._settle_s
         deadline = settle_until + self._record_s
-        last_emit = 0.0
+        st = {"emit": 0.0, "sample": start, "warned": False, "timed_out": False}
 
-        for sample in src:
-            if self._stop.is_set():
-                return
-            now = time.time()
-            if now - last_emit > 0.2:
+        def phase(now: float) -> None:
+            # The countdown keeps ticking with or without data.
+            if now - st["emit"] > 0.2:
                 if now < settle_until:
                     self.phase_changed.emit("LEAVE THE ROOM",
                                             max(0.0, settle_until - now))
                 else:
                     self.phase_changed.emit("RECORDING",
                                             max(0.0, deadline - now))
-                last_emit = now
+                st["emit"] = now
+
+        def idle() -> None:
+            now = time.time()
+            phase(now)
+            if now - st["sample"] >= NO_DATA_WARN_S:
+                st["warned"] = True
+                self.no_data.emit(now - st["sample"])
+            if now >= deadline:
+                st["timed_out"] = True
+                self._stop.set()         # ends the source iterator
+
+        for sample in csi_collector.open_source(self._source, stop=self._stop,
+                                                on_idle=idle):
+            if self._stop.is_set():
+                break
+            now = time.time()
+            st["sample"] = now
+            if st["warned"]:
+                st["warned"] = False
+                self.no_data.emit(0.0)
+            phase(now)
             if now < settle_until:
                 continue
             if idx is None:
@@ -267,8 +323,18 @@ class _CalibrateWorker(QObject):
             if now >= deadline:
                 break
 
+        if self._stop.is_set() and not st["timed_out"]:
+            return                       # cancelled
         if not rows or idx is None:
-            raise RuntimeError("no CSI samples received during calibration")
+            raise RuntimeError(
+                f"No CSI data arrived from {self._source}. Check that the "
+                f"transmitter is powered and was flashed for the same channel "
+                f"as the receiver, and that this is the receiver's port.")
+        if len(rows) < 3 * self._window:
+            raise RuntimeError(
+                f"Only {len(rows)} CSI samples arrived in {self._record_s:.0f} s "
+                f"(need {3 * self._window}). Is the transmitter powered and "
+                f"close enough?")
         amps = np.stack(rows)[:, idx]
         baseline = detector.compute_baseline(amps, self._window)
         self.done.emit(float(baseline), amps.shape[0])
@@ -362,6 +428,8 @@ class _StatusBadge(QLabel):
 # --------------------------------------------------------------------------
 
 class CSIDetectorWindow(QMainWindow):
+    test_result = pyqtSignal(bool, str)      # Test alert, from its thread
+
     def __init__(self, alert_config_path: str = ""):
         super().__init__()
         self.setWindowTitle("CSIDetector — Alert Mode")
@@ -378,6 +446,11 @@ class CSIDetectorWindow(QMainWindow):
         self._ratio_bar = QProgressBar()
         self._ratio_bar.setRange(0, 300)   # 0.00× to 3.00×
         self._ratio_bar.setTextVisible(False)
+        self._ratio_bar.setVisible(False)  # empty, it reads as a text box
+        self._no_data = QLabel("")
+        self._no_data.setWordWrap(True)
+        self._no_data.setStyleSheet("color: #b54a4a; font-weight: bold;")
+        self._no_data.setVisible(False)
         self._sparkline = _Sparkline()
         self._sparkline.set_threshold(self._state.enter_ratio)
 
@@ -397,11 +470,13 @@ class CSIDetectorWindow(QMainWindow):
         self._test_btn.clicked.connect(self._on_test)
         self._edit_btn.clicked.connect(self._on_edit)
         self._disarm_btn.setEnabled(False)
+        self.test_result.connect(self._on_test_result)
 
         # --- layout ------------------------------------------------------
         central = QWidget()
         v = QVBoxLayout(central)
         v.addWidget(self._badge)
+        v.addWidget(self._no_data)
         v.addWidget(self._ratio_label)
         v.addWidget(self._ratio_bar)
         v.addWidget(self._sparkline, stretch=1)
@@ -436,18 +511,24 @@ class CSIDetectorWindow(QMainWindow):
     # ----------------------------------------------------------------------
 
     def _on_calibrate(self) -> None:
-        if self._detect_thread is not None or self._calib_thread is not None:
+        if self._calib_worker is not None:         # the button reads "Cancel"
+            self._badge.set_state("CALIB", "stopping…")
+            self._calib_worker.request_stop()
             return
+        if self._detect_thread is not None:
+            return
+        source = self._resolve_source()
         self._badge.set_state("CALIB", "starting…")
-        self._calibrate_btn.setEnabled(False)
+        self._calibrate_btn.setText("Cancel calibration")
         self._arm_btn.setEnabled(False)
 
         thread = QThread(self)
-        worker = _CalibrateWorker(source=self._state.source)
+        worker = _CalibrateWorker(source=source)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.phase_changed.connect(self._on_calib_phase)
         worker.done.connect(self._on_calib_done)
+        worker.no_data.connect(self._on_no_data)
         worker.error_occurred.connect(self._on_calib_error)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -480,8 +561,10 @@ class CSIDetectorWindow(QMainWindow):
     def _on_calib_finished(self) -> None:
         self._calib_thread = None
         self._calib_worker = None
+        self._calibrate_btn.setText("Calibrate")
         self._calibrate_btn.setEnabled(True)
         self._arm_btn.setEnabled(True)
+        self._on_no_data(0.0)
         self._badge.set_state("DISARMED")
         self._refresh_stats()
 
@@ -514,7 +597,7 @@ class CSIDetectorWindow(QMainWindow):
         )
 
         worker = _DetectWorker(
-            source=self._state.source,
+            source=self._resolve_source(),
             baseline=self._state.baseline,
             enter_ratio=self._state.enter_ratio,
             exit_ratio=self._state.exit_ratio,
@@ -528,6 +611,7 @@ class CSIDetectorWindow(QMainWindow):
         worker.state_changed.connect(self._on_state)
         worker.pkt_rate_updated.connect(self._on_pkt_rate)
         worker.alert_sent.connect(self._on_alert)
+        worker.no_data.connect(self._on_no_data)
         worker.error_occurred.connect(self._on_detect_error)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -547,14 +631,15 @@ class CSIDetectorWindow(QMainWindow):
             return
         self._badge.set_state("DISARMED", "stopping…")
         self._detect_worker.request_stop()
-        # iter_serial has up to ~1s of readline blocking, so disarm
-        # takes effect within that window. UI re-enables in
-        # _on_detect_finished.
+        # iter_serial checks the stop flag on every 1 s read timeout too,
+        # so this takes effect within ~1 s even with no CSI arriving. UI
+        # re-enables in _on_detect_finished.
 
     def _on_ratio(self, score: float, ratio: float) -> None:
         self._ratio_label.setText(
             f"Ratio: {ratio:5.2f}×  (threshold {self._state.enter_ratio:.2f}×)  "
             f"σ={score:.3f}")
+        self._ratio_bar.setVisible(True)
         self._ratio_bar.setValue(int(min(ratio, 3.0) * 100))
         self._sparkline.push(ratio)
 
@@ -585,48 +670,95 @@ class CSIDetectorWindow(QMainWindow):
         self._calibrate_btn.setEnabled(True)
         self._disarm_btn.setEnabled(False)
         self._badge.set_state("DISARMED")
+        self._ratio_bar.setVisible(False)
+        self._on_no_data(0.0)
         self._pkt_rate = 0.0
         self._refresh_stats()
+
+    def _on_no_data(self, seconds: float) -> None:
+        if seconds <= 0:
+            self._no_data.setVisible(False)
+            return
+        self._no_data.setText(
+            f"⚠ No CSI from {self._state.source} for {seconds:.0f} s. Is the "
+            f"transmitter powered, and flashed for the same channel as the "
+            f"receiver?")
+        self._no_data.setVisible(True)
+
+    def _resolve_source(self) -> str:
+        """The receiver's port now. /dev/ttyACM* numbers change when boards
+        are replugged; a native-USB receiver is found again by its MAC
+        (its USB serial number). Bridge boards can't be, so their saved
+        port (ideally a /dev/serial/by-id link) is used as is."""
+        source, mac = self._state.source, self._state.receiver_mac
+        if mac and not source.startswith("/dev/serial/by-id/"):
+            from csidetector.provision import devices as dv
+            try:
+                boards = dv.list_boards()
+            except Exception:  # noqa: BLE001 — no pyserial / no ports
+                boards = []
+            port = next((b.port for b in boards if b.mac == mac), "")
+            if port and port != source:
+                self._state.source = port
+                self._state.save()
+                self._refresh_stats()
+        return self._state.source
 
     # ----------------------------------------------------------------------
     # Test alert + edit config
     # ----------------------------------------------------------------------
 
+    _NO_TELEGRAM = ("Telegram isn't set up, so alerts only show in this window. "
+                    "To get messages on your phone, run the setup wizard "
+                    "(\"Setup wizard…\" in the setup app, or "
+                    "`python run.py setup --wizard`) and fill in the Telegram "
+                    "page.")
+
     def _on_test(self) -> None:
+        """Send one message straight to Telegram (not via the retry queue)
+        and report what actually happened."""
         if not self._state.alert_config_path:
-            QMessageBox.warning(
-                self, "No config",
-                "Test alert needs an alert.toml — set --alert-config on "
-                "the command line or 'Edit config' to point at one.")
+            QMessageBox.information(self, "Telegram not set up", self._NO_TELEGRAM)
             return
+        from csidetector.modes.alert import telegram
         try:
             cfg = load_config(self._state.alert_config_path)
-            notifier = build_notifier(cfg)
-        except SystemExit as exc:
-            QMessageBox.warning(self, "Config error", str(exc))
+            sender = telegram.from_config(cfg)
+        except (SystemExit, ValueError) as exc:
+            QMessageBox.warning(self, "alert.toml problem", str(exc))
             return
-        ev = Event.now(kind="TEST", message="CSIDetector GUI test alert")
-        try:
-            notifier.send(ev)
-            QMessageBox.information(
-                self, "Test alert sent",
-                "Queued for delivery. If your Telegram doesn't buzz "
-                "within ~10s, check ~/.csidetector/alert-queue.db for "
-                "a row with last_error set.")
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "Test alert failed", str(exc))
-        finally:
+        if sender is None:
+            QMessageBox.information(self, "Telegram not set up", self._NO_TELEGRAM)
+            return
+        self._test_btn.setEnabled(False)
+        self._test_btn.setText("Sending…")
+
+        def run() -> None:
             try:
-                notifier.close()
-            except Exception:  # noqa: BLE001
-                pass
+                sender.send(Event.now(kind="TEST", message="CSIDetector test alert ✓"))
+                ok, msg = True, "Sent. Check Telegram on your phone."
+            except Exception as exc:  # noqa: BLE001 — report whatever went wrong
+                ok, msg = False, f"{type(exc).__name__}: {exc}"
+            try:
+                self.test_result.emit(ok, msg)
+            except RuntimeError:
+                pass                      # window closed meanwhile
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_test_result(self, ok: bool, message: str) -> None:
+        self._test_btn.setEnabled(True)
+        self._test_btn.setText("Test alert")
+        if ok:
+            QMessageBox.information(self, "Test alert sent", message)
+        else:
+            QMessageBox.warning(self, "Test alert failed",
+                                f"{message}\n\nCheck the bot token and chat ID "
+                                f"(re-run the setup wizard to change them).")
 
     def _on_edit(self) -> None:
         if not self._state.alert_config_path:
-            QMessageBox.information(
-                self, "No config path",
-                "Pass --alert-config alert.toml to the GUI to use this "
-                "feature.")
+            QMessageBox.information(self, "Telegram not set up", self._NO_TELEGRAM)
             return
         # Open in the system default editor for .toml. xdg-open on Linux,
         # 'open' on macOS, default association on Windows.

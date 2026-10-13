@@ -75,6 +75,26 @@ class AttachedBoard:
         return _BRIDGE_VIDS.get(self.vid or -1, "USB serial")
 
 
+BY_ID_DIR = "/dev/serial/by-id"
+
+
+def stable_port(port: str, by_id_dir: str = BY_ID_DIR) -> str:
+    """A path for ``port`` that survives re-enumeration: its udev
+    /dev/serial/by-id link (named after the USB device), else ``port``.
+
+    /dev/ttyACM1 becomes /dev/ttyACM0 when boards are replugged in another
+    order; the by-id link keeps pointing at the same board.
+    """
+    try:
+        target = os.path.realpath(port)
+        for entry in sorted(os.scandir(by_id_dir), key=lambda e: e.name):
+            if os.path.realpath(entry.path) == target:
+                return entry.path
+    except OSError:
+        pass
+    return port
+
+
 def list_boards(comports: Optional[Iterable] = None) -> list[AttachedBoard]:
     """Enumerate USB serial ports, newest naming order first.
 

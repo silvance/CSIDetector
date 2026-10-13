@@ -441,8 +441,9 @@ _HINTS = [
      "ESP-IDF's environment didn't load. Check the export.sh path in the "
      "setup window, or run ESP-IDF's install.sh once."),
     (re.compile(r"This chip is ESP32[-\w]*,? not ESP32|Wrong --chip argument", re.I),
-     "The board is a different chip than the build target. Pick the right "
-     "target (or click Identify so it's detected) and flash again."),
+     "The board is a different chip than the firmware was built for (was "
+     "it swapped?). Click Identify, or just Flash again: an unidentified "
+     "board is identified before building."),
     (re.compile(r"Target settings are not consistent", re.I),
      "The cached build was configured for another chip. Delete "
      "~/.cache/csidetector/firmware/ and retry."),

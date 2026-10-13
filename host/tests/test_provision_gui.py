@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -432,14 +433,16 @@ def test_process_runner_reports_failed_start(qt_app):
 
 
 
-def _live_children_of_marker(marker: str) -> list[int]:
-    """PIDs (not zombies) whose command line contains ``marker``."""
+def _live_sleeps(arg: str) -> list[int]:
+    """PIDs (not zombies) whose argv is exactly ``sleep <arg>``."""
+    want = b"sleep\0" + arg.encode() + b"\0"
     out = []
     for proc in Path("/proc").iterdir():
         if not proc.name.isdigit():
             continue
         try:
-            if marker not in (proc / "cmdline").read_bytes().decode(errors="replace"):
+            argv = (proc / "cmdline").read_bytes()
+            if argv != want and not argv.endswith(b"/" + want):
                 continue
             if (proc / "stat").read_text().split(") ")[1].startswith("Z"):
                 continue
@@ -454,8 +457,9 @@ def test_cancel_catches_children_forked_during_cancel(qt_app):
     """A /proc walk then kill misses a child forked in between (esptool
     starting up at the moment you click Cancel): it'd be orphaned holding
     the serial port. Signalling the process group can't miss it."""
-    marker = f"60{os.getpid() % 1000:03d}"           # unique sleep argument
-    script = f"while true; do sleep {marker} & sleep 0.002; done"
+    # A unique duration nothing else on the machine is sleeping for.
+    arg = f"6000.{uuid.uuid4().int % 10**9:09d}"
+    script = f"while true; do sleep {arg} & sleep 0.002; done"
     try:
         for _ in range(15):
             runner = gui.ProcessRunner()
@@ -463,12 +467,13 @@ def test_cancel_catches_children_forked_during_cancel(qt_app):
             QTimer.singleShot(60, runner.cancel)
             _run_until_finished(runner)
             deadline = time.monotonic() + 3
-            while _live_children_of_marker(marker) and time.monotonic() < deadline:
+            while _live_sleeps(arg) and time.monotonic() < deadline:
                 time.sleep(0.05)
-            assert not _live_children_of_marker(marker)
+            assert not _live_sleeps(arg)
     finally:
-        for pid in _live_children_of_marker(marker):
+        for pid in _live_sleeps(arg):
             os.kill(pid, 9)
+
 
 def test_wizard_retires_the_open_monitor_before_rewriting_its_state(qt_app, tmp_path):
     """An open monitor writes the settings it loaded at startup back on its

@@ -463,9 +463,12 @@ def test_unexpected_apply_error_is_reported_not_fatal(env, monkeypatch):
 
 
 @pytest.mark.parametrize("port, expect", [
-    (5566, "  3. HOTSPOT_NAME=Hotspot ./start.sh"),
-    (5577, "  3. PORT=5577 HOTSPOT_NAME=Hotspot ./start.sh")])
+    (5566, "  3. HOTSPOT_NAME=Hotspot {repo}/start.sh"),
+    (5577, "  3. PORT=5577 HOTSPOT_NAME=Hotspot {repo}/start.sh")])
 def test_localize_finish_steps_use_the_chosen_port(env, port, expect):
+    """Commands use full paths: step 2 runs in host/, start.sh is in the
+    repo root, so relative ones were ambiguous."""
+    expect = expect.format(repo=env.host_dir.parent)
     wiz = env.wiz
     wiz.page(wz.PAGE_MODE).localize.setChecked(True)
     wiz.next()
@@ -477,7 +480,7 @@ def test_localize_finish_steps_use_the_chosen_port(env, port, expect):
     wiz.next()
     wiz.next()
     text = wiz.currentPage().summary.text()
-    assert f"calibrate-links udp:{port} " in text
+    assert f"cd {env.host_dir} && python run.py localize calibrate-links udp:{port} " in text
     assert expect in text
 
 

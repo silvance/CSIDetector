@@ -107,3 +107,12 @@ def test_motion_detector_drops_too_short_samples_without_crashing(synthetic_ampl
     # Subsequent normal-width sample is still processed correctly.
     score, _ = det.update(still[1])
     assert math.isfinite(score)
+
+
+def test_motion_detector_ready_once_window_is_full():
+    det = detector.MotionDetector(np.arange(4), 1.0, detector.DetectorConfig(window=5))
+    for _ in range(4):
+        det.update(np.ones(4))
+        assert not det.ready
+    det.update(np.ones(4))
+    assert det.ready
