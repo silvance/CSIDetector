@@ -8,9 +8,13 @@ directory with ``-B`` / ``-D SDKCONFIG`` / ``-D SDKCONFIG_DEFAULTS``.
 Reflashing a second board with an identical config reuses the build, so
 only the first flash pays the full compile.
 
-All ESP-IDF commands run through ``bash -c '. export.sh && …'`` with the
-host Python venv stripped from the environment — otherwise the venv's
-python shadows IDF's and ``idf.py`` dies with ``No module named 'click'``.
+On Linux/macOS, ESP-IDF commands run through ``bash -c '. export.sh &&
+…'``. On Windows there's no bash: ``export.bat`` is run once through
+``cmd.exe`` to capture the environment it sets up (cached per export.bat),
+then ``python idf.py …`` / ``python -m esptool …`` run directly in it — no
+cmd quoting rules in the way. Either way the host Python venv is stripped
+first — otherwise the venv's python shadows IDF's and ``idf.py`` dies
+with ``No module named 'click'``.
 """
 
 from __future__ import annotations
@@ -19,8 +23,10 @@ import dataclasses
 import hashlib
 import ipaddress
 import os
+import glob
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -43,6 +49,9 @@ PROJECTS = {
     ROLE_RX: "csi_receiver",
 }
 
+IS_WINDOWS = os.name == "nt"
+EXPORT_NAME = "export.bat" if IS_WINDOWS else "export.sh"
+
 
 def repo_firmware_root() -> Path:
     # host/csidetector/provision/firmware.py → repo root is parents[3].
@@ -50,8 +59,32 @@ def repo_firmware_root() -> Path:
 
 
 def cache_root() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return Path(base) / "csidetector" / "firmware"
+    """Where builds go. On Windows: %LOCALAPPDATA% (private to the user —
+    generated sdkconfigs hold the hotspot password), short names, and no
+    spaces (ESP-IDF can't build in a path with spaces; a user name can
+    have them)."""
+    if os.environ.get("CSIDETECTOR_BUILD_DIR"):
+        return Path(os.environ["CSIDETECTOR_BUILD_DIR"])
+    if os.environ.get("XDG_CACHE_HOME"):
+        return Path(os.environ["XDG_CACHE_HOME"]) / "csidetector" / "firmware"
+    if IS_WINDOWS and os.environ.get("LOCALAPPDATA"):
+        base = Path(os.environ["LOCALAPPDATA"])
+        if " " in str(base):
+            base = Path(_short_path(str(base)))
+        return base / "csid" / "fw"
+    return Path(os.path.expanduser("~/.cache")) / "csidetector" / "firmware"
+
+
+def _short_path(path: str) -> str:
+    """Windows 8.3 short form of an existing path (no spaces), else as is."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(1024)
+        if ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf)):
+            return buf.value
+    except (AttributeError, OSError):
+        pass
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -226,6 +259,15 @@ class FlashJob:
             errors.append("No serial port selected.")
         if not (self.project_dir / "CMakeLists.txt").is_file():
             errors.append(f"Firmware project not found: {self.project_dir}")
+        for what, path in (("The CSIDetector folder", self.firmware_root.parent),
+                           ("The build folder", self.build_root)):
+            if " " in str(path):
+                errors.append(
+                    f"{what} is in a path with spaces ({path}), which ESP-IDF "
+                    f"can't build in. Move it to a path without spaces, e.g. "
+                    + (r"C:\csidetector" if IS_WINDOWS else "~/csidetector")
+                    + (" (or set CSIDETECTOR_BUILD_DIR)." if what.startswith("The build")
+                       else "."))
         return errors
 
 
@@ -289,30 +331,49 @@ def prepare_build_dir(job: FlashJob) -> bool:
 # ESP-IDF shell
 # --------------------------------------------------------------------------
 
-def find_idf_export(env: Optional[dict] = None) -> Optional[Path]:
-    """Locate ESP-IDF's export.sh: $IDF_EXPORT, $IDF_PATH, ~/esp/esp-idf."""
+def find_idf_export(env: Optional[dict] = None,
+                    windows: bool = IS_WINDOWS) -> Optional[Path]:
+    """Locate ESP-IDF's export script ($IDF_EXPORT, $IDF_PATH,
+    ~/esp/esp-idf; on Windows also the ESP-IDF installer's
+    C:\\Espressif\\frameworks\\esp-idf-v*, newest first)."""
     env = os.environ if env is None else env
+    name = "export.bat" if windows else "export.sh"
     candidates = []
     if env.get("IDF_EXPORT"):
         candidates.append(Path(env["IDF_EXPORT"]).expanduser())
     if env.get("IDF_PATH"):
-        candidates.append(Path(env["IDF_PATH"]).expanduser() / "export.sh")
-    candidates.append(Path(os.path.expanduser("~/esp/esp-idf/export.sh")))
+        candidates.append(Path(env["IDF_PATH"]).expanduser() / name)
+    candidates.append(Path(os.path.expanduser("~")) / "esp" / "esp-idf" / name)
+    if windows:
+        drive = env.get("SystemDrive", "C:")
+        for root in (env.get("IDF_TOOLS_PATH"), f"{drive}\\Espressif"):
+            if root:
+                found = sorted(glob.glob(os.path.join(root, "frameworks",
+                                                      "esp-idf-v*", name)),
+                               key=_version_key, reverse=True)
+                candidates += [Path(f) for f in found]
+        candidates.append(Path(f"{drive}\\esp\\esp-idf") / name)
     for c in candidates:
         if c.is_file():
             return c
     return None
 
 
+def _version_key(path: str) -> tuple:
+    m = re.search(r"esp-idf-v(\d+)\.(\d+)(?:\.(\d+))?", path)
+    return tuple(int(g or 0) for g in m.groups()) if m else (0,)
+
+
 def idf_env(base: Optional[dict] = None) -> dict:
     """Copy of the environment with any Python venv removed from it."""
     env = dict(os.environ if base is None else base)
     strip = set()
+    scripts = "Scripts" if IS_WINDOWS else "bin"
     venv = env.pop("VIRTUAL_ENV", None)
     if venv:
-        strip.add(os.path.join(venv, "bin"))
+        strip.add(os.path.join(venv, scripts))
     if base is None and sys.prefix != sys.base_prefix:
-        strip.add(os.path.join(sys.prefix, "bin"))
+        strip.add(os.path.join(sys.prefix, scripts))
     for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV_PROMPT"):
         env.pop(key, None)
     if "PATH" in env and strip:
@@ -330,10 +391,87 @@ def _idf_shell(export_sh: Path, command: list[str]) -> list[str]:
     return ["bash", "-c", script]
 
 
-def flash_command(job: FlashJob, export_sh: Path) -> list[str]:
+# -- Windows: capture export.bat's environment once ---------------------------
+
+ENV_MARKER = "__CSIDETECTOR_IDF_ENV__"
+
+
+@dataclasses.dataclass
+class IdfEnv:
+    """ESP-IDF's environment as export.bat sets it up, and what to run."""
+    env: dict
+    python: str            # IDF's own python.exe
+    idf_py: Path           # %IDF_PATH%\\tools\\idf.py
+
+
+_IDF_ENV_CACHE: dict[str, tuple[float, IdfEnv]] = {}
+
+
+def env_capture_command(export_bat: Path) -> tuple[list[str], str]:
+    """(argv, native command line) for cmd.exe: run export.bat (its output
+    shows in the log), then print a marker and the environment.
+
+    The native command line is passed verbatim (QProcess.setNativeArguments):
+    cmd.exe doesn't follow the quoting rules other programs use, so a path
+    with spaces would otherwise break."""
+    native = (f'/d /s /c "call "{export_bat}" || (echo ESP-IDF export.bat failed '
+              f'to load & exit /b 97) & echo {ENV_MARKER} & set"')
+    return ["cmd.exe"], native
+
+
+def _env_get(env: dict, key: str) -> str:
+    """Windows environment names are case-insensitive (``set`` prints Path)."""
+    for k, v in env.items():
+        if k.upper() == key.upper():
+            return v
+    return ""
+
+
+def parse_env_dump(output: str) -> Optional[IdfEnv]:
+    """The IdfEnv from env_capture_command's output, or None if export.bat
+    didn't get as far as the marker or the result has no usable IDF."""
+    if ENV_MARKER not in output:
+        return None
+    env: dict[str, str] = {}
+    for line in output.split(ENV_MARKER, 1)[1].splitlines():
+        key, eq, value = line.partition("=")
+        if eq and key and not key.startswith("="):     # skip =C:=C:\ entries
+            env[key] = value
+    idf_path = _env_get(env, "IDF_PATH")
+    if not idf_path:
+        return None
+    python = ""
+    venv = _env_get(env, "IDF_PYTHON_ENV_PATH")
+    if venv and Path(venv, "Scripts", "python.exe").is_file():
+        python = str(Path(venv, "Scripts", "python.exe"))
+    if not python:
+        python = shutil.which("python", path=_env_get(env, "PATH")) or ""
+    if not python:
+        return None
+    return IdfEnv(env, python, Path(idf_path) / "tools" / "idf.py")
+
+
+def cached_idf_env(export_bat: Path) -> Optional[IdfEnv]:
+    """The captured environment for this export.bat, unless it changed."""
+    key = str(Path(export_bat))
+    try:
+        mtime = Path(export_bat).stat().st_mtime
+    except OSError:
+        return None
+    hit = _IDF_ENV_CACHE.get(key)
+    return hit[1] if hit and hit[0] == mtime else None
+
+
+def remember_idf_env(export_bat: Path, idf: IdfEnv) -> None:
+    try:
+        _IDF_ENV_CACHE[str(Path(export_bat))] = (Path(export_bat).stat().st_mtime, idf)
+    except OSError:
+        pass
+
+
+def _flash_args(job: FlashJob) -> list[str]:
     defaults = f"{job.project_dir / 'sdkconfig.defaults'};{job.overlay_path}"
-    return _idf_shell(export_sh, [
-        "idf.py",
+    return [
         "-C", str(job.project_dir),
         "-B", str(job.build_dir),
         "-D", f"SDKCONFIG={job.sdkconfig_path}",
@@ -341,17 +479,28 @@ def flash_command(job: FlashJob, export_sh: Path) -> list[str]:
         "-D", f"IDF_TARGET={job.target}",
         "-p", job.port,
         "flash",
-    ])
+    ]
 
 
-def identify_command(port: str, export_sh: Path,
-                     esptool_cmd: str = "read_mac") -> list[str]:
+def flash_command(job: FlashJob, export_sh: Path,
+                  idf: Optional[IdfEnv] = None) -> list[str]:
+    """``idf: IdfEnv`` on Windows (run directly in the captured environment);
+    otherwise through bash and export.sh."""
+    if idf is not None:
+        return [idf.python, str(idf.idf_py), *_flash_args(job)]
+    return _idf_shell(export_sh, ["idf.py", *_flash_args(job)])
+
+
+def identify_command(port: str, export_sh: Path, esptool_cmd: str = "read_mac",
+                     idf: Optional[IdfEnv] = None) -> list[str]:
     """esptool read_mac through IDF's Python (which ships esptool).
 
     ``read_mac`` works on esptool v4 and v5 (v5 also accepts
     ``read-mac``); callers retry with the dashed form if a future
     esptool drops the underscore alias ("invalid choice").
     """
+    if idf is not None:
+        return [idf.python, "-m", "esptool", "--port", port, esptool_cmd]
     return _idf_shell(export_sh, [
         "python", "-m", "esptool", "--port", port, esptool_cmd,
     ])
@@ -396,7 +545,16 @@ def descendant_pids(root: int, proc_dir: str = "/proc") -> list[int]:
 
 
 def terminate_tree(root: int, sig: int = 15) -> None:
-    """Send ``sig`` to every descendant of ``root``, deepest first."""
+    """Send ``sig`` to every descendant of ``root``, deepest first. On
+    Windows: taskkill /T /F, which ends the whole tree including ``root``."""
+    if IS_WINDOWS:
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(root)],
+                           capture_output=True, timeout=10,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return
     for pid in reversed(descendant_pids(root)):
         try:
             os.kill(pid, sig)
@@ -428,25 +586,30 @@ def parse_progress(line: str) -> Optional[tuple[str, int]]:
 
 _HINTS = [
     (re.compile(r"could not open port|Permission denied|Device or resource busy"
-                r"|multiple access on port", re.I),
-     "The serial port is busy or not permitted. Close anything else using "
-     "it (alert GUI, `alert detect`, `idf.py monitor`, the heatmap). On "
-     "Linux your user also needs to be in the `dialout` group."),
+                r"|multiple access on port|Access is denied", re.I),
+     "The serial port is busy, unplugged, or not permitted. Close anything "
+     "else using it (the alert monitor, a serial monitor such as PuTTY or "
+     "the Arduino IDE, `idf.py monitor`, the heatmap) and check the cable."
+     + ("" if IS_WINDOWS else " On Linux your user also needs to be in the "
+        "`dialout` group.")),
     (re.compile(r"Failed to connect to ESP32|No serial data received|"
                 r"Wrong boot mode detected", re.I),
      "The chip didn't enter download mode. Hold BOOT, tap RESET (or "
      "unplug and replug while holding BOOT), release BOOT, then retry."),
     (re.compile(r"No module named 'click'|idf\.py: command not found|"
-                r"ESP-IDF export\.sh failed", re.I),
-     "ESP-IDF's environment didn't load. Check the export.sh path in the "
-     "setup window, or run ESP-IDF's install.sh once."),
+                r"ESP-IDF export\.(?:sh|bat) failed|is not recognized as an internal"
+                r"|No module named 'esptool'", re.I),
+     f"ESP-IDF's environment didn't load. Check the {EXPORT_NAME} path in "
+     f"the setup window, or run ESP-IDF's "
+     f"{'install.bat' if IS_WINDOWS else 'install.sh'} once"
+     + (" (or use the ESP-IDF Tools Installer)." if IS_WINDOWS else ".")),
     (re.compile(r"This chip is ESP32[-\w]*,? not ESP32|Wrong --chip argument", re.I),
      "The board is a different chip than the firmware was built for (was "
      "it swapped?). Click Identify, or just Flash again: an unidentified "
      "board is identified before building."),
     (re.compile(r"Target settings are not consistent", re.I),
-     "The cached build was configured for another chip. Delete "
-     "~/.cache/csidetector/firmware/ and retry."),
+     f"The cached build was configured for another chip. Delete "
+     f"{cache_root()} and retry."),
 ]
 
 

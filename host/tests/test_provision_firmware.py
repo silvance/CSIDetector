@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -296,3 +297,27 @@ def test_detect_hotspots_survives_missing_nmcli():
     def run(argv):
         raise FileNotFoundError("nmcli")
     assert fw.detect_hotspots(run) == []
+
+
+def test_find_idf_export_windows_installer_layout(tmp_path):
+    root = tmp_path / "Espressif" / "frameworks"
+    for v in ("esp-idf-v5.1.2", "esp-idf-v5.2.1", "esp-idf-v5.10.0"):
+        (root / v).mkdir(parents=True)
+        (root / v / "export.bat").write_text("")
+    env = {"IDF_TOOLS_PATH": str(tmp_path / "Espressif"), "SystemDrive": str(tmp_path / "nowhere")}
+    assert fw.find_idf_export(env, windows=True) == root / "esp-idf-v5.10.0" / "export.bat"
+
+
+def test_paths_with_spaces_are_refused(tmp_path):
+    job = _job(tmp_path / "build dir", fw.TxConfig())
+    assert any("path with spaces" in e for e in job.validate())
+
+
+def test_env_dump_parsing():
+    out = (f"noise=ignored before the marker\n{fw.ENV_MARKER} \n=C:=C:\\x\n"
+           f"IDF_PATH=/opt/idf\nPath={os.path.dirname(sys.executable)}\nA=b=c\n")
+    idf = fw.parse_env_dump(out)
+    assert idf.idf_py == Path("/opt/idf/tools/idf.py") and idf.env["A"] == "b=c"
+    assert "noise" not in idf.env and "=C:" not in idf.env
+    assert fw.parse_env_dump("export.bat failed") is None
+    assert fw.parse_env_dump(f"{fw.ENV_MARKER}\nPath=/bin\n") is None      # no IDF_PATH

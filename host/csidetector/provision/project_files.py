@@ -35,7 +35,10 @@ def _write_new(path: Path, data: bytes, mode: int, exclusive: bool) -> None:
     try:
         # fchmod before writing: O_CREAT's mode is masked by the umask and
         # ignored for a pre-existing file, and the content may be a secret.
-        os.fchmod(fd, mode)
+        # (Windows before Python 3.13 has no fchmod; there the file inherits
+        # the user-private ACL of its folder in the profile.)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
         os.write(fd, data)
     finally:
         os.close(fd)

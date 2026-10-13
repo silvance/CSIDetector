@@ -8,6 +8,7 @@ output-streaming and cancel tests (plain bash, no ESP-IDF).
 from __future__ import annotations
 
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -515,3 +516,57 @@ def test_excepthook_reports_instead_of_aborting(qt_app, monkeypatch, capsys):
         gui.sys.excepthook(type(exc), exc, exc.__traceback__)
     assert shown and "KeyError" in shown[0][2]
     assert "Traceback" in capsys.readouterr().err
+
+
+def test_windows_flash_captures_the_idf_environment_once(qt_app, tmp_path, monkeypatch):
+    """Windows: export.bat runs once through cmd.exe (native command line),
+    its environment is captured and cached, then idf.py runs directly in
+    it. The dumped environment never reaches the log."""
+    monkeypatch.setattr(fw, "IS_WINDOWS", True)
+    monkeypatch.setattr(fw, "_IDF_ENV_CACHE", {})
+    export = tmp_path / "esp idf" / "export.bat"
+    export.parent.mkdir()
+    export.write_text("")
+    (tmp_path / "idf" / "tools").mkdir(parents=True)
+    flasher = gui.Flasher(dv.Registry(tmp_path / "devices.json"))
+    started, lines = [], []
+    flasher.line.connect(lines.append)
+    monkeypatch.setattr(flasher._runner, "start",
+                        lambda argv, env, native_args=None: started.append((argv, env, native_args)))
+    job = fw.FlashJob(port="COM5", config=fw.TxConfig(), build_root=tmp_path / "build")
+    flasher.flash(job, export)
+    argv, _env, native = started[0]
+    assert argv == ["cmd.exe"] and f'call "{export}"' in native
+    dump = (f"Activating ESP-IDF 5.2\n{fw.ENV_MARKER} \n"
+            f"IDF_PATH={tmp_path / 'idf'}\nPath={os.path.dirname(sys.executable)}\n"
+            f"SECRET_TOKEN=hunter22\n")
+    for text in dump.splitlines():
+        flasher._on_line(text)
+    flasher._on_finished(0, dump)
+    argv, env, native = started[1]
+    assert native is None and argv[1] == str(tmp_path / "idf" / "tools" / "idf.py")
+    assert argv[-3:] == ["-p", "COM5", "flash"] and env["SECRET_TOKEN"] == "hunter22"
+    assert "Activating ESP-IDF 5.2" in lines
+    assert not any("hunter22" in l for l in lines)          # env dump not logged
+    # Second use: cached, no cmd.exe stage.
+    flasher._pending = None
+    started.clear()
+    flasher.identify("COM5", "", export)
+    assert started[0][0][1:] == ["-m", "esptool", "--port", "COM5", "read_mac"]
+
+
+def test_windows_failed_export_reports_a_flash_failure(qt_app, tmp_path, monkeypatch):
+    monkeypatch.setattr(fw, "IS_WINDOWS", True)
+    monkeypatch.setattr(fw, "_IDF_ENV_CACHE", {})
+    export = tmp_path / "export.bat"
+    export.write_text("")
+    flasher = gui.Flasher(dv.Registry(tmp_path / "devices.json"))
+    monkeypatch.setattr(flasher._runner, "start", lambda *a, **k: None)
+    results = []
+    flasher.flash_finished.connect(results.append)
+    flasher.flash(fw.FlashJob(port="COM5", config=fw.TxConfig(),
+                              build_root=tmp_path / "build"), export)
+    flasher._on_finished(97, "ERROR: tool xtensa-esp32s3-elf has no installed versions\n"
+                             "ESP-IDF export.bat failed to load\n")
+    assert results and not results[0].ok
+    assert any("environment didn't load" in h for h in fw.failure_hints(results[0].output))

@@ -89,7 +89,10 @@ class ProcessRunner(QObject):
     def running(self) -> bool:
         return self._proc is not None
 
-    def start(self, argv: list[str], env: dict) -> None:
+    def start(self, argv: list[str], env: dict, native_args: Optional[str] = None) -> None:
+        """``native_args`` (Windows): pass this command line to argv[0]
+        verbatim instead of quoting argv[1:] — for cmd.exe, whose parsing
+        doesn't follow the usual rules."""
         if self._proc is not None:
             raise RuntimeError("a process is already running")
         proc = QProcess(self)
@@ -105,6 +108,11 @@ class ProcessRunner(QObject):
         self._output = ""
         self.cancelled = False
         self._proc = proc
+        if native_args is not None and hasattr(proc, "setNativeArguments"):
+            proc.setProgram(argv[0])
+            proc.setNativeArguments(native_args)
+            proc.start()
+            return
         if _SETSID and shutil.which(argv[0]):
             # QProcess's child isn't a group leader, so setsid execs in
             # place: the pid QProcess reports is the new group's id. (A
@@ -224,10 +232,36 @@ class Flasher(QObject):
         super().__init__(parent)
         self.registry = registry
         self._runner = ProcessRunner(self)
-        self._runner.line.connect(self.line)
+        self._runner.line.connect(self._on_line)
         self._runner.progress.connect(self.progress)
         self._runner.finished.connect(self._on_finished)
         self._pending: Optional[dict] = None
+        self._mute = False      # the environment dump of an export.bat capture
+
+    def _on_line(self, text: str) -> None:
+        if text.startswith(fw.ENV_MARKER):
+            self._mute = True   # what follows is `set` output: not for the log
+        if not self._mute:
+            self.line.emit(text)
+
+    def _run(self, export: Path, argv_for: Callable, phase: str) -> None:
+        """Start argv_for(idf) — on Windows once ESP-IDF's environment has
+        been captured (first use of this export.bat: an extra stage)."""
+        self._mute = False
+        if not fw.IS_WINDOWS:
+            self._runner.start(argv_for(None), fw.idf_env())
+            self.started.emit(phase)
+            return
+        idf = fw.cached_idf_env(export)
+        if idf is not None:
+            self._runner.start(argv_for(idf), idf.env)
+            self.started.emit(phase)
+            return
+        self._pending.update(stage="env", export=export, argv_for=argv_for, phase=phase)
+        argv, native = fw.env_capture_command(export)
+        self.line.emit("[setup] loading the ESP-IDF environment (once per session)…")
+        self._runner.start(argv, fw.idf_env(), native_args=native)
+        self.started.emit("Loading ESP-IDF…")
 
     @property
     def busy(self) -> bool:
@@ -245,8 +279,7 @@ class Flasher(QObject):
         self.line.emit(
             f"[setup] flashing {job.project} ({job.target}) to {job.port}"
             + ("" if changed else " — config unchanged, reusing previous build"))
-        self._runner.start(fw.flash_command(job, export), fw.idf_env())
-        self.started.emit("Building…")
+        self._run(export, lambda idf: fw.flash_command(job, export, idf), "Building…")
 
     def identify(self, port: str, usb_serial: str, export: Path,
                  esptool_cmd: str = "read_mac") -> None:
@@ -256,9 +289,8 @@ class Flasher(QObject):
                          "usb_serial": usb_serial, "cmd": esptool_cmd,
                          "export": export}
         self.line.emit(f"[setup] identifying {port} …")
-        self._runner.start(fw.identify_command(port, export, esptool_cmd),
-                           fw.idf_env())
-        self.started.emit("Identifying…")
+        self._run(export, lambda idf: fw.identify_command(port, export, esptool_cmd, idf),
+                  "Identifying…")
 
     def cancel(self) -> None:
         self._runner.cancel()
@@ -273,6 +305,26 @@ class Flasher(QObject):
         if pending is None:
             return
         cancelled = self._runner.cancelled
+        if pending.get("stage") == "env":
+            idf = None if (code != 0 or cancelled) else fw.parse_env_dump(output)
+            visible = output.split(fw.ENV_MARKER, 1)[0]     # never the env dump
+            if idf is None:
+                if not cancelled and code == 0:
+                    visible += ("\nESP-IDF export.bat failed: no IDF_PATH or "
+                                "python in its environment")
+                    self.line.emit("[setup] ESP-IDF export.bat ran, but its "
+                                   "environment has no IDF_PATH or python.")
+                code = code or 97
+                pending.pop("stage")
+                output = visible
+            else:
+                fw.remember_idf_env(pending["export"], idf)
+                pending.pop("stage")
+                self._pending = pending
+                self._mute = False
+                self._runner.start(pending["argv_for"](idf), idf.env)
+                self.started.emit(pending["phase"])
+                return
         if pending["kind"] == "identify":
             if (code != 0 and not cancelled and "invalid choice" in output
                     and pending["cmd"] == "read_mac"):
