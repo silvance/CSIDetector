@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
 
 from csidetector.provision import devices as dv
 
+
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX-only (bash, file modes, symlinks or /proc)")
 
 def _port(device, vid=None, pid=None, serial=None, desc=""):
     return SimpleNamespace(device=device, vid=vid, pid=pid,
@@ -143,6 +146,7 @@ def test_registry_ignores_unknown_keys_and_bad_macs_on_load(tmp_path):
     assert [r.mac for r in reg.all()] == ["a0:f2:62:f0:39:d8"]
 
 
+@POSIX_ONLY
 def test_stable_port_prefers_the_by_id_link(tmp_path):
     dev = tmp_path / "ttyACM1"
     dev.write_text("")

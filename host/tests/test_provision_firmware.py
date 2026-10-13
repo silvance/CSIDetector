@@ -13,6 +13,8 @@ import pytest
 
 from csidetector.provision import firmware as fw
 
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX-only (bash, file modes, symlinks or /proc)")
+
 REPO_FIRMWARE = fw.repo_firmware_root()
 
 
@@ -114,6 +116,7 @@ def test_flash_job_validate_catches_missing_project(tmp_path):
     assert any("not found" in e for e in job.validate())
 
 
+@POSIX_ONLY
 def test_prepare_build_dir_reuses_build_when_config_unchanged(tmp_path):
     job = _job(tmp_path, fw.RxConfig(ssid="CSIDetector", password="hunter22"))
     assert fw.prepare_build_dir(job) is True
@@ -155,6 +158,7 @@ def test_prepare_build_dir_rebuilds_when_project_defaults_change(tmp_path):
     assert fw.prepare_build_dir(job) is True
 
 
+@POSIX_ONLY
 def test_build_dirs_are_private(tmp_path):
     """Generated sdkconfig / sdkconfig.h hold the hotspot password and are
     written 0644 by kconfgen, so the directories must block other users."""
@@ -164,6 +168,7 @@ def test_build_dirs_are_private(tmp_path):
     assert stat.S_IMODE(os.stat(job.build_root).st_mode) == 0o700
 
 
+@POSIX_ONLY
 def test_flash_command_quotes_paths_and_keeps_secrets_out(tmp_path):
     export = tmp_path / "esp idf" / "export.sh"
     job = _job(tmp_path, fw.RxConfig(ssid="My Hotspot", password="hunter22"))
@@ -180,6 +185,7 @@ def test_flash_command_quotes_paths_and_keeps_secrets_out(tmp_path):
     assert "hunter22" not in script and "My Hotspot" not in script
 
 
+@POSIX_ONLY
 def test_identify_command_uses_idf_python_esptool(tmp_path):
     argv = fw.identify_command("/dev/ttyACM0", tmp_path / "export.sh")
     tokens = shlex.split(argv[2])
@@ -187,6 +193,7 @@ def test_identify_command_uses_idf_python_esptool(tmp_path):
                            "read_mac"]
 
 
+@POSIX_ONLY
 def test_idf_env_strips_active_venv():
     base = {
         "VIRTUAL_ENV": "/home/u/proj/.venv",

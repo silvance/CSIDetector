@@ -129,7 +129,8 @@ def test_alert_flow_end_to_end(env):
 
     assert wiz.result() == QWizard.DialogCode.Accepted
     toml = env.host_dir / "alert.toml"
-    assert stat.S_IMODE(os.stat(toml).st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(os.stat(toml).st_mode) == 0o600
     cfg = load_config(str(toml))
     assert cfg["notifier"]["bot_token"] == TOKEN
     assert cfg["alert"]["location_label"] == "South RX"

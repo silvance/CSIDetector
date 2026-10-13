@@ -52,6 +52,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -227,7 +228,8 @@ out("MAC: " + board["mac"])
 out("Uploading stub...")
 out("Running stub...")
 if behavior == "hang":
-    child = subprocess.Popen(["sleep", "600"])        # esptool, as a grandchild
+    # esptool, as a grandchild (python, so it exists on Windows too)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
     with open(os.path.join(BENCH, "children.txt"), "a") as f:
         f.write("%d\n" % child.pid)
     out("Writing at 0x00010000... (10 %)")
@@ -281,6 +283,40 @@ out("Chip is %s (revision v0.2)" % board["chip"])
 out("MAC: " + board["mac"])
 hard_reset(port)
 '''
+
+
+def _alive(pid: int) -> bool:
+    """Is the process running (not a zombie)? os.kill(pid, 0) can't be
+    used on Windows: signal 0 there is CTRL_C_EVENT."""
+    if fw.IS_WINDOWS:
+        import ctypes
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return code.value == 259                                       # STILL_ACTIVE
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().split(")")[-1].split()[0]
+        return state != "Z"
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)                                   # no /proc (macOS)
+        return True
+    except OSError:
+        return False
+
+
+def _kill(pid: int) -> None:
+    if fw.IS_WINDOWS:
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+        return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
 
 
 def _write_exe(path: Path, text: str) -> None:
@@ -450,10 +486,7 @@ class Session:
             self.failed_expectations.append(
                 f"processes left running after the session: {leftovers}")
             for pid in leftovers:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
+                _kill(pid)
 
     def _patch(self, obj: Any, attr: str, value: Any) -> None:
         old = getattr(obj, attr)
@@ -462,7 +495,8 @@ class Session:
 
     def _patch_environment(self) -> None:
         for key, value in (("XDG_CACHE_HOME", str(self._tmp / "cache")),
-                           ("HOME", str(self.home))):
+                           ("HOME", str(self.home)),
+                           ("USERPROFILE", str(self.home))):      # ~ on Windows
             old = os.environ.get(key)
             os.environ[key] = value
             self._restore.append(lambda k=key, o=old: os.environ.__setitem__(k, o)
@@ -505,6 +539,9 @@ class Session:
         self._restore.append(lambda: qInstallMessageHandler(None))
 
     def _install_fake_tools(self) -> None:
+        if fw.IS_WINDOWS:
+            self._install_fake_tools_windows()
+            return
         fakebin = self._tmp / "fakebin"
         py = sys.executable
         _write_exe(fakebin / "idf.py",
@@ -523,6 +560,27 @@ class Session:
         self.export_sh.parent.mkdir()
         self.export_sh.write_text(f'export PATH="{fakebin}:$PATH"\n')
 
+    def _install_fake_tools_windows(self) -> None:
+        """Windows: an export.bat (in a folder with a space, so cmd.exe's
+        quoting is exercised) that sets IDF_PATH to a fake IDF whose
+        tools\\idf.py is the fake, and PYTHONPATH so ``python -m esptool``
+        finds a fake esptool package. The app runs them with the python on
+        the captured PATH, as with real ESP-IDF."""
+        fakeidf = self._tmp / "fake idf"
+        (fakeidf / "tools").mkdir(parents=True)
+        (fakeidf / "tools" / "idf.py").write_text(_FAKE_IDF.format(bench=str(self.bench)))
+        pkg = self._tmp / "fakebin" / "esptool"
+        pkg.mkdir(parents=True)
+        (pkg / "__init__.py").write_text("")
+        (pkg / "__main__.py").write_text(_FAKE_ESPTOOL.format(bench=str(self.bench)))
+        self.export_sh = self._tmp / "esp idf" / "export.bat"
+        self.export_sh.parent.mkdir()
+        self.export_sh.write_text(
+            "@echo off\r\n"
+            "echo Activating ESP-IDF (fake)\r\n"
+            f'set "IDF_PATH={fakeidf}"\r\n'
+            f'set "PYTHONPATH={self._tmp / "fakebin"}"\r\n'
+            f'set "PATH={os.path.dirname(sys.executable)};%PATH%"\r\n')
     # -- the bench -------------------------------------------------------
 
     def plug(self, port: str, chip: str = "ESP32-S3", mac: str = "",
@@ -644,15 +702,8 @@ class Session:
     def leftover_processes(self) -> list[int]:
         """Fake esptool grandchildren (from behavior="hang") still alive."""
         path = self.bench / "children.txt"
-        alive = []
-        for line in (path.read_text().split() if path.exists() else []):
-            try:
-                state = Path(f"/proc/{line}/stat").read_text().split(")")[-1].split()[0]
-            except OSError:
-                continue
-            if state != "Z":
-                alive.append(int(line))
-        return alive
+        return [int(pid) for pid in (path.read_text().split() if path.exists() else [])
+                if _alive(int(pid))]
 
     def _sync_bench(self) -> None:
         (self.bench / "boards.json").write_text(json.dumps(

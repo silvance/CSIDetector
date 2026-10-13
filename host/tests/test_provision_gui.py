@@ -25,6 +25,8 @@ from csidetector.provision import devices as dv  # noqa: E402
 from csidetector.provision import firmware as fw  # noqa: E402
 from csidetector.provision import gui  # noqa: E402
 
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX-only (bash, file modes, symlinks or /proc)")
+
 TX_MAC = "a0:f2:62:f0:39:d8"
 RX_MAC = "a0:f2:62:f0:39:28"
 FAR_TX = "ac:a7:04:2c:24:cc"
@@ -380,6 +382,7 @@ def _run_until_finished(runner, timeout_ms=10000):
     return result
 
 
+@POSIX_ONLY
 def test_process_runner_streams_lines_and_progress(qt_app):
     runner = gui.ProcessRunner()
     lines, progress = [], []
@@ -397,6 +400,7 @@ def test_process_runner_streams_lines_and_progress(qt_app):
     assert not runner.running
 
 
+@POSIX_ONLY
 def test_process_runner_cancel_kills_grandchildren(qt_app):
     runner = gui.ProcessRunner()
     child = {}
@@ -454,6 +458,7 @@ def _live_sleeps(arg: str) -> list[int]:
 
 
 @pytest.mark.skipif(not Path("/proc").is_dir(), reason="needs /proc")
+@POSIX_ONLY
 def test_cancel_catches_children_forked_during_cancel(qt_app):
     """A /proc walk then kill misses a child forked in between (esptool
     starting up at the moment you click Cancel): it'd be orphaned holding

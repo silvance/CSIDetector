@@ -16,8 +16,6 @@ import pytest
 pytest.importorskip("PyQt6.QtWidgets")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-if not sys.platform.startswith("linux"):
-    pytest.skip("the fake ESP-IDF tools are POSIX shell + /proc", allow_module_level=True)
 
 from tests.gui_driver import DriverError, Session  # noqa: E402
 from tests.gui_scenarios import SCENARIOS  # noqa: E402
