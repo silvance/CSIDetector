@@ -52,6 +52,9 @@ the `Session` methods before you start. Key calls:
   transmitter went away); `motion(port, True)` = someone moving. With
   this the alert monitor can be calibrated, armed, and starved of data.
   Calibration is shortened via `Session(calibrate_s=(settle, record))`.
+  The monitor's Record saves into `s.recordings` (read one back with
+  `csidetector.core.recording.read_recording`); "Open folder" lands in
+  `s.opened` instead of a file manager.
 - Actions (by visible text, like a user): `click`, `fill`, `choose`,
   `tick`, `select_row`, `tab`, `next`/`back`/`finish`/`cancel_wizard`,
   `press("Return", "Label")`, `answer("Yes"/"No")` for the next question

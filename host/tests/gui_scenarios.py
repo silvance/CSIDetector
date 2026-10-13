@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 
 import csidetector.modes.alert.gui as alert_gui
+from csidetector.core import collector, recording
 from csidetector.provision import firmware as fw
 from tests.gui_driver import Session
 
@@ -567,6 +568,62 @@ def monitor_test_alert(s: Session) -> None:
              "no-Telegram messages point at the wizard")
 
 
+def monitor_records_csi(s: Session) -> None:
+    """Record: a labelled capture of the raw stream, with marks, lands in the
+    recordings folder and replays through the collector. Arm and Calibrate
+    wait meanwhile; with no CSI nothing is saved and it says why."""
+    _alert_setup(s)
+    mon = _monitor(s)
+    s.csi("/dev/ttyACM1")
+    s.fill("Condition", "Someone walking through")
+    s.fill("Note", "door open")
+    s.fill("Start in", 0)
+    s.click("Record")
+    s.expect(not mon._arm_btn.isEnabled() and not mon._calibrate_btn.isEnabled(),
+             "Arm and Calibrate wait while recording")
+    s.wait_for(lambda: mon._mark_btn.isEnabled(), what="the recording to start")
+    s.wait(0.6)
+    s.click("Mark")
+    s.wait_for(lambda: mon._pkt_rate > 20, timeout=3, what="the packet rate while recording")
+    s.snap("recording")
+    s.click("Stop recording")
+    s.wait_for(lambda: mon._rec_thread is None, timeout=5, what="the file to be closed")
+    files = sorted(s.recordings.glob("*" + recording.SUFFIX))
+    s.expect(len(files) == 1 and files[0].name.endswith("_walk.csi.gz"),
+             "one file, named for the condition")
+    if not files:
+        return
+    rec = recording.read_recording(files[0])
+    s.expect(rec.meta["condition"] == "walk" and rec.meta["note"] == "door open",
+             "labelled with the condition and note")
+    s.expect(rec.meta["receiver_mac"] == RX_MAC and rec.meta["transmitter_mac"] == TX_MAC
+             and rec.meta["receiver"].get("label") == "South RX",
+             "names the boards")
+    s.expect(rec.end is not None and rec.end["stopped_by"] == "stop button"
+             and rec.end["samples"] > 20 and rec.end["tx_macs"] == {TX_MAC: rec.end["samples"]},
+             "a complete summary")
+    s.expect(len(rec.marks) == 1, "the mark is in the file")
+    replayed = sum(1 for _ in collector.iter_file(str(files[0])))
+    s.expect(replayed == rec.end["samples"], "it replays through the collector")
+    s.expect(files[0].name.lower() in s.texts() and "send this file" in s.texts(),
+             "says what was saved and what to do with it")
+    s.expect(mon._arm_btn.isEnabled() and mon._record_btn.text() == "Record",
+             "everything is back")
+    s.click("Open folder")
+    s.expect(s.opened == [str(s.recordings)], "Open folder shows the recordings")
+    # Transmitter off: nothing to save.
+    s.csi("/dev/ttyACM1", on=False)
+    s.click("Record")
+    s.wait(1.5)
+    s.click("Stop recording")
+    s.wait_for(lambda: mon._rec_thread is None, timeout=5, what="the empty recording to stop")
+    s.expect(_dialog(s, "Recording problem")
+             and any("nothing was saved" in d.text for d in s.dialogs),
+             "says nothing was saved, and why")
+    s.expect(len(list(s.recordings.glob("*" + recording.SUFFIX))) == 1,
+             "no empty file left behind")
+
+
 def environment_reasons(s: Session) -> None:
     """A disabled Next says why: ESP-IDF path, hotspot fields, short password,
     Telegram token."""
@@ -991,6 +1048,7 @@ SCENARIOS = {f.__name__: f for f in (
     monitor_receiver_port_moved,
     monitor_reopen_keeps_baseline,
     monitor_test_alert,
+    monitor_records_csi,
     environment_reasons,
     enter_in_label_flashes,
     rerun_with_bridge_receiver,
