@@ -125,6 +125,15 @@ alert or localize, flash transmitters and receivers, then it writes
 merges the new boards into `links.json` (localize mode) without touching
 the room shape or nodes that are already placed.
 
+The **Room layout** tab is a floorplan editor for `links.json`: drag the
+boards to where they are (or type x / y), shape the room by dragging,
+adding or removing corners, and put a floor-plan image underneath —
+click two points a known distance apart to set its scale. It shows the
+room exactly as the heatmap will (meters, y up), refuses to save layouts
+the heatmap can't use (no receivers, a self-crossing outline), and keeps
+a backup of the previous file. After a localize wizard run it opens with
+the new boards marked as not yet placed.
+
 Builds go to `~/.cache/csidetector/firmware/` with a generated sdkconfig
 overlay; the firmware projects' own `sdkconfig` files are never modified,
 and reflashing more boards with the same settings skips the rebuild.
