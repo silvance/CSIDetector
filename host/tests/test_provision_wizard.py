@@ -29,6 +29,8 @@ from csidetector.provision import devices as dv  # noqa: E402
 from csidetector.provision import firmware as fw  # noqa: E402
 from csidetector.provision import wizard as wz  # noqa: E402
 
+POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX-only (bash, file modes, symlinks or /proc)")
+
 MAC_A = "aa:aa:aa:aa:aa:a0"
 MAC_B = "aa:aa:aa:aa:aa:b0"
 TOKEN = "123456789:" + "A" * 35
@@ -41,7 +43,7 @@ def qt_app():
 
 
 @pytest.fixture
-def env(qt_app, tmp_path, monkeypatch):
+def env(qt_app, tmp_path, monkeypatch, idf_export):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     monkeypatch.setattr(dv, "stable_port", lambda port, mac="", by_id_dir=None: port)
     monkeypatch.setattr(alert_gui, "_STATE_DIR", tmp_path / "state")
@@ -52,8 +54,6 @@ def env(qt_app, tmp_path, monkeypatch):
         dv.AttachedBoard("/dev/ttyACM1", 0x303A, 0x1001, MAC_B.upper(), "", mac=MAC_B,
                          chip="ESP32-S3"),
     ]
-    export = tmp_path / "export.sh"
-    export.write_text("")
     host_dir = tmp_path / "host"
     host_dir.mkdir()
     hotspots = [fw.HotspotInfo("Hotspot", "wlp2s0u2", "CSIDetector", 6, "10.42.1.1")]
@@ -62,7 +62,7 @@ def env(qt_app, tmp_path, monkeypatch):
     # not rely on mutating a listed board.
     wiz = wz.SetupWizard(reg, list_boards=lambda: [dataclasses.replace(b) for b in boards],
                          detect_hotspots=lambda: hotspots,
-                         idf_export=str(export), host_dir=host_dir)
+                         idf_export=str(idf_export), host_dir=host_dir)
     started = []
     monkeypatch.setattr(wiz.flasher._runner, "start",
                         lambda argv, environ, native_args=None: started.append(argv))
@@ -465,6 +465,7 @@ def test_unexpected_apply_error_is_reported_not_fatal(env, monkeypatch):
     assert any("KeyError" in a[2] for a in env.shown)
 
 
+@POSIX_ONLY      # Windows gets Command Prompt steps instead (tested below)
 @pytest.mark.parametrize("port, expect", [
     (5566, "  3. HOTSPOT_NAME=Hotspot {repo}/start.sh"),
     (5577, "  3. PORT=5577 HOTSPOT_NAME=Hotspot {repo}/start.sh")])

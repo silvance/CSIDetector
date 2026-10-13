@@ -135,18 +135,17 @@ def test_build_notifier_missing_chat_id_raises_systemexit():
                                      "bot_token": "t", "chat_id": ""}})
 
 
-def test_queue_path_expands_tilde_and_creates_parent_dir(tmp_path, monkeypatch):
+def test_queue_path_expands_tilde_and_creates_parent_dir(home):
     """`~/...` in the queue path is expanded, and the parent directory
     is created on first use (so a fresh deploy doesn't crash on
     'no such file or directory')."""
-    monkeypatch.setenv("HOME", str(tmp_path))
     cfg = {
         "notifier": {"type": "telegram", "bot_token": "t", "chat_id": "1"},
         "queue": {"path": "~/some/nested/csidetector/q.db"},
     }
     n = build_notifier(cfg)
     try:
-        expected = tmp_path / "some/nested/csidetector/q.db"
+        expected = home / "some/nested/csidetector/q.db"
         assert expected.parent.exists()
         # The DB file itself is created lazily by sqlite3; opening the
         # connection in _Store.__init__ does that.

@@ -376,7 +376,9 @@ def relative_image_path(image: str, links_path: Path) -> str:
         rel = os.path.relpath(Path(image).resolve(), Path(links_path).resolve().parent)
     except ValueError:                       # different drive (Windows)
         return image
-    return rel if not rel.startswith("..") else str(Path(image).resolve())
+    if rel.startswith(".."):
+        return str(Path(image).resolve())
+    return Path(rel).as_posix()              # links.json is shared across OSes
 
 
 def resolve_image_path(image: str, links_path: Path) -> Path:

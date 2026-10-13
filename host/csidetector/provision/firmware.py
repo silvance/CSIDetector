@@ -24,6 +24,7 @@ import glob
 import hashlib
 import ipaddress
 import json
+import ntpath
 import os
 import re
 import shlex
@@ -470,17 +471,59 @@ def windows_export_env(export_bat: Path, base: dict) -> dict:
     for key in [k for k in env if k.upper() == "MSYSTEM"]:
         del env[key]
     framework = Path(export_bat).parent
-    if framework.parent.name.lower() == "frameworks":
-        root = framework.parent.parent
-        if not _env_get(env, "IDF_TOOLS_PATH"):
-            env["IDF_TOOLS_PATH"] = str(root)
-        front = sorted(glob.glob(os.path.join(root, "tools", "idf-python", "*")), reverse=True)[:1]
-        front += sorted(glob.glob(os.path.join(root, "tools", "idf-git", "*", "cmd")),
-                        reverse=True)[:1]
-        if front:
-            key = next((k for k in env if k.upper() == "PATH"), "PATH")
-            env[key] = os.pathsep.join(front + [env.get(key, "")])
+    if framework.parent.name.lower() != "frameworks":
+        return env
+    root = framework.parent.parent
+    if not _env_get(env, "IDF_TOOLS_PATH"):
+        env["IDF_TOOLS_PATH"] = str(root)
+    key = next((k for k in env if k.upper() == "PATH"), "PATH")
+    path = [p for p in env.get(key, "").split(";") if p]     # Windows separator
+    venv = _env_get(env, "IDF_PYTHON_ENV_PATH")
+    if venv and _ntnorm(ntpath.join(venv, "Scripts")) in {_ntnorm(p) for p in path}:
+        # Started from an "ESP-IDF CMD" prompt: IDF's virtualenv is already
+        # first on PATH and export.bat won't add it again, so the bare
+        # installer python must not go in front of it.
+        return env
+    # export.bat finds the virtualenv under IDF_TOOLS_PATH (the installer
+    # keeps it in the registry, so it can name another root).
+    front = _installer_python(root, Path(_env_get(env, "IDF_TOOLS_PATH")), framework.name)
+    front += _newest(glob.glob(os.path.join(root, "tools", "idf-git", "*", "cmd")),
+                     lambda p: os.path.basename(os.path.dirname(p)))
+    if front:
+        env[key] = ";".join(front + path)
     return env
+
+
+def _ntnorm(path: str) -> str:
+    return ntpath.normcase(ntpath.normpath(path))
+
+
+def _installer_python(root: Path, tools_path: Path, framework_name: str) -> list[str]:
+    """The ESP-IDF Tools Installer's python for this ESP-IDF: export.bat
+    looks for the virtualenv named after the python it runs under
+    (<tools_path>\\python_env\\idf5.2_py3.11_env), so with several installer
+    generations under one root (3.8 for IDF 4.4, 3.11 for 5.x) the one with
+    a matching virtualenv is the one to use; else the newest."""
+    pythons = glob.glob(os.path.join(root, "tools", "idf-python", "*"))
+    if not pythons:
+        return []
+    m = re.search(r"esp-idf-v(\d+\.\d+)", framework_name)
+    if m:
+        venvs = glob.glob(os.path.join(tools_path, "python_env", f"idf{m.group(1)}_py*_env"))
+        wanted = {w for v in venvs for w in re.findall(r"_py(\d+\.\d+)_env$", v)}
+        matching = [p for p in pythons
+                    if ".".join(os.path.basename(p).split(".")[:2]) in wanted]
+        if matching:
+            return _newest(matching, os.path.basename)
+    return _newest(pythons, os.path.basename)
+
+
+def _newest(paths: list[str], name_of) -> list[str]:
+    """The path whose version-like name is highest (as a list: [] if none).
+    A string sort would put 3.8.7 after 3.11.2."""
+    if not paths:
+        return []
+    return [max(paths, key=lambda p: tuple(int(n) for n in re.findall(r"\d+", name_of(p))))]
 
 
 def _env_get(env: dict, key: str) -> str:

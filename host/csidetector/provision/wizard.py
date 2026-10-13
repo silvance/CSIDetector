@@ -1190,6 +1190,10 @@ class SetupWizard(QWizard):
         super().__init__(parent)
         self.setWindowTitle("CSIDetector setup wizard")
         self.resize(760, 640)
+        # The same look on every platform. Windows' default (Aero) draws
+        # Back in the title bar, outside the button layout that
+        # set_navigation_locked() takes it out of while a flash runs.
+        self.setWizardStyle(QWizard.WizardStyle.ClassicStyle)
         self.registry = registry
         self.list_boards = list_boards
         self.detect_hotspots = detect_hotspots

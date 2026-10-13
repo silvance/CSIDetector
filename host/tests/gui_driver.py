@@ -745,6 +745,8 @@ class Session:
     def _qt_message(self, mode, context, message) -> None:
         if mode == QtMsgType.QtDebugMsg or any(n in message for n in QT_NOISE):
             return
+        if "QFontDatabase: Cannot find font directory" in message:
+            return      # Windows offscreen: PyQt ships no fonts; harness only
         self.qt_warnings.append(f"{mode.name}: {message}")
 
     def _message_box(self, kind: str):
