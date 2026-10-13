@@ -192,3 +192,15 @@ def test_numeric_strings_are_accepted_like_the_viewers_do(tmp_path):
     pf.write_links(path, txs=[], rxs=[("aa:bb:cc:dd:ee:02", "R")])
     cfg, txs, rxs = _load_links(str(path))
     assert (txs[0].x, txs[0].y) == (0.3, 1.0) and len(rxs) == 1
+
+
+def test_write_links_writes_through_a_symlink(tmp_path):
+    """The wizard's merge mustn't replace a symlinked links.json either."""
+    real = tmp_path / "rooms" / "office" / "links.json"
+    real.parent.mkdir(parents=True)
+    real.write_text(EXAMPLE_LINKS.read_text())
+    link = tmp_path / "links.json"
+    link.symlink_to(real)
+    pf.write_links(link, txs=[("a0:f2:62:f0:39:d8", "Desk TX")], rxs=[])
+    assert link.is_symlink()
+    assert "Desk TX" in real.read_text()

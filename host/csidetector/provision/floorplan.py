@@ -126,6 +126,21 @@ class _CornerItem(_Handle):
         self.canvas.edited.emit()
 
 
+class _ImageItem(QGraphicsPixmapItem):
+    """The floor plan; reports drags (Move image) so they count as edits."""
+
+    def __init__(self, canvas: "RoomCanvas", pixmap: QPixmap):
+        super().__init__(pixmap)
+        self.canvas = canvas
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+
+    def itemChange(self, change, value):  # noqa: N802
+        if (change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged
+                and not self.canvas.updating):
+            self.canvas.image_moved.emit()
+        return super().itemChange(change, value)
+
+
 # --------------------------------------------------------------------------
 # Canvas
 # --------------------------------------------------------------------------
@@ -137,6 +152,7 @@ class RoomCanvas(QGraphicsView):
     selection = pyqtSignal(object)        # the selected Node, or None
     hovered = pyqtSignal(float, float)    # mouse position in meters
     picked = pyqtSignal(float, float)     # a click while picking points
+    image_moved = pyqtSignal()            # the floor plan was dragged
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -153,7 +169,8 @@ class RoomCanvas(QGraphicsView):
         self.updating = False             # set while we move items ourselves
         self.picking = 0                  # clicks still wanted by pick_points()
         self._zoomed = False              # the user zoomed: stop auto-fitting
-        self._image_item: Optional[QGraphicsPixmapItem] = None
+        self._image_item: Optional[_ImageItem] = None
+        self.image_movable = False        # Move image mode
         self._outline: Optional[QGraphicsPolygonItem] = None
         self.node_items: dict[str, _NodeItem] = {}
         self.corner_items: list[_CornerItem] = []
@@ -168,14 +185,18 @@ class RoomCanvas(QGraphicsView):
         self.fit()
 
     def rebuild(self, image: Optional[QPixmap] = None, keep_image: bool = False) -> None:
+        if keep_image:
+            self.fold_image_offset()      # a Move-image drag isn't lost
         pixmap = (self._image_item.pixmap() if keep_image and self._image_item else image)
         self.updating = True
+        # clear() deletes selected items one by one, emitting selectionChanged
+        # with items whose Node belongs to the old model.
+        self.scene().blockSignals(True)
         try:
             self.scene().clear()
             self._image_item = None
             if pixmap is not None and not pixmap.isNull() and self.model.floorplan:
-                self._image_item = QGraphicsPixmapItem(pixmap)
-                self._image_item.setZValue(-10)
+                self._image_item = _ImageItem(self, pixmap)
                 self._image_item.setTransformationMode(
                     Qt.TransformationMode.SmoothTransformation)
                 self.place_image()
@@ -200,8 +221,11 @@ class RoomCanvas(QGraphicsView):
                 item.setPos(node.x, node.y)
                 self.scene().addItem(item)
                 self.node_items[node.mac] = item
+            self.set_image_movable(self.image_movable)
         finally:
+            self.scene().blockSignals(False)
             self.updating = False
+        self.selection.emit(None)
         x0, y0, x1, y1 = self.model.bbox()
         self.scene().setSceneRect(QRectF(x0 - 50, y0 - 50, x1 - x0 + 100, y1 - y0 + 100))
 
@@ -219,7 +243,45 @@ class RoomCanvas(QGraphicsView):
         ox, oy = fp.origin_px
         self._image_item.setTransform(QTransform(s, 0, 0, -s, -ox * s, oy * s))
         self._image_item.setPos(0, 0)
+        self._image_item.setZValue(40 if self.image_movable else -10)
         self._image_item.setOpacity(fp.opacity)
+
+    def set_image_movable(self, on: bool) -> None:
+        """Move image mode: only the plan moves (Qt would otherwise drag the
+        selected boards along with it), and it sits on top to be grabbed."""
+        on = on and self._image_item is not None
+        self.image_movable = on
+        if on:
+            self.scene().clearSelection()
+        for item in [*self.node_items.values(), *self.corner_items]:
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, not on)
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, not on)
+        item = self._image_item
+        if item is not None:
+            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, on)
+            item.setZValue(40 if on else -10)
+            if on:
+                item.setCursor(Qt.CursorShape.SizeAllCursor)
+            else:
+                item.unsetCursor()
+
+    def fold_image_offset(self) -> bool:
+        """Turn a Move-image drag (the item's offset, in meters) into the
+        floor plan's origin. True if it moved."""
+        item, fp = self._image_item, self.model.floorplan
+        if item is None or fp is None:
+            return False
+        dx, dy = item.pos().x(), item.pos().y()
+        if not (dx or dy):
+            return False
+        fp.origin_px = (fp.origin_px[0] - dx * fp.px_per_m,
+                        fp.origin_px[1] + dy * fp.px_per_m)
+        self.updating = True
+        try:
+            self.place_image()            # resets pos to 0 with the new origin
+        finally:
+            self.updating = False
+        return True
 
     def sync_positions(self) -> None:
         """Move items to the model's coordinates (after a table edit)."""
@@ -367,6 +429,7 @@ class RoomTab(QWidget):
         self.canvas.hovered.connect(
             lambda x, y: self.coords.setText(f"x {x:5.2f} m   y {y:5.2f} m"))
         self.canvas.picked.connect(self._on_picked)
+        self.canvas.image_moved.connect(lambda: self._set_dirty(True))
 
         # File row
         self.path_edit = QLineEdit(str(self.path))
@@ -575,6 +638,7 @@ class RoomTab(QWidget):
                                   "Save to keep your edits, or Reload to see its boards.")
 
     def save(self) -> bool:
+        self.canvas.fold_image_offset()   # Move image may still be on
         layout = self.canvas.model
         problems = layout.problems()
         if problems:
@@ -590,6 +654,11 @@ class RoomTab(QWidget):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return False
+        fp = layout.floorplan
+        if fp is not None and path.resolve() != self.path.resolve():
+            # Saved elsewhere: the image path is relative to links.json.
+            fp.image = lo.relative_image_path(
+                str(lo.resolve_image_path(fp.image, self.path)), path)
         try:
             layout.save(path)
         except (OSError, ValueError) as exc:
@@ -642,6 +711,8 @@ class RoomTab(QWidget):
             fp = layout.floorplan
             has_image = self.canvas.image_pixmap() is not None
             self.scale_btn.setEnabled(has_image)
+            if not has_image:
+                self.move_image.setChecked(False)
             self.move_image.setEnabled(has_image)
             self.remove_image_btn.setEnabled(fp is not None)
             self.opacity.setEnabled(has_image)
@@ -686,9 +757,10 @@ class RoomTab(QWidget):
         self._edited()
 
     def _on_canvas_selection(self, node: Optional[lo.Node]) -> None:
-        if node is None:
+        nodes = self.canvas.model.nodes
+        row = next((i for i, n in enumerate(nodes) if n is node), None)
+        if row is None:
             return
-        row = self.canvas.model.nodes.index(node)
         self.boards.blockSignals(True)
         self.boards.selectRow(row)
         self.boards.blockSignals(False)
@@ -760,6 +832,10 @@ class RoomTab(QWidget):
         self._edited()
 
     def _selected_corner(self) -> int:
+        on_canvas = [i.index for i in self.canvas.scene().selectedItems()
+                     if isinstance(i, _CornerItem)]
+        if len(on_canvas) == 1:
+            return on_canvas[0]
         rows = self.corners.selectionModel().selectedRows()
         return rows[0].row() if rows else len(self.canvas.model.corners) - 1
 
@@ -826,27 +902,11 @@ class RoomTab(QWidget):
         self._set_dirty(True)
 
     def _toggle_move_image(self, on: bool) -> None:
-        item = self.canvas._image_item
-        if item is None:
-            return
-        if on:
-            item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
-            item.setZValue(40)           # above the room so it can be grabbed
-            item.setCursor(Qt.CursorShape.SizeAllCursor)
-            self.scale_note.setText("Drag the image into place, then untick Move image.")
-            return
-        # Fold the drag (an offset in meters) into the image's origin.
-        fp = self.canvas.model.floorplan
-        dx, dy = item.pos().x(), item.pos().y()
-        if fp is not None and (dx or dy):
-            fp.origin_px = (fp.origin_px[0] - dx * fp.px_per_m,
-                            fp.origin_px[1] + dy * fp.px_per_m)
-            self._set_dirty(True)
-        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
-        item.setZValue(-10)
-        item.unsetCursor()
-        self.canvas.place_image()
-        self.scale_note.setText("")
+        if not on:
+            self.canvas.fold_image_offset()
+        self.canvas.set_image_movable(on)
+        self.scale_note.setText("Drag the image into place, then untick Move image."
+                                if on else "")
 
     def _show_scale_row(self, show: bool) -> None:
         for w in self._scale_widgets:

@@ -831,6 +831,50 @@ def room_unsaved_changes_on_quit(s: Session) -> None:
     s.expect(s.window.isVisible(), "so the window stays open")
 
 
+def room_selection_and_image_move(s: Session) -> None:
+    """Review regressions: reload with two boards selected; Move image drags
+    only the image and is saved; Remove corner takes the canvas selection."""
+    from PyQt6.QtGui import QColor, QImage
+    img = QImage(500, 400, QImage.Format.Format_RGB32)
+    img.fill(QColor("white"))
+    plan = s.host_dir / "plan.png"
+    img.save(str(plan))
+    s.window.registry.upsert(TX_MAC, role="tx", label="TX")
+    s.window.registry.upsert(RX_MAC, role="rx", label="RX")
+    s.tab("Room layout")
+    for label in ("TX", "RX"):
+        s.choose("Board to add", label)
+        s.click("Add")
+    canvas = _canvas(s)
+    s.drag("Room canvas", canvas.to_view(-0.4, -0.4), canvas.to_view(5.4, 4.4))   # rubber band
+    s.expect(len([i for i in canvas.scene().selectedItems()
+                  if hasattr(i, "node")]) == 2, "both boards selected")
+    rx0 = canvas.model.find(RX_MAC)
+    # Moves both; snapping to 2.9 gives 29 * 0.1 = 2.9000000000000004, which
+    # no longer equals the 2.9 read back from the file.
+    s.drag("Room canvas", canvas.to_view(rx0.x, rx0.y), canvas.to_view(2.9, rx0.y))
+    s.click("Save")
+    s.click("Reload")                    # used to raise from stale selection signals
+    s.choose_file(str(plan))
+    s.click("Floor plan image")
+    rx = canvas.model.find(RX_MAC)
+    canvas.node_items[RX_MAC].setSelected(True)
+    before = (rx.x, rx.y, rx.placed)
+    origin = canvas.model.floorplan.origin_px
+    s.fill("Move image", True)
+    s.drag("Room canvas", canvas.to_view(4.0, 1.0), canvas.to_view(4.5, 1.0))
+    s.expect((rx.x, rx.y, rx.placed) == before, "the selected board didn't move with the image")
+    s.expect(s.window.room.dirty, "moving the image is an unsaved change")
+    s.click("Save")                      # Move image still ticked
+    saved = _links(s)["floorplan"]["origin_px"]
+    s.expect(saved[0] != origin[0], "the moved image position is saved")
+    s.fill("Move image", False)
+    canvas.corner_items[0].setSelected(True)
+    first = canvas.model.corners[0]
+    s.click("Remove corner")
+    s.expect(first not in canvas.model.corners, "removed the corner selected on the plan")
+
+
 SCENARIOS = {f.__name__: f for f in (
     alert_happy_path,
     alert_telegram_failure,
@@ -866,4 +910,5 @@ SCENARIOS = {f.__name__: f for f in (
     room_draw_the_room,
     room_floorplan_image,
     room_unsaved_changes_on_quit,
+    room_selection_and_image_move,
 )}

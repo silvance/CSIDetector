@@ -338,7 +338,7 @@ def write_links(path: Path, txs: list[tuple[str, str]],
     Raises ValueError (file untouched) when the existing file isn't valid
     JSON or isn't a usable links.json shape.
     """
-    path = Path(path)
+    path = Path(path).resolve()           # through a symlink, not over it
     existing = None
     if path.exists():
         try:
