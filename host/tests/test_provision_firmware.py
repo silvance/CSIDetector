@@ -233,6 +233,9 @@ def test_failure_hints():
         "A fatal error occurred: Failed to connect to ESP32-S3: No serial data received."))
     assert any("export.sh" in h for h in fw.failure_hints(
         "ESP-IDF export.sh failed to load"))
+    assert any("different chip" in h for h in fw.failure_hints(
+        "A fatal error occurred: This chip is ESP32-C3, not ESP32-S3. "
+        "Wrong --chip argument?"))
     assert fw.failure_hints("all good") == []
 
 

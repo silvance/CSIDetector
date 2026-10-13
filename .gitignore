@@ -14,3 +14,9 @@ venv/
 # Captured CSI logs
 *.csilog
 captures/
+
+# Written by the setup app / per-site config (alert.toml holds the bot token)
+host/alert.toml
+host/links.json
+host/baselines.json
+*.bak-*

@@ -277,3 +277,192 @@ def test_failed_flash_is_not_ticked(env):
     assert not page.isComplete()
     assert "[hint]" in page.log.toPlainText()
     assert env.shown                                   # failure dialog raised
+
+
+# --------------------------------------------------------------------------
+# Regression tests for the phase B review
+# --------------------------------------------------------------------------
+
+MAC_C = "aa:aa:aa:aa:aa:c0"
+BACK = QWizard.WizardButton.BackButton
+
+
+def _to_page(wiz, page_id):
+    while wiz.currentId() != page_id:
+        wiz.next()
+
+
+def test_unknown_chip_is_identified_before_building(env):
+    """A bridge board's chip isn't in its USB descriptor: the wizard must
+    identify it and build for that chip, not silently for an S3."""
+    env.boards.append(dv.AttachedBoard("/dev/ttyUSB0", 0x10C4, 0xEA60, "0001", "CP2102"))
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    page = wiz.currentPage()
+    page.refresh_boards()
+    page.board_combo.setCurrentIndex(page.board_combo.findData("/dev/ttyUSB0"))
+    page.flash_btn.click()
+    assert wiz.flasher._pending["kind"] == "identify"
+    wiz.flasher._on_finished(0, "Chip is ESP32-C3 (QFN32)\nMAC: aa:aa:aa:aa:aa:c0\n")
+    job = wiz.flasher._pending["job"]
+    assert job.target == "esp32c3"
+    assert env.reg.get(MAC_C).chip == "ESP32-C3"
+
+
+def test_unsupported_chip_is_refused(env):
+    env.boards.append(dv.AttachedBoard("/dev/ttyACM2", 0x303A, 0x1001, MAC_C.upper(), "",
+                                       mac=MAC_C, chip="ESP32-H2"))
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    page = wiz.currentPage()
+    page.refresh_boards()
+    page.board_combo.setCurrentIndex(page.board_combo.findData("/dev/ttyACM2"))
+    page.flash_btn.click()
+    assert wiz.flasher._pending is None
+    assert any("isn't supported" in a[2] for a in env.shown)
+
+
+def test_alert_receiver_flashed_through_a_bridge_needs_its_native_port(env):
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    wiz.next()
+    env.boards[:] = [b for b in env.boards if b.mac != MAC_B]
+    env.boards.append(dv.AttachedBoard("/dev/ttyUSB0", 0x10C4, 0xEA60, "0001", "CP2102",
+                                       chip="ESP32-S3"))
+    _flash(env, "/dev/ttyUSB0", MAC_C)
+    page = wiz.currentPage()
+    assert page.checked_macs() == [MAC_C]
+    assert not page.isComplete()
+    assert "native USB port" in page.ready_note.text()
+    # Plugging the native port in (MAC in its USB serial) completes the page,
+    # and that's the port the monitor will read.
+    env.boards.append(dv.AttachedBoard("/dev/ttyACM5", 0x303A, 0x1001, MAC_C.upper(), "",
+                                       mac=MAC_C))
+    page.refresh_boards()
+    assert page.isComplete()
+    wiz.next()
+    assert wiz.state.rxs[MAC_C][1] == "/dev/ttyACM5"
+
+
+def test_reused_boards_must_match_this_setup(env):
+    env.reg.upsert(MAC_C, role=dv.ROLE_TX, label="Old TX", config={"channel": 6})
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    page = wiz.currentPage()
+    page.ready.item(0).setCheckState(wz.Qt.CheckState.Checked)
+    assert not page.isComplete()
+    assert "channel 6" in page.ready_note.text()
+
+    page.ready.item(0).setCheckState(wz.Qt.CheckState.Unchecked)
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    wiz.next()
+    # MAC_B was last flashed as a localize receiver: alert mode can't use it.
+    env.reg.upsert(MAC_B, role=dv.ROLE_RX, label="Hall RX",
+                   config={"channel": 11, "tx_macs": [MAC_A], "mode": "hotspot"})
+    rx = wiz.currentPage()
+    rx.initializePage()
+    rx.ready.item(0).setCheckState(wz.Qt.CheckState.Checked)
+    assert not rx.isComplete()
+    assert "hotspot (localize) mode" in rx.ready_note.text()
+    env.reg.upsert(MAC_B, config={"channel": 11, "tx_macs": [MAC_C], "mode": "uart"})
+    rx.completeChanged.emit()
+    assert not rx.isComplete()
+    assert "different transmitters" in rx.ready_note.text()
+    env.reg.upsert(MAC_B, config={"channel": 11, "tx_macs": [MAC_A], "mode": "uart"})
+    assert rx.isComplete()
+
+
+def test_ticks_survive_back_and_next(env):
+    env.reg.upsert(MAC_C, role=dv.ROLE_TX, label="Old TX")
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    wiz.currentPage().ready.item(0).setCheckState(wz.Qt.CheckState.Checked)
+    wiz.back()
+    wiz.next()
+    assert wiz.currentPage().checked_macs() == [MAC_C]
+
+
+def test_back_is_hidden_while_flashing(env, monkeypatch):
+    """Back runs cleanupPage, which kills the flash without asking."""
+    wiz = env.wiz
+    runner = wiz.flasher._runner
+    monkeypatch.setattr(runner, "start",
+                        lambda argv, environ: setattr(runner, "_proc", "running"))
+    _to_page(wiz, wz.PAGE_TX)
+    page = wiz.currentPage()
+    assert wiz.button(BACK).isVisible()
+    page.refresh_boards()
+    page.flash_btn.click()
+    assert wiz.flasher.busy
+    assert not wiz.button(BACK).isVisible()
+    page.completeChanged.emit()               # QWizard re-syncs buttons here
+    assert not wiz.button(BACK).isVisible()
+    runner._proc = None
+    wiz.flasher._on_finished(0, f"Chip is ESP32-S3 (QFN56)\nMAC: {MAC_A}\n")
+    assert wiz.button(BACK).isVisible()
+
+
+def test_alert_mode_uses_exactly_one_transmitter(env):
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    page = wiz.currentPage()
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    _flash(env, "/dev/ttyACM1", MAC_B)
+    assert page.checked_macs() == [MAC_B]     # the new one replaces the tick
+    for i in range(page.ready.count()):
+        page.ready.item(i).setCheckState(wz.Qt.CheckState.Checked)
+    assert not page.isComplete()
+    assert "exactly one transmitter" in page.ready_note.text()
+
+
+def test_open_monitor_is_retired_before_state_is_rewritten(env):
+    seen = []
+    env.wiz.before_alert_apply = lambda: seen.append(alert_gui._STATE_PATH.exists())
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    wiz.next()
+    _flash(env, "/dev/ttyACM1", MAC_B)
+    wiz.next()
+    wiz.currentPage().skip.setChecked(True)
+    wiz.next()
+    wiz.button(QWizard.WizardButton.FinishButton).click()
+    assert seen == [False]                    # called once, before the write
+    assert alert_gui._PersistedState.load().source == "/dev/ttyACM1"
+
+
+def test_unexpected_apply_error_is_reported_not_fatal(env, monkeypatch):
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    wiz.next()
+    _flash(env, "/dev/ttyACM1", MAC_B)
+    wiz.next()
+    wiz.currentPage().skip.setChecked(True)
+    wiz.next()
+
+    def boom():
+        raise KeyError("rxs")
+    monkeypatch.setattr(wiz, "apply", boom)
+    wiz.button(QWizard.WizardButton.FinishButton).click()
+    assert wiz.isVisible() and wiz.currentId() == wz.PAGE_FINISH
+    assert any("KeyError" in a[2] for a in env.shown)
+
+
+@pytest.mark.parametrize("port, expect", [(5566, "  3. ./start.sh"),
+                                          (5577, "  3. PORT=5577 ./start.sh")])
+def test_localize_finish_steps_use_the_chosen_port(env, port, expect):
+    wiz = env.wiz
+    wiz.page(wz.PAGE_MODE).localize.setChecked(True)
+    wiz.next()
+    wiz.currentPage().port.setValue(port)
+    wiz.next()
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    wiz.next()
+    _flash(env, "/dev/ttyACM1", MAC_B)
+    wiz.next()
+    wiz.next()
+    text = wiz.currentPage().summary.text()
+    assert f"calibrate-links udp:{port} " in text
+    assert expect in text

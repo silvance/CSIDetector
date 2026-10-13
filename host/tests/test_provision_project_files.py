@@ -110,3 +110,72 @@ def test_write_links_refuses_to_clobber_invalid_json(tmp_path):
     with pytest.raises(ValueError):
         pf.write_links(path, txs=[], rxs=[])
     assert path.read_text() == "{hand-edited, broken"
+
+
+def test_backups_are_owner_only_and_never_overwrite_each_other(tmp_path):
+    path = tmp_path / "alert.toml"
+    path.write_text('[notifier]\nbot_token = "old"\n')
+    os.chmod(path, 0o644)                    # world-readable before the wizard
+    first = pf.write_alert_toml(path, TOKEN, "8722080863")
+    second = pf.write_alert_toml(path, TOKEN, "8722080863")   # same second
+    assert first != second
+    assert 'bot_token = "old"' in first.read_text()           # not clobbered
+    for p in (first, second, path):
+        assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+
+
+@pytest.mark.parametrize("bad", [
+    [],
+    {"room": None},
+    {"room": {"polygon": [[0, 0], [5, 0], [5]]}},
+    {"room": {"polygon": [[0, 0], [5, 0]]}},
+    {"room": {"width_m": -1}},
+    {"txs": {"mac": "aa:bb:cc:dd:ee:ff", "x": 0, "y": 0}},
+    {"txs": [{"mac": 12, "x": 0, "y": 0}]},
+    {"rxs": [{"mac": "not-a-mac", "x": 0, "y": 0}]},
+    {"rxs": [{"mac": "aa:bb:cc:dd:ee:ff", "x": "1", "y": 0}]},
+    {"tx": "aa:bb:cc:dd:ee:ff"},
+])
+def test_malformed_links_are_refused_and_left_alone(tmp_path, bad):
+    with pytest.raises(ValueError):
+        pf.validate_links_shape(bad)
+    path = tmp_path / "links.json"
+    text = json.dumps(bad)
+    path.write_text(text)
+    with pytest.raises(ValueError):
+        pf.write_links(path, txs=[("aa:bb:cc:dd:ee:01", "")], rxs=[])
+    assert path.read_text() == text
+    assert list(tmp_path.iterdir()) == [path]          # no backup, no temp file
+
+
+def test_example_links_pass_validation():
+    pf.validate_links_shape(json.loads(EXAMPLE_LINKS.read_text()))
+
+
+def test_reflashed_board_moves_role_and_keeps_its_position():
+    existing = {"room": {"width_m": 5, "height_m": 4},
+                "txs": [{"mac": "aa:bb:cc:dd:ee:01", "x": 1.0, "y": 2.0, "label": "old"}],
+                "rxs": []}
+    data = pf.merge_links(existing, txs=[], rxs=[("AA:BB:CC:DD:EE:01", "Hall RX")])
+    assert data["txs"] == []
+    assert data["rxs"] == [{"mac": "aa:bb:cc:dd:ee:01", "x": 1.0, "y": 2.0,
+                            "label": "Hall RX"}]
+
+
+def test_mac_in_both_roles_is_rejected():
+    with pytest.raises(ValueError, match="both TX and RX"):
+        pf.merge_links(None, txs=[("aa:bb:cc:dd:ee:01", "")],
+                       rxs=[("aa-bb-cc-dd-ee-01", "")])
+
+
+def test_placeholders_avoid_existing_nodes_and_each_other():
+    # Example layout: nodes on the perimeter, including the corners where
+    # evenly spaced placeholders used to land.
+    existing = json.loads(EXAMPLE_LINKS.read_text())
+    placed = [(n["x"], n["y"]) for n in existing["txs"] + existing["rxs"]]
+    data = pf.merge_links(existing, txs=[],
+                          rxs=[(f"aa:bb:cc:dd:ee:{i:02x}", "") for i in range(1, 4)])
+    new = [(n["x"], n["y"]) for n in data["rxs"] if n.get("placed") is False]
+    assert len(new) == 3 and len(set(new)) == 3
+    for x, y in new:
+        assert min((x - px) ** 2 + (y - py) ** 2 for px, py in placed) > 0.25
