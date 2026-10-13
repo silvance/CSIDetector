@@ -321,6 +321,7 @@ def test_rx_alert_on_bridge_board_warns_about_native_usb(tab):
     assert not any("native USB" in w for w in tab.plan_flash().warnings)
 
 
+@POSIX_ONLY      # Windows has no NetworkManager to ask, so no warning there
 def test_localize_plan_warns_when_no_hotspot_running(qt_app, tmp_path, idf_export):
     t = gui.DevicesTab(dv.Registry(tmp_path / "d.json"), list_boards=_boards,
                        detect_hotspots=lambda: [], settings_path=tmp_path / "s.json",
@@ -365,7 +366,9 @@ def test_settings_persist_without_password(tab, tmp_path):
 # ProcessRunner with real processes
 # --------------------------------------------------------------------------
 
-def _run_until_finished(runner, timeout_ms=10000):
+def _run_until_finished(runner, start, timeout_ms=10000):
+    """Connect first, then ``start()``: on Windows a program that can't
+    start fails synchronously inside QProcess.start, and finished with it."""
     loop = QEventLoop()
     result = {}
 
@@ -374,8 +377,10 @@ def _run_until_finished(runner, timeout_ms=10000):
         loop.quit()
 
     runner.finished.connect(done)
-    QTimer.singleShot(timeout_ms, loop.quit)
-    loop.exec()
+    start()
+    if runner.running:
+        QTimer.singleShot(timeout_ms, loop.quit)
+        loop.exec()
     return result
 
 
@@ -388,8 +393,8 @@ def test_process_runner_streams_lines_and_progress(qt_app):
     script = (r"echo hello; echo '[5/10] Building x'; "
               r"printf 'Writing at 0x0001 [==] 40.0%%\rWriting at 0x0001 [===] 90.0%%\n'; "
               r"echo bye; exit 3")
-    runner.start(["bash", "-c", script], dict(os.environ))
-    res = _run_until_finished(runner)
+    res = _run_until_finished(runner, lambda: runner.start(["bash", "-c", script],
+                                                           dict(os.environ)))
     assert res["code"] == 3
     assert "hello" in lines and "bye" in lines and "[5/10] Building x" in lines
     assert not any(l.startswith("Writing at") for l in lines)
@@ -408,8 +413,8 @@ def test_process_runner_cancel_kills_grandchildren(qt_app):
             QTimer.singleShot(0, runner.cancel)
 
     runner.line.connect(on_line)
-    runner.start(["bash", "-c", "sleep 60 & echo \"child $!\"; wait"], dict(os.environ))
-    res = _run_until_finished(runner)
+    res = _run_until_finished(runner, lambda: runner.start(
+        ["bash", "-c", "sleep 60 & echo \"child $!\"; wait"], dict(os.environ)))
     assert res["code"] == -1 and runner.cancelled
     stat = Path(f"/proc/{child['pid']}/stat")
 
@@ -429,8 +434,8 @@ def test_process_runner_cancel_kills_grandchildren(qt_app):
 
 def test_process_runner_reports_failed_start(qt_app):
     runner = gui.ProcessRunner()
-    runner.start(["/nonexistent/binary-xyz"], dict(os.environ))
-    res = _run_until_finished(runner)
+    res = _run_until_finished(runner, lambda: runner.start(["/nonexistent/binary-xyz"],
+                                                           dict(os.environ)))
     assert res["code"] == -1 and "could not start" in res["out"]
 
 
@@ -466,9 +471,9 @@ def test_cancel_catches_children_forked_during_cancel(qt_app):
     try:
         for _ in range(15):
             runner = gui.ProcessRunner()
-            runner.start(["bash", "-c", script], dict(os.environ))
             QTimer.singleShot(60, runner.cancel)
-            _run_until_finished(runner)
+            _run_until_finished(runner, lambda: runner.start(["bash", "-c", script],
+                                                             dict(os.environ)))
             deadline = time.monotonic() + 3
             while _live_sleeps(arg) and time.monotonic() < deadline:
                 time.sleep(0.05)

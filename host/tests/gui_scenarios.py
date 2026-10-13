@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 
 import csidetector.modes.alert.gui as alert_gui
+from csidetector.provision import firmware as fw
 from tests.gui_driver import Session
 
 TX_MAC = "30:30:f9:aa:00:01"
@@ -220,7 +221,11 @@ def localize_happy_path(s: Session) -> None:
     s.expect(cfg.get("CONFIG_CSI_RX_WIFI_PASS") == "<redacted>", "a password was set")
     s.expect(s.next(), "Receivers → links.json")
     s.expect(s.next(), "links.json → Finish")
-    s.expect("HOTSPOT_NAME=Hotspot" in s.dump(), "finish steps name the hotspot connection")
+    if fw.IS_WINDOWS:
+        s.expect("cd /d" in s.dump() and "localize heatmap" in s.dump(),
+                 "finish steps are Command Prompt commands")
+    else:
+        s.expect("HOTSPOT_NAME=Hotspot" in s.dump(), "finish steps name the hotspot connection")
     s.expect(s.finish(), "Finish")
     links = json.loads((s.host_dir / "links.json").read_text())
     s.expect(len(links["txs"]) == 2 and len(links["rxs"]) == 2, "links.json has all four")
@@ -232,7 +237,10 @@ def localize_no_hotspot(s: Session) -> None:
     s.click("Setup wizard")
     s.fill("Localize", True)
     s.next()
-    s.expect("no running hotspot" in s.texts(), "says no hotspot was found")
+    if fw.IS_WINDOWS:      # nothing to detect with: says what to type in
+        s.expect("enter the wi-fi network" in s.texts(), "says to enter the network by hand")
+    else:
+        s.expect("no running hotspot" in s.texts(), "says no hotspot was found")
     s.fill("Hotspot SSID", "")
     s.expect(not s.nav_usable("next"), "an empty SSID blocks Next")
     s.fill("Hotspot SSID", "MyHotspot")
@@ -567,10 +575,10 @@ def environment_reasons(s: Session) -> None:
     s.click("Setup wizard")
     s.fill("Localize", True)
     s.next()
-    s.fill("ESP-IDF export.sh", "")
-    s.expect(not s.nav_usable("next") and "export.sh" in s.page().note.text(),
-             "says to pick export.sh")
-    s.fill("ESP-IDF export.sh", str(s.export_sh.parent))      # the folder is fine
+    s.fill(f"ESP-IDF {fw.EXPORT_NAME}", "")
+    s.expect(not s.nav_usable("next") and fw.EXPORT_NAME in s.page().note.text(),
+             f"says to pick {fw.EXPORT_NAME}")
+    s.fill(f"ESP-IDF {fw.EXPORT_NAME}", str(s.export_sh.parent))    # the folder is fine
     s.fill("Hotspot password", "abc12")
     s.expect(not s.nav_usable("next") and "8–64" in s.page().note.text(),
              "a short password is caught here, not at the first receiver")
