@@ -158,6 +158,26 @@ pyserial, no real Telegram. It exercises:
 
 Suite is ~60 tests, runs in <5 seconds.
 
+### GUI walkthroughs (setup app)
+
+`host/tests/gui_driver.py` drives the real setup window and wizard
+against simulated boards: fake `idf.py`/esptool read a model of what's
+plugged in, so flashing runs the app's real process handling. Each step
+saves a screenshot and a text dump of the screen.
+
+```sh
+cd host
+python -m tests.gui_driver --list                     # scripted scenarios
+python -m tests.gui_driver alert_happy_path --out /tmp/gui-run
+# → /tmp/gui-run/alert_happy_path/report.md + screenshots
+```
+
+The scenarios also run headlessly in the normal suite
+(`tests/test_gui_scenarios.py`). For an exploratory pass, the
+`gui-tester` agent (`.claude/agents/gui-tester.md`) runs them, looks at
+the screenshots, tries the awkward cases and reports what a user would
+hit.
+
 ---
 
 ## Workflow A — Localized motion detection (multi-RX/TX)

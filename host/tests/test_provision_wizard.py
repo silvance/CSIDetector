@@ -8,6 +8,7 @@ exercised for real.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
@@ -55,7 +56,9 @@ def env(qt_app, tmp_path, monkeypatch):
     host_dir.mkdir()
     hotspots = [fw.HotspotInfo("Hotspot", "wlp2s0u2", "CSIDetector", 6, "10.42.1.1")]
     reg = dv.Registry(tmp_path / "devices.json")
-    wiz = wz.SetupWizard(reg, list_boards=lambda: list(boards),
+    # Fresh copies each call, like the real list_boards(): page code must
+    # not rely on mutating a listed board.
+    wiz = wz.SetupWizard(reg, list_boards=lambda: [dataclasses.replace(b) for b in boards],
                          detect_hotspots=lambda: hotspots,
                          idf_export=str(export), host_dir=host_dir)
     started = []
@@ -287,6 +290,15 @@ MAC_C = "aa:aa:aa:aa:aa:c0"
 BACK = QWizard.WizardButton.BackButton
 
 
+def _tick(page, mac, on=True):
+    for i in range(page.ready.count()):
+        item = page.ready.item(i)
+        if item.data(wz.Qt.ItemDataRole.UserRole) == mac:
+            item.setCheckState(wz.Qt.CheckState.Checked if on else wz.Qt.CheckState.Unchecked)
+            return
+    raise AssertionError(f"{mac} not listed")
+
+
 def _to_page(wiz, page_id):
     while wiz.currentId() != page_id:
         wiz.next()
@@ -450,8 +462,9 @@ def test_unexpected_apply_error_is_reported_not_fatal(env, monkeypatch):
     assert any("KeyError" in a[2] for a in env.shown)
 
 
-@pytest.mark.parametrize("port, expect", [(5566, "  3. ./start.sh"),
-                                          (5577, "  3. PORT=5577 ./start.sh")])
+@pytest.mark.parametrize("port, expect", [
+    (5566, "  3. HOTSPOT_NAME=Hotspot ./start.sh"),
+    (5577, "  3. PORT=5577 HOTSPOT_NAME=Hotspot ./start.sh")])
 def test_localize_finish_steps_use_the_chosen_port(env, port, expect):
     wiz = env.wiz
     wiz.page(wz.PAGE_MODE).localize.setChecked(True)
@@ -466,3 +479,74 @@ def test_localize_finish_steps_use_the_chosen_port(env, port, expect):
     text = wiz.currentPage().summary.text()
     assert f"calibrate-links udp:{port} " in text
     assert expect in text
+
+
+def test_bridge_receiver_identified_then_flashed_stays_attached(env):
+    """Classic ESP32 on a CP2102: chip and MAC come from Identify, CSI comes
+    over the bridge. The port must survive the post-flash board refresh."""
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    wiz.next()
+    env.boards[:] = [b for b in env.boards if b.mac != MAC_B]
+    env.boards.append(dv.AttachedBoard("/dev/ttyUSB0", 0x10C4, 0xEA60, "0001", "CP2102"))
+    page = wiz.currentPage()
+    page.refresh_boards()
+    page.board_combo.setCurrentIndex(page.board_combo.findData("/dev/ttyUSB0"))
+    page.flash_btn.click()
+    out = f"Chip is ESP32-D0WD-V3 (revision v3.1)\nMAC: {MAC_C}\n"
+    wiz.flasher._on_finished(0, out)                   # identify
+    assert wiz.flasher._pending["job"].target == "esp32"
+    wiz.flasher._on_finished(0, out)                   # flash
+    page.refresh_boards()                              # the post-flash refresh
+    assert page.isComplete(), page.ready_note.text()
+    wiz.next()
+    assert wiz.state.rxs[MAC_C][1] == "/dev/ttyUSB0"
+
+
+def test_receiver_cannot_also_be_the_transmitter(env):
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    _flash(env, "/dev/ttyACM0", MAC_A, "Desk TX")
+    wiz.next()
+    _flash(env, "/dev/ttyACM0", MAC_A)                 # confirm() says yes
+    page = wiz.currentPage()
+    assert page.checked_macs() == [MAC_A]
+    assert not page.isComplete()
+    assert "also this setup's transmitter" in page.ready_note.text()
+
+
+def test_unticking_after_a_forward_pass_sticks(env):
+    env.reg.upsert(MAC_C, role=dv.ROLE_TX, label="Old TX")
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    page = wiz.currentPage()
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    wiz.next()                                         # state.txs = {MAC_A}
+    wiz.back()
+    _tick(page, MAC_A, False)
+    _tick(page, MAC_C, True)
+    wiz.back()
+    wiz.next()
+    assert page.checked_macs() == [MAC_C]
+
+
+def test_failed_alert_toml_write_leaves_the_monitor_running(env, tmp_path):
+    retired = []
+    env.wiz.before_alert_apply = lambda: retired.append(True)
+    wiz = env.wiz
+    _to_page(wiz, wz.PAGE_TX)
+    _flash(env, "/dev/ttyACM0", MAC_A)
+    wiz.next()
+    _flash(env, "/dev/ttyACM1", MAC_B)
+    wiz.next()
+    tg = wiz.currentPage()
+    tg.token.setText(TOKEN)
+    tg.chat.setText("8722080863")
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    tg.path.setText(str(blocker / "alert.toml"))        # can't be written
+    wiz.next()
+    wiz.button(QWizard.WizardButton.FinishButton).click()
+    assert wiz.currentId() == wz.PAGE_FINISH            # stayed: "Couldn't save"
+    assert retired == []

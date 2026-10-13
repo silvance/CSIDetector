@@ -431,19 +431,56 @@ def test_process_runner_reports_failed_start(qt_app):
     assert res["code"] == -1 and "could not start" in res["out"]
 
 
-def test_wizard_retires_the_open_monitor_before_rewriting_its_state(qt_app, tmp_path,
-                                                                    monkeypatch):
+
+def _live_children_of_marker(marker: str) -> list[int]:
+    """PIDs (not zombies) whose command line contains ``marker``."""
+    out = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if marker not in (proc / "cmdline").read_bytes().decode(errors="replace"):
+                continue
+            if (proc / "stat").read_text().split(") ")[1].startswith("Z"):
+                continue
+        except OSError:
+            continue
+        out.append(int(proc.name))
+    return out
+
+
+@pytest.mark.skipif(not Path("/proc").is_dir(), reason="needs /proc")
+def test_cancel_catches_children_forked_during_cancel(qt_app):
+    """A /proc walk then kill misses a child forked in between (esptool
+    starting up at the moment you click Cancel): it'd be orphaned holding
+    the serial port. Signalling the process group can't miss it."""
+    marker = f"60{os.getpid() % 1000:03d}"           # unique sleep argument
+    script = f"while true; do sleep {marker} & sleep 0.002; done"
+    try:
+        for _ in range(15):
+            runner = gui.ProcessRunner()
+            runner.start(["bash", "-c", script], dict(os.environ))
+            QTimer.singleShot(60, runner.cancel)
+            _run_until_finished(runner)
+            deadline = time.monotonic() + 3
+            while _live_children_of_marker(marker) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert not _live_children_of_marker(marker)
+    finally:
+        for pid in _live_children_of_marker(marker):
+            os.kill(pid, 9)
+
+def test_wizard_retires_the_open_monitor_before_rewriting_its_state(qt_app, tmp_path):
     """An open monitor writes the settings it loaded at startup back on its
     next Calibrate, undoing the wizard's new receiver port."""
-    from csidetector.provision import wizard as wz
     win = gui.SetupWindow(dv.Registry(tmp_path / "devices.json"), idf_export="",
                           list_boards=_boards, detect_hotspots=lambda: [],
                           settings_path=tmp_path / "setup.json", auto_refresh=False)
-    hooks = []
-    monkeypatch.setattr(wz.SetupWizard, "exec",
-                        lambda self: hooks.append(self.before_alert_apply) or 0)
-    win.open_wizard()
-    assert hooks == [win.retire_monitor]
+    wiz = win.open_wizard()
+    assert wiz.before_alert_apply == win.retire_monitor
+    assert win.open_wizard() is wiz                  # a second click reuses it
+    wiz.reject()
+    assert win.wizard is None
 
     class FakeMonitor:
         closed = False
