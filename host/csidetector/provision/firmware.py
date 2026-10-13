@@ -20,13 +20,13 @@ with ``No module named 'click'``.
 from __future__ import annotations
 
 import dataclasses
+import glob
 import hashlib
 import ipaddress
+import json
 import os
-import glob
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -344,8 +344,11 @@ def prepare_build_dir(job: FlashJob) -> bool:
     if previous == content and job.sdkconfig_path.exists():
         return False
     # The overlay may hold the hotspot password: owner-only.
-    fd = os.open(job.overlay_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
+    fd = os.open(job.overlay_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                 | getattr(os, "O_BINARY", 0), 0o600)
+    # newline="\n": on Windows text mode would write \r\n, read back
+    # differently, and every flash would look like a config change.
+    with os.fdopen(fd, "w", newline="\n") as f:
         f.write(content)
     os.chmod(job.overlay_path, 0o600)
     try:
@@ -435,16 +438,49 @@ class IdfEnv:
 _IDF_ENV_CACHE: dict[str, tuple[float, IdfEnv]] = {}
 
 
+# Run by the python export.bat puts first on PATH. It must be ESP-IDF's
+# own (it can import esptool): export.bat can exit 0 after failing to
+# find IDF's virtualenv, leaving the host's python in front. JSON with
+# ensure_ascii keeps the dump ASCII — `set` would print in the console's
+# code page, mangling e.g. a user name with an accent in TEMP.
+_DUMP_ENV = ("import json,os,sys,esptool;"
+             f"print('{ENV_MARKER}'+json.dumps({{'env':dict(os.environ),"
+             "'python':sys.executable}))")
+
+
 def env_capture_command(export_bat: Path) -> tuple[list[str], str]:
     """(argv, native command line) for cmd.exe: run export.bat (its output
-    shows in the log), then print a marker and the environment.
+    shows in the log), then have IDF's python print the environment.
 
     The native command line is passed verbatim (QProcess.setNativeArguments):
     cmd.exe doesn't follow the quoting rules other programs use, so a path
     with spaces would otherwise break."""
     native = (f'/d /s /c "call "{export_bat}" || (echo ESP-IDF export.bat failed '
-              f'to load & exit /b 97) & echo {ENV_MARKER} & set"')
+              f'to load & exit /b 97) & python -c "{_DUMP_ENV}""')
     return ["cmd.exe"], native
+
+
+def windows_export_env(export_bat: Path, base: dict) -> dict:
+    """The environment to run export.bat in. export.bat needs python and git
+    on PATH, and finds IDF's virtualenv under IDF_TOOLS_PATH; the ESP-IDF
+    Tools Installer's own shortcut adds its bundled ones first. For that
+    layout (<root>\\frameworks\\esp-idf-v*\\export.bat), do the same. MSYSTEM
+    (set in Git Bash / MSYS2) makes export.bat refuse to run at all."""
+    env = dict(base)
+    for key in [k for k in env if k.upper() == "MSYSTEM"]:
+        del env[key]
+    framework = Path(export_bat).parent
+    if framework.parent.name.lower() == "frameworks":
+        root = framework.parent.parent
+        if not _env_get(env, "IDF_TOOLS_PATH"):
+            env["IDF_TOOLS_PATH"] = str(root)
+        front = sorted(glob.glob(os.path.join(root, "tools", "idf-python", "*")), reverse=True)[:1]
+        front += sorted(glob.glob(os.path.join(root, "tools", "idf-git", "*", "cmd")),
+                        reverse=True)[:1]
+        if front:
+            key = next((k for k in env if k.upper() == "PATH"), "PATH")
+            env[key] = os.pathsep.join(front + [env.get(key, "")])
+    return env
 
 
 def _env_get(env: dict, key: str) -> str:
@@ -456,25 +492,20 @@ def _env_get(env: dict, key: str) -> str:
 
 
 def parse_env_dump(output: str) -> Optional[IdfEnv]:
-    """The IdfEnv from env_capture_command's output, or None if export.bat
-    didn't get as far as the marker or the result has no usable IDF."""
+    """The IdfEnv from env_capture_command's output, or None if the dump
+    isn't there (export.bat failed, or the python it left first on PATH
+    isn't IDF's) or names no IDF_PATH."""
     if ENV_MARKER not in output:
         return None
-    env: dict[str, str] = {}
-    for line in output.split(ENV_MARKER, 1)[1].splitlines():
-        key, eq, value = line.partition("=")
-        if eq and key and not key.startswith("="):     # skip =C:=C:\ entries
-            env[key] = value
-    idf_path = _env_get(env, "IDF_PATH")
-    if not idf_path:
+    line = output.split(ENV_MARKER, 1)[1].splitlines()[0]
+    try:
+        data = json.loads(line)
+        env = {str(k): str(v) for k, v in data["env"].items()}
+        python = str(data["python"])
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError):
         return None
-    python = ""
-    venv = _env_get(env, "IDF_PYTHON_ENV_PATH")
-    if venv and Path(venv, "Scripts", "python.exe").is_file():
-        python = str(Path(venv, "Scripts", "python.exe"))
-    if not python:
-        python = shutil.which("python", path=_env_get(env, "PATH")) or ""
-    if not python:
+    idf_path = _env_get(env, "IDF_PATH")
+    if not idf_path or not python:
         return None
     return IdfEnv(env, python, Path(idf_path) / "tools" / "idf.py")
 
@@ -626,7 +657,7 @@ _HINTS = [
      "unplug and replug while holding BOOT), release BOOT, then retry."),
     (re.compile(r"No module named 'click'|idf\.py: command not found|"
                 r"ESP-IDF export\.(?:sh|bat) failed|is not recognized as an internal"
-                r"|No module named 'esptool'", re.I),
+                r"|No module named '?esptool'?", re.I),
      f"ESP-IDF's environment didn't load. Check the {EXPORT_NAME} path in "
      f"the setup window, or run ESP-IDF's "
      f"{'install.bat' if IS_WINDOWS else 'install.sh'} once"

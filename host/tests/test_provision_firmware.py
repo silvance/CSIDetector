@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -321,10 +322,35 @@ def test_paths_with_spaces_are_refused(tmp_path):
 
 
 def test_env_dump_parsing():
-    out = (f"noise=ignored before the marker\n{fw.ENV_MARKER} \n=C:=C:\\x\n"
-           f"IDF_PATH=/opt/idf\nPath={os.path.dirname(sys.executable)}\nA=b=c\n")
+    env = {"IDF_PATH": "/opt/idf", "Path": "/bin", "TEMP": "C:\\Users\\José\\Temp"}
+    dump = json.dumps({"env": env, "python": "/opt/idf-env/python.exe"})   # ASCII-only
+    out = f"Activating ESP-IDF 5.5\nnoise=ignored\n{fw.ENV_MARKER}{dump}\n"
     idf = fw.parse_env_dump(out)
-    assert idf.idf_py == Path("/opt/idf/tools/idf.py") and idf.env["A"] == "b=c"
-    assert "noise" not in idf.env and "=C:" not in idf.env
+    assert idf.idf_py == Path("/opt/idf/tools/idf.py") and idf.python == "/opt/idf-env/python.exe"
+    assert idf.env["TEMP"].endswith("José\\Temp") and "noise" not in idf.env
     assert fw.parse_env_dump("export.bat failed") is None
-    assert fw.parse_env_dump(f"{fw.ENV_MARKER}\nPath=/bin\n") is None      # no IDF_PATH
+    # export.bat "succeeded" but IDF's python wasn't first on PATH: the dump
+    # (which imports esptool) never ran, so there's no marker.
+    assert fw.parse_env_dump("Activating ESP-IDF\nNo module named esptool\n") is None
+    no_idf = json.dumps({"env": {"Path": "/bin"}, "python": "x"})
+    assert fw.parse_env_dump(f"{fw.ENV_MARKER}{no_idf}\n") is None
+
+
+def test_windows_export_env_for_the_installer_layout(tmp_path):
+    root = tmp_path / "Espressif"
+    export = root / "frameworks" / "esp-idf-v5.4.1" / "export.bat"
+    export.parent.mkdir(parents=True)
+    (root / "tools" / "idf-python" / "3.11.2").mkdir(parents=True)
+    (root / "tools" / "idf-git" / "2.44.0" / "cmd").mkdir(parents=True)
+    env = fw.windows_export_env(export, {"Path": "/usr/bin", "MSYSTEM": "MINGW64"})
+    assert "MSYSTEM" not in env                      # export.bat refuses to run with it
+    assert env["IDF_TOOLS_PATH"] == str(root)
+    parts = env["Path"].split(os.pathsep)
+    assert parts[0].endswith("3.11.2") and parts[1].endswith("cmd") and parts[-1] == "/usr/bin"
+    other = fw.windows_export_env(tmp_path / "esp-idf" / "export.bat", {"PATH": "/bin"})
+    assert other == {"PATH": "/bin"}                 # not the installer layout: as is
+
+
+def test_esptool_missing_hint():
+    assert any("environment didn't load" in h for h in fw.failure_hints(
+        "C:\\py\\python.exe: No module named esptool"))

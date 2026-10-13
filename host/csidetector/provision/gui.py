@@ -258,9 +258,17 @@ class Flasher(QObject):
             self.started.emit(phase)
             return
         self._pending.update(stage="env", export=export, argv_for=argv_for, phase=phase)
+        if Path(export).suffix.lower() != ".bat":
+            # export.sh on Windows would just open in some other program.
+            self.line.emit(f"[setup] {export} isn't ESP-IDF's export.bat; on Windows "
+                           f"choose export.bat (in the esp-idf folder).")
+            self._runner.finished.emit(97, "ESP-IDF export.bat failed: "
+                                           "an export.bat is needed on Windows")
+            return
         argv, native = fw.env_capture_command(export)
         self.line.emit("[setup] loading the ESP-IDF environment (once per session)…")
-        self._runner.start(argv, fw.idf_env(), native_args=native)
+        self._runner.start(argv, fw.windows_export_env(export, fw.idf_env()),
+                           native_args=native)
         self.started.emit("Loading ESP-IDF…")
 
     @property
@@ -310,10 +318,12 @@ class Flasher(QObject):
             visible = output.split(fw.ENV_MARKER, 1)[0]     # never the env dump
             if idf is None:
                 if not cancelled and code == 0:
-                    visible += ("\nESP-IDF export.bat failed: no IDF_PATH or "
-                                "python in its environment")
-                    self.line.emit("[setup] ESP-IDF export.bat ran, but its "
-                                   "environment has no IDF_PATH or python.")
+                    visible += ("\nESP-IDF export.bat failed: its environment has "
+                                "no IDF_PATH, or its python isn't ESP-IDF's")
+                    self.line.emit("[setup] ESP-IDF export.bat ran, but ESP-IDF's "
+                                   "Python environment isn't set up (no IDF_PATH, or "
+                                   "esptool missing). Run ESP-IDF's install.bat, or "
+                                   "reinstall with the ESP-IDF Tools Installer.")
                 code = code or 97
                 pending.pop("stage")
                 output = visible
