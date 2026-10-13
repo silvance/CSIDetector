@@ -8,6 +8,7 @@ output-streaming and cancel tests (plain bash, no ESP-IDF).
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -199,6 +200,116 @@ def test_identify_result_updates_row_and_registry(tab):
     assert tab.save_details_btn.isEnabled()
 
 
+def test_identify_button_click_runs_read_mac(tab, monkeypatch):
+    """Regression: clicked(bool) used to arrive as esptool_cmd=False."""
+    started = []
+    monkeypatch.setattr(tab, "_start", lambda argv, phase: started.append(argv))
+    _select(tab, "/dev/ttyUSB0")
+    tab.identify_btn.click()
+    assert started, "identify did not start"
+    assert started[0][-1].endswith("--port /dev/ttyUSB0 read_mac")
+    assert tab._pending["cmd"] == "read_mac"
+
+
+def test_selection_clears_when_selected_board_disappears(qt_app, tmp_path):
+    attached = [
+        dv.AttachedBoard("/dev/ttyACM0", 0x303A, 0x1001, "", "", mac="aa:aa:aa:aa:aa:00"),
+        dv.AttachedBoard("/dev/ttyACM1", 0x303A, 0x1001, "", "", mac="aa:aa:aa:aa:aa:01"),
+        dv.AttachedBoard("/dev/ttyACM2", 0x303A, 0x1001, "", "", mac="aa:aa:aa:aa:aa:02"),
+    ]
+    t = gui.DevicesTab(dv.Registry(tmp_path / "d.json"), list_boards=lambda: list(attached),
+                       detect_hotspots=lambda: [], settings_path=tmp_path / "s.json",
+                       auto_refresh=False)
+    try:
+        t.select_port("/dev/ttyACM1")
+        del attached[1]                      # unplugged (BOOT + replug, reset…)
+        t.refresh()
+        assert t._selected_row() is None     # not silently ACM2
+        assert not t.flash_btn.isEnabled()
+    finally:
+        t.shutdown()
+
+
+def test_flashing_a_tx_adds_it_to_the_rx_filter(tab):
+    _select(tab, "/dev/ttyACM0")
+    tab.mode_tx.setChecked(True)
+    plan = tab.plan_flash()
+    tab._pending = {"kind": "flash", "job": plan.job, "mac": RX_MAC, "chip": ""}
+    tab._on_process_finished(0, "")
+    assert tab.macs_edit.text() == f"{FAR_TX}, {RX_MAC}"
+
+
+def test_rx_plan_warns_when_registered_tx_missing_from_filter(tab):
+    tab.registry.upsert(TX_MAC, label="Desk TX", role=dv.ROLE_TX)
+    _select(tab, "/dev/ttyACM0")
+    tab.mode_rx_alert.setChecked(True)
+    tab.macs_edit.setText(FAR_TX)            # stale: doesn't include Desk TX
+    plan = tab.plan_flash()
+    assert any("Desk TX" in w and "ignore" in w for w in plan.warnings)
+
+
+def test_flash_output_mac_wins_over_inferred_mac(tab):
+    _select(tab, "/dev/ttyUSB0")
+    tab.mode_tx.setChecked(True)
+    plan = tab.plan_flash()
+    stale = "11:11:11:11:11:11"              # e.g. from an Identify on a swapped board
+    tab._pending = {"kind": "flash", "job": plan.job, "mac": stale, "chip": ""}
+    tab._on_process_finished(0, "Chip is ESP32-S3 (QFN56)\nMAC: 34:85:18:aa:bb:cc\n")
+    assert tab.registry.get(stale) is None
+    rec = tab.registry.get("34:85:18:aa:bb:cc")
+    assert rec.role == dv.ROLE_TX and rec.chip == "ESP32-S3"
+
+
+def test_bridge_board_flash_registers_mac_without_identify(tab):
+    _select(tab, "/dev/ttyUSB0")
+    tab.mode_tx.setChecked(True)
+    plan = tab.plan_flash()
+    tab._pending = {"kind": "flash", "job": plan.job, "mac": "", "chip": ""}
+    tab._on_process_finished(0, "Chip type:   ESP32-S3 (QFN56)\nMAC:   34:85:18:aa:bb:dd\n")
+    assert tab.registry.get("34:85:18:aa:bb:dd").role == dv.ROLE_TX
+
+
+def test_rx_alert_on_bridge_board_warns_about_native_usb(tab):
+    _select(tab, "/dev/ttyUSB0")
+    tab.mode_rx_alert.setChecked(True)
+    tab.target_combo.setCurrentText("esp32s3")
+    assert any("native USB" in w for w in tab.plan_flash().warnings)
+    tab.target_combo.setCurrentText("esp32")      # classic ESP32: UART console
+    assert not any("native USB" in w for w in tab.plan_flash().warnings)
+
+
+def test_localize_plan_warns_when_no_hotspot_running(qt_app, tmp_path):
+    export = tmp_path / "export.sh"
+    export.write_text("")
+    t = gui.DevicesTab(dv.Registry(tmp_path / "d.json"), list_boards=_boards,
+                       detect_hotspots=lambda: [], settings_path=tmp_path / "s.json",
+                       idf_export=str(export), auto_refresh=False)
+    try:
+        t.select_port("/dev/ttyACM0")
+        t.mode_rx_loc.setChecked(True)
+        t.ssid_edit.setText("CSIDetector")
+        plan = t.plan_flash()
+        assert plan.job is not None
+        assert any("No running hotspot" in w for w in plan.warnings)
+    finally:
+        t.shutdown()
+
+
+def test_tx_plan_warns_when_rx_on_other_channel(tab):
+    tab.registry.upsert(TX_MAC, role=dv.ROLE_RX, label="North RX", config={"channel": 6})
+    _select(tab, "/dev/ttyACM0")
+    tab.mode_tx.setChecked(True)
+    assert any("North RX" in w and "channel 6" in w for w in tab.plan_flash().warnings)
+
+
+def test_fill_tx_macs_reports_truncation(tab):
+    for i in range(5):
+        tab.registry.upsert(f"aa:bb:cc:dd:ee:{i:02x}", role=dv.ROLE_TX)
+    tab.fill_tx_macs()
+    assert len(tab._filter_macs()) == fw.MAX_FILTER_MACS
+    assert "left out" in tab.log.toPlainText()
+
+
 def test_settings_persist_without_password(tab, tmp_path):
     tab.mode_rx_loc.setChecked(True)
     tab.ssid_edit.setText("CSIDetector")
@@ -256,10 +367,20 @@ def test_process_runner_cancel_kills_grandchildren(qt_app):
     runner.start(["bash", "-c", "sleep 60 & echo \"child $!\"; wait"], dict(os.environ))
     res = _run_until_finished(runner)
     assert res["code"] == -1 and runner.cancelled
-    pid = child["pid"]
-    stat = Path(f"/proc/{pid}/stat")
-    # Gone, or a zombie awaiting reaping by PID 1 — either way not sleeping.
-    assert not stat.exists() or stat.read_text().split(") ")[1].startswith("Z")
+    stat = Path(f"/proc/{child['pid']}/stat")
+
+    def dead() -> bool:
+        # Gone, or a zombie awaiting reaping by PID 1 — either way not sleeping.
+        try:
+            return stat.read_text().split(") ")[1].startswith("Z")
+        except (FileNotFoundError, ProcessLookupError):
+            return True
+
+    # SIGTERM delivery isn't instantaneous under load; allow a moment.
+    deadline = time.monotonic() + 3.0
+    while not dead() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert dead()
 
 
 def test_process_runner_reports_failed_start(qt_app):

@@ -82,10 +82,22 @@ def test_parse_esptool_identify(output, chip, mac):
     assert dv.parse_esptool_identify(output) == (chip, mac)
 
 
-def test_chip_to_target():
-    assert dv.chip_to_target("ESP32-S3") == "esp32s3"
-    assert dv.chip_to_target("ESP32") == "esp32"
-    assert dv.chip_to_target("") == ""
+@pytest.mark.parametrize("chip,target", [
+    ("ESP32-S3", "esp32s3"),
+    ("ESP32-S3-PICO-1", "esp32s3"),     # full part names from esptool
+    ("ESP32-S2FNR2", "esp32s2"),
+    ("ESP32-D0WD-V3", "esp32"),
+    ("ESP32-PICO-D4", "esp32"),
+    ("ESP32", "esp32"),
+    ("ESP32-C3", "esp32c3"),
+    ("ESP32-C5", "esp32c5"),
+    ("ESP32-C61", "esp32c61"),          # not esp32c6
+    ("esp32-s3", "esp32s3"),
+    ("", ""),
+    ("RP2040", ""),
+])
+def test_chip_to_target(chip, target):
+    assert dv.chip_to_target(chip) == target
 
 
 # --------------------------------------------------------------------------

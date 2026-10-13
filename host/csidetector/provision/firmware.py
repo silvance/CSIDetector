@@ -16,6 +16,7 @@ python shadows IDF's and ``idf.py`` dies with ``No module named 'click'``.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import ipaddress
 import os
 import re
@@ -32,6 +33,10 @@ from csidetector.provision.devices import ROLE_RX, ROLE_TX, normalize_mac
 MAX_FILTER_MACS = 4
 DEFAULT_TARGET = "esp32s3"
 TARGETS = ("esp32s3", "esp32c3", "esp32c5", "esp32s2", "esp32")
+# Chips with a USB-Serial/JTAG controller. The receiver's
+# sdkconfig.defaults routes its console (and the CSI stream) there, so on
+# these chips UART-mode CSI arrives on the native USB port only.
+USB_JTAG_TARGETS = frozenset({"esp32s3", "esp32c3", "esp32c5"})
 
 PROJECTS = {
     ROLE_TX: "csi_transmitter",
@@ -224,16 +229,44 @@ class FlashJob:
         return errors
 
 
+def _base_defaults_fingerprint(job: FlashJob) -> str:
+    """Hash of the project's own defaults files that idf.py will load.
+
+    kconfgen lets an existing sdkconfig win over defaults, so a `git pull`
+    that changes the project's sdkconfig.defaults would otherwise never
+    reach a cached build.
+    """
+    h = hashlib.sha256()
+    for name in ("sdkconfig.defaults", f"sdkconfig.defaults.{job.target}"):
+        path = job.project_dir / name
+        h.update(name.encode() + b"\0")
+        try:
+            h.update(path.read_bytes())
+        except OSError:
+            h.update(b"<absent>")
+    return h.hexdigest()
+
+
+def _private_dir(path: Path) -> None:
+    """mkdir -p, then 0700: generated sdkconfig / sdkconfig.h files under
+    the build dir carry the hotspot password and are written 0644."""
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
 def prepare_build_dir(job: FlashJob) -> bool:
     """Write the sdkconfig overlay; return True when it changed.
 
     SDKCONFIG_DEFAULTS only seeds values missing from an existing
-    sdkconfig, so when the overlay changes we delete the generated
-    sdkconfig to force the new values in. When it hasn't changed the
-    previous build is reused and only the flash step runs.
+    sdkconfig, so when the overlay or the project's own defaults change we
+    delete the generated sdkconfig to force the new values in. When
+    neither changed the previous build is reused and only the flash step
+    runs.
     """
-    content = render_sdkconfig_defaults(job.config.kconfig())
-    job.build_dir.mkdir(parents=True, exist_ok=True)
+    content = (f"# base-defaults-sha256: {_base_defaults_fingerprint(job)}\n"
+               + render_sdkconfig_defaults(job.config.kconfig()))
+    _private_dir(job.build_root)
+    _private_dir(job.build_dir)
     try:
         previous = job.overlay_path.read_text()
     except OSError:

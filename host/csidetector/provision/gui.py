@@ -252,7 +252,9 @@ class DevicesTab(QWidget):
         self.refresh_btn = QPushButton("Refresh")
         self.identify_btn = QPushButton("Identify (esptool)")
         self.refresh_btn.clicked.connect(self.refresh)
-        self.identify_btn.clicked.connect(self.identify_selected)
+        # Lambda, not the bound method: clicked(bool) would otherwise pass
+        # `checked` in as identify_selected's esptool_cmd.
+        self.identify_btn.clicked.connect(lambda: self.identify_selected())
         top = QHBoxLayout()
         top.addWidget(QLabel("Attached boards and registered devices"))
         top.addStretch(1)
@@ -488,6 +490,9 @@ class DevicesTab(QWidget):
         keep = selected.identity() if selected else None
         self._rows = rows
         self.table.blockSignals(True)
+        # Drop the old selection before rebuilding: Qt keeps the row
+        # *index*, which after an unplug points at a different board.
+        self.table.clearSelection()
         self.table.setRowCount(len(rows))
         for i, row in enumerate(rows):
             b, r = row.board, row.record
@@ -592,8 +597,27 @@ class DevicesTab(QWidget):
             self.fill_tx_macs()
 
     def fill_tx_macs(self) -> None:
-        macs = self.registry.tx_macs()[:fw.MAX_FILTER_MACS]
-        self.macs_edit.setText(", ".join(macs))
+        macs = self.registry.tx_macs()
+        if len(macs) > fw.MAX_FILTER_MACS:
+            self._append_log(
+                f"[setup] {len(macs)} transmitters are registered but a receiver "
+                f"filter holds {fw.MAX_FILTER_MACS}; left out: "
+                f"{', '.join(macs[fw.MAX_FILTER_MACS:])}")
+        self.macs_edit.setText(", ".join(macs[:fw.MAX_FILTER_MACS]))
+
+    def _filter_macs(self) -> list[str]:
+        return [m for m in re.split(r"[,;\s]+", self.macs_edit.text()) if m]
+
+    def _add_tx_to_filter(self, mac: str) -> None:
+        """A newly flashed TX joins the RX filter so the next receiver
+        flashed in this session hears it."""
+        current = [dv.try_normalize_mac(m) for m in self._filter_macs()]
+        if mac in current:
+            return
+        if len(current) >= fw.MAX_FILTER_MACS:
+            self._append_log(f"[setup] TX filter is full; {mac} not added.")
+            return
+        self.macs_edit.setText(", ".join(self._filter_macs() + [mac]))
 
     def detect_hotspot(self) -> None:
         hotspots = self._detect_hotspots()
@@ -612,16 +636,17 @@ class DevicesTab(QWidget):
         self._append_log(f"[setup] hotspot '{hs.connection}' on {hs.iface}: "
                          f"SSID={hs.ssid!r} channel={hs.channel or '?'} "
                          f"host IP={hs.ip or '?'}")
-        for tx in self._txs_on_other_channel(self.channel_spin.value()):
-            self._append_log(f"[setup] note: {tx} — receivers and transmitters "
+        for note in self._nodes_on_other_channel(dv.ROLE_TX, self.channel_spin.value()):
+            self._append_log(f"[setup] note: {note} — receivers and transmitters "
                              f"must all share the hotspot channel.")
 
-    def _txs_on_other_channel(self, channel: int) -> list[str]:
+    def _nodes_on_other_channel(self, role: str, channel: int) -> list[str]:
         out = []
         for rec in self.registry.all():
             ch = rec.config.get("channel") if isinstance(rec.config, dict) else None
-            if rec.role == dv.ROLE_TX and isinstance(ch, int) and ch != channel:
-                out.append(f"TX {rec.label or rec.mac} was flashed on channel {ch}")
+            if rec.role == role and isinstance(ch, int) and ch != channel:
+                out.append(f"{role.upper()} {rec.label or rec.mac} was flashed "
+                           f"on channel {ch}")
         return out
 
     def plan_flash(self) -> FlashPlan:
@@ -641,8 +666,7 @@ class DevicesTab(QWidget):
             config: fw.Config = fw.TxConfig(channel=channel,
                                             rate_hz=self.rate_spin.value())
         else:
-            macs = [m for m in re.split(r"[,;\s]+", self.macs_edit.text()) if m]
-            config = fw.RxConfig(channel=channel, tx_macs=macs)
+            config = fw.RxConfig(channel=channel, tx_macs=self._filter_macs())
             if mode == MODE_RX_LOCALIZE:
                 config.ssid = self.ssid_edit.text()
                 config.password = self.pass_edit.text()
@@ -661,17 +685,43 @@ class DevicesTab(QWidget):
         if plan.errors:
             return plan
 
+        if isinstance(config, fw.TxConfig):
+            for note in self._nodes_on_other_channel(dv.ROLE_RX, channel):
+                plan.warnings.append(f"{note}, but this transmitter will use "
+                                     f"channel {channel}.")
         if isinstance(config, fw.RxConfig):
             if not config.tx_macs:
                 plan.warnings.append(
                     "The TX MAC filter is empty, so this receiver will report CSI "
                     "from ANY ESP-NOW transmitter nearby.")
-            for note in self._txs_on_other_channel(channel):
+            else:
+                in_filter = {dv.normalize_mac(m) for m in config.tx_macs}
+                missing = [r for r in self.registry.all()
+                           if r.role == dv.ROLE_TX and r.mac not in in_filter]
+                if missing and len(in_filter) < fw.MAX_FILTER_MACS:
+                    names = ", ".join(r.label or r.mac for r in missing)
+                    plan.warnings.append(
+                        f"Registered transmitter(s) not in this receiver's MAC "
+                        f"filter: {names}. The receiver will ignore them. Click "
+                        f"'Use registered TXs' to include them.")
+            for note in self._nodes_on_other_channel(dv.ROLE_TX, channel):
                 plan.warnings.append(f"{note}, but this receiver will use "
                                      f"channel {channel}.")
+            if (config.uart_only and row.board.vid != dv.ESPRESSIF_VID
+                    and job.target in fw.USB_JTAG_TARGETS):
+                plan.warnings.append(
+                    f"This receiver streams CSI over the chip's native USB port, "
+                    f"not the {row.board.interface} you're flashing through. For "
+                    f"alert mode, connect the board's native USB port (often "
+                    f"labelled 'USB') to this computer and run detection on that.")
             if config.ssid:
                 hotspots = self._detect_hotspots()
-                if hotspots:
+                if not hotspots:
+                    plan.warnings.append(
+                        "No running hotspot was detected, so the SSID, host IP and "
+                        "channel couldn't be checked. Start the hotspot "
+                        "(./start.sh) and use 'Detect from hotspot' to be sure.")
+                else:
                     ips = {h.ip for h in hotspots if h.ip}
                     ssids = {h.ssid for h in hotspots}
                     chans = {h.channel for h in hotspots if h.channel}
@@ -814,18 +864,28 @@ class DevicesTab(QWidget):
         if code == 0:
             self.progress.setValue(100)
             self.phase_label.setText("Flashed ✓")
-            mac = pending["mac"]
+            # esptool prints the chip and MAC as it connects. That's the
+            # board that was actually written, so it wins over the MAC we
+            # inferred from the USB serial or an earlier Identify (which
+            # can be stale if a bridge board was swapped mid-session).
+            out_chip, out_mac = dv.parse_esptool_identify(output)
+            mac = out_mac or pending["mac"]
+            if out_mac and pending["mac"] and out_mac != pending["mac"]:
+                self._append_log(f"[setup] note: esptool reports MAC {out_mac}, "
+                                 f"not {pending['mac']}; recording {out_mac}.")
             if mac:
                 rec = self.registry.get(mac)
                 self.registry.upsert(
                     mac, role=job.role, firmware=job.project,
                     last_flashed=time.time(), config=job.config.summary(),
-                    chip=pending["chip"] or (rec.chip if rec else ""))
+                    chip=out_chip or pending["chip"] or (rec.chip if rec else ""))
                 self._append_log(f"[setup] recorded {mac} as {job.role.upper()}")
+                if job.role == dv.ROLE_TX:
+                    self._add_tx_to_filter(mac)
                 self.flashed.emit(mac, job.role)
             else:
-                self._append_log("[setup] flashed OK. This board's MAC is unknown "
-                                 "(USB-UART bridge) — click Identify to register it.")
+                self._append_log("[setup] flashed OK, but the board's MAC wasn't "
+                                 "reported — click Identify to register it.")
                 self.flashed.emit("", job.role)
             return
         if cancelled:

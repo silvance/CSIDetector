@@ -130,6 +130,39 @@ def test_prepare_build_dir_reuses_build_when_config_unchanged(tmp_path):
     assert "CONFIG_CSI_RX_CHANNEL=6" in job.overlay_path.read_text()
 
 
+def test_prepare_build_dir_rebuilds_when_project_defaults_change(tmp_path):
+    """A `git pull` that edits the project's sdkconfig.defaults must reach
+    the cached build — kconfgen would otherwise keep the stale value."""
+    root = tmp_path / "firmware"
+    proj = root / "csi_transmitter"
+    proj.mkdir(parents=True)
+    (proj / "CMakeLists.txt").write_text("")
+    (proj / "sdkconfig.defaults").write_text("CONFIG_A=y\n")
+    job = fw.FlashJob(port="/dev/ttyACM0", config=fw.TxConfig(),
+                      firmware_root=root, build_root=tmp_path / "cache")
+    assert fw.prepare_build_dir(job) is True
+    job.sdkconfig_path.write_text("generated\n")
+    assert fw.prepare_build_dir(job) is False
+
+    (proj / "sdkconfig.defaults").write_text("CONFIG_A=n\n")
+    assert fw.prepare_build_dir(job) is True
+    assert not job.sdkconfig_path.exists()
+
+    # A target-specific defaults file appearing counts too.
+    job.sdkconfig_path.write_text("generated\n")
+    (proj / "sdkconfig.defaults.esp32s3").write_text("CONFIG_B=y\n")
+    assert fw.prepare_build_dir(job) is True
+
+
+def test_build_dirs_are_private(tmp_path):
+    """Generated sdkconfig / sdkconfig.h hold the hotspot password and are
+    written 0644 by kconfgen, so the directories must block other users."""
+    job = _job(tmp_path / "cache", fw.RxConfig(ssid="X", password="hunter22"))
+    fw.prepare_build_dir(job)
+    assert stat.S_IMODE(os.stat(job.build_dir).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(job.build_root).st_mode) == 0o700
+
+
 def test_flash_command_quotes_paths_and_keeps_secrets_out(tmp_path):
     export = tmp_path / "esp idf" / "export.sh"
     job = _job(tmp_path, fw.RxConfig(ssid="My Hotspot", password="hunter22"))
