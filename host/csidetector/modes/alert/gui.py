@@ -24,7 +24,6 @@ import json
 import os
 import platform
 import queue
-import re
 import subprocess
 import threading
 import time
@@ -413,7 +412,7 @@ class _RecordWorker(QObject):
         st = {"emit": 0.0, "data": time.time(), "warned": False}
 
         def tick(now: float) -> None:
-            if self._writer is None and now >= start_at:
+            if self._writer is None and now >= start_at and not self._stop.is_set():
                 self._open(now)
             w = self._writer
             if w is not None:
@@ -457,14 +456,20 @@ class _RecordWorker(QObject):
         meta = dict(self._meta)
         meta["started"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
         meta["started_unix"] = round(now, 3)
-        path = self._folder / recording.recording_name(meta.get("condition", ""), now)
-        self._writer = recording.RecordingWriter(path, meta)
+        self._writer = recording.new_recording(self._folder, meta.get("condition", ""),
+                                               meta, now)
         self._end_at = now + self._length_s
 
     def _finish_file(self) -> None:
         w, self._writer = self._writer, None
         if w is None:
             return                         # stopped before recording began
+        while True:                        # marks pressed just before the end
+            try:
+                self._marks.get_nowait()
+            except queue.Empty:
+                break
+            w.mark()
         if w.samples == 0:
             w.abandon()
             if self._stopped_by != "error":
@@ -478,14 +483,24 @@ class _RecordWorker(QObject):
 
 
 def _git_commit() -> str:
-    """The checked-out commit, so a recording says which code made it."""
+    """The checked-out commit (``+dirty`` with local edits), so a recording
+    says which code made it."""
+    here = Path(__file__).resolve().parent
+    kw = dict(cwd=here, capture_output=True, text=True, timeout=3,
+              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
-        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
-                             cwd=Path(__file__).resolve().parent,
-                             capture_output=True, text=True, timeout=3)
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], **kw)
+        if head.returncode != 0:
+            return ""
+        dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], **kw)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return out.stdout.strip() if out.returncode == 0 else ""
+    return head.stdout.strip() + ("+dirty" if dirty.stdout.strip() else "")
+
+
+# Board settings a recording may carry: what shapes the CSI, nothing that
+# names the network or could be secret.
+_BOARD_CONFIG_KEYS = ("channel", "rate_hz", "tx_macs", "mode")
 
 
 def _board_info(mac: str) -> dict:
@@ -503,9 +518,29 @@ def _board_info(mac: str) -> dict:
     out = {k: rec[k] for k in ("label", "role", "chip", "firmware") if k in rec}
     config = rec.get("config")
     if isinstance(config, dict):
-        out["config"] = {k: v for k, v in config.items()
-                         if not re.search(r"pass|psk|token|secret", k, re.I)}
+        out["config"] = {k: config[k] for k in _BOARD_CONFIG_KEYS if k in config}
     return out
+
+
+def _writable_recordings_dir() -> tuple[Path, str]:
+    """(folder, note): Documents/CSIDetector recordings, or the home
+    folder's if Documents can't be written to (e.g. Windows' Controlled
+    folder access). Checked before recording starts, not after the user
+    has left the room. Raises OSError if neither works."""
+    first = recordings_dir()
+    error: Optional[OSError] = None
+    for folder in (first, Path.home() / "CSIDetector recordings"):
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            probe = folder / f".write-test-{os.getpid()}"
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError as exc:
+            error = error or exc
+            continue
+        note = "" if folder == first else f" ({first} can't be written to: {error})"
+        return folder, note
+    raise error or OSError(f"can't write to {first}")
 
 
 # --------------------------------------------------------------------------
@@ -944,6 +979,7 @@ class CSIDetectorWindow(QMainWindow):
         if self._rec_worker is not None:          # the button reads "Stop"
             self._rec_worker.request_stop("stop button")
             self._record_btn.setEnabled(False)    # until the file is closed
+            self._mark_btn.setEnabled(False)
             return
         if self._detect_thread is not None or self._calib_thread is not None:
             return
@@ -954,6 +990,13 @@ class CSIDetectorWindow(QMainWindow):
                 f"Recording reads the receiver's serial port, but this monitor "
                 f"reads {source}. Run the setup wizard to point it at the "
                 f"receiver.")
+            return
+        try:
+            folder, folder_note = _writable_recordings_dir()
+        except OSError as exc:
+            QMessageBox.warning(self, "Can't save recordings",
+                                f"Recordings go in {recordings_dir()}, but it can't be "
+                                f"written to:\n\n{exc}")
             return
         st = self._state
         key = self._rec_condition.currentData()
@@ -968,7 +1011,6 @@ class CSIDetectorWindow(QMainWindow):
             "receiver": _board_info(st.receiver_mac),
             "transmitter": _board_info(st.transmitter_mac),
             "channel": st.channel,
-            "location": st.location,
             "baseline": st.baseline,
             "baseline_age_s": round(time.time() - st.baseline_ts) if st.baseline_ts else None,
             "enter_ratio": st.enter_ratio,
@@ -980,7 +1022,7 @@ class CSIDetectorWindow(QMainWindow):
             "platform": platform.platform(),
             "python": platform.python_version(),
         }
-        worker = _RecordWorker(source, recordings_dir(), meta,
+        worker = _RecordWorker(source, folder, meta,
                                delay_s=float(self._rec_delay.value()),
                                length_s=float(self._rec_length.value() * 60))
         thread = QThread(self)
@@ -1006,7 +1048,8 @@ class CSIDetectorWindow(QMainWindow):
         for w in (self._rec_condition, self._rec_note, self._rec_delay, self._rec_length):
             w.setEnabled(False)
         self._badge.set_state("REC", "starting…")
-        self._rec_status.setText(f"Recording: {self._rec_condition.currentText()}.")
+        self._rec_status.setText(f"Recording: {self._rec_condition.currentText()}, "
+                                 f"into {folder}.{folder_note}")
 
     def _on_rec_progress(self, phase: str, seconds_left: float, samples: int) -> None:
         left = f"{int(seconds_left) // 60}:{int(seconds_left) % 60:02d}"
@@ -1045,14 +1088,19 @@ class CSIDetectorWindow(QMainWindow):
                 f"{summary.get('samples', 0):,} samples at "
                 f"{summary.get('rate_hz', 0):.0f} Hz) in {p.parent}. "
                 f"Send this file to the developers.")
+        if summary.get("stopped_by") == "error":
+            text += " ⚠ It stopped early (see the message); what came before is kept."
         if summary.get("gaps_over_1s"):
             text += (f" ⚠ The stream paused {summary['gaps_over_1s']} time(s) "
-                     f"for over a second.")
+                     f"for over a second (longest {summary.get('max_gap_s', 0):.0f} s).")
         self._rec_status.setText(text)
 
     def _on_rec_error(self, msg: str) -> None:
-        if not self._closed:
-            QMessageBox.warning(self, "Recording problem", msg)
+        if self._closed:
+            return
+        if not self._rec_saved:
+            self._rec_status.setText("✗ " + msg.split("\n")[0])
+        QMessageBox.warning(self, "Recording problem", msg)
 
     def _on_rec_finished(self) -> None:
         self._rec_thread = None
@@ -1224,8 +1272,14 @@ def run_gui(source: Optional[str] = None,
             location: Optional[str] = None) -> int:
     """Launch the alert-mode GUI. CLI args override the persisted state."""
     import sys
+    from csidetector.provision.gui import _install_excepthook, _quit_on_signals
     app = QApplication(sys.argv)
+    _install_excepthook()
     win = CSIDetectorWindow(alert_config_path=alert_config or "")
+    # Ctrl+C / closing the terminal: stop the workers so a recording's file
+    # is finished, not cut off.
+    app.aboutToQuit.connect(win.stop_workers)
+    _quit_on_signals(app)
     # CLI overrides land in the persisted state so they survive a relaunch.
     if source:
         win._state.source = source

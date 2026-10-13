@@ -391,10 +391,13 @@ Improving detection needs real captures, so the monitor has a
 Each recording is one file in `Documents/CSIDetector recordings`, for
 example `2026-10-13_213102_walk.csi.gz` (**Open folder** shows it). That
 file is what to send: it holds the receiver's raw CSI lines plus what
-they were recorded under (condition, note, marks, boards, channel,
-baseline, app version). It holds no Wi-Fi password or Telegram token, and
-the firmware's other log lines are left out. A useful set is one
-recording of each condition with the boards where they'll be used.
+they were recorded under (condition, note, marks, board labels and
+chips, channel, baseline, app version). It holds no Wi-Fi name or
+password, Telegram token or location label, and the firmware's other
+log lines are left out. A useful set is one recording of each condition
+with the boards where they'll be used. When a recording ends, the panel
+says how much it got and warns if the stream paused, e.g. because the
+transmitter lost power.
 
 Recording uses the receiver's serial port, so it runs while the monitor
 is disarmed. A recording also replays anywhere a capture file is

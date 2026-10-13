@@ -54,6 +54,14 @@ where it came from. Add to it rather than opening another review round.
   image not found" when opened on Linux. Re-select the image once and
   save.
 
+- **Recording: the wizard can end it unannounced** (recording review).
+  Re-running the setup wizard closes an open alert monitor; a recording
+  in progress is finished and kept, but the user isn't told.
+- **Recording: closing the console window on Windows** (recording
+  review) ends the process without a chance to finish the file. The
+  file is flushed every 2 s, so it keeps everything but the last
+  couple of seconds and has no end summary; it still replays.
+
 ## Test tooling
 
 - **The fake idf.py reads the bench once** (GUI tester). It loads
