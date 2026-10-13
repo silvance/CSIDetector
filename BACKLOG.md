@@ -44,6 +44,15 @@ where it came from. Add to it rather than opening another review round.
   when the path has spaces. On a volume with short names disabled,
   flashing refuses with the "path with spaces" message and asks for
   `CSIDETECTOR_BUILD_DIR`.
+- **Windows: export.bat writes into the app's working directory**
+  (Windows CI review). ESP-IDF's export.bat (v5.2) writes an
+  `UNINSTALL_OUTPUT` file in the current directory, which is `host\`
+  when started from setup-windows.bat. A read-only folder only adds an
+  error line to the flash log.
+- **links.json files saved on Windows before the forward-slash fix**
+  (Windows CI review) keep a backslash image path and show "Floor plan
+  image not found" when opened on Linux. Re-select the image once and
+  save.
 
 ## Test tooling
 

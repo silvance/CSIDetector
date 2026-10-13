@@ -173,7 +173,13 @@ class ProcessRunner(QObject):
             # On Windows this arrives from inside QProcess.start(); report
             # it once start() has returned, as POSIX does, so callers see
             # started → finished in that order either way.
-            QTimer.singleShot(0, lambda: self._finish(-1, msg))
+            QTimer.singleShot(0, lambda: self._report_failed_start(msg))
+
+    def _report_failed_start(self, msg: str) -> None:
+        try:
+            self._finish(-1, msg)
+        except RuntimeError:
+            pass        # the runner's owner was deleted in the meantime
 
     def _on_finished(self, code: int, status: QProcess.ExitStatus) -> None:
         if self._proc is None:

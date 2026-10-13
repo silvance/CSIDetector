@@ -351,6 +351,37 @@ def test_windows_export_env_for_the_installer_layout(tmp_path):
     assert other == {"PATH": "/bin"}                 # not the installer layout: as is
 
 
+def test_windows_export_env_picks_the_python_the_idf_virtualenv_was_made_with(tmp_path):
+    """Two installer generations under one root: IDF 4.4's python 3.8 and
+    IDF 5.x's 3.11. export.bat under the wrong one looks for a virtualenv
+    that doesn't exist (idf5.2_py3.8_env), and a string sort puts 3.8.7
+    after 3.11.2."""
+    root = tmp_path / "Espressif"
+    for v in ("3.8.7", "3.11.2"):
+        (root / "tools" / "idf-python" / v).mkdir(parents=True)
+    for v in ("2.9.0", "2.44.0"):
+        (root / "tools" / "idf-git" / v / "cmd").mkdir(parents=True)
+    (root / "python_env" / "idf4.4_py3.8_env").mkdir(parents=True)
+    (root / "python_env" / "idf5.2_py3.11_env").mkdir()
+    for idf in ("esp-idf-v5.2.1", "esp-idf-v4.4.7", "esp-idf-v5.5"):
+        (root / "frameworks" / idf).mkdir(parents=True)
+
+    def front(idf):
+        env = fw.windows_export_env(root / "frameworks" / idf / "export.bat", {"Path": "/bin"})
+        return [os.path.basename(os.path.dirname(p)) if p.endswith("cmd")
+                else os.path.basename(p) for p in env["Path"].split(os.pathsep)[:2]]
+
+    assert front("esp-idf-v5.2.1") == ["3.11.2", "2.44.0"]
+    assert front("esp-idf-v4.4.7") == ["3.8.7", "2.44.0"]
+    assert front("esp-idf-v5.5") == ["3.11.2", "2.44.0"]     # no virtualenv yet: newest
+    # Started from an "ESP-IDF 5.2 CMD" prompt: the virtualenv is already
+    # on PATH and export.bat won't re-add it, so nothing goes in front.
+    prompt = {"Path": "C:\\Espressif\\python_env\\idf5.2_py3.11_env\\Scripts;C:\\Windows",
+              "IDF_PYTHON_ENV_PATH": "C:\\Espressif\\python_env\\idf5.2_py3.11_env"}
+    env = fw.windows_export_env(root / "frameworks" / "esp-idf-v5.2.1" / "export.bat", prompt)
+    assert env["Path"] == prompt["Path"] and env["IDF_TOOLS_PATH"] == str(root)
+
+
 def test_esptool_missing_hint():
     assert any("environment didn't load" in h for h in fw.failure_hints(
         "C:\\py\\python.exe: No module named esptool"))
