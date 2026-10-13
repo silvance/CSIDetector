@@ -151,6 +151,7 @@ class RoomCanvas(QGraphicsView):
     edited = pyqtSignal()                 # the layout changed on the canvas
     selection = pyqtSignal(object)        # the selected Node, or None
     hovered = pyqtSignal(float, float)    # mouse position in meters
+    corner_selection = pyqtSignal(int)    # index of the one selected corner
     picked = pyqtSignal(float, float)     # a click while picking points
     image_moved = pyqtSignal()            # the floor plan was dragged
 
@@ -388,8 +389,12 @@ class RoomCanvas(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def _on_selection(self) -> None:
-        nodes = [i.node for i in self.scene().selectedItems() if isinstance(i, _NodeItem)]
+        selected = self.scene().selectedItems()
+        nodes = [i.node for i in selected if isinstance(i, _NodeItem)]
         self.selection.emit(nodes[0] if len(nodes) == 1 else None)
+        corners = [i.index for i in selected if isinstance(i, _CornerItem)]
+        if len(corners) == 1:
+            self.corner_selection.emit(corners[0])
 
     def select_node(self, node: Optional[lo.Node]) -> None:
         self.scene().blockSignals(True)
@@ -430,6 +435,7 @@ class RoomTab(QWidget):
             lambda x, y: self.coords.setText(f"x {x:5.2f} m   y {y:5.2f} m"))
         self.canvas.picked.connect(self._on_picked)
         self.canvas.image_moved.connect(lambda: self._set_dirty(True))
+        self.canvas.corner_selection.connect(self._on_canvas_corner)
 
         # File row
         self.path_edit = QLineEdit(str(self.path))
@@ -493,6 +499,7 @@ class RoomTab(QWidget):
         self.corners.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.corners.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.corners.itemChanged.connect(self._on_corner_cell)
+        self.corners.itemSelectionChanged.connect(self._on_corner_row)
         add_corner = QPushButton("Add corner")
         add_corner.setToolTip("Split the wall after the selected corner (or "
                               "double-click a wall on the plan).")
@@ -655,6 +662,7 @@ class RoomTab(QWidget):
                 QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return False
         fp = layout.floorplan
+        old_image = fp.image if fp is not None else None
         if fp is not None and path.resolve() != self.path.resolve():
             # Saved elsewhere: the image path is relative to links.json.
             fp.image = lo.relative_image_path(
@@ -662,6 +670,8 @@ class RoomTab(QWidget):
         try:
             layout.save(path)
         except (OSError, ValueError) as exc:
+            if fp is not None:
+                fp.image = old_image      # still relative to self.path
             QMessageBox.warning(self, "Couldn't save", f"{type(exc).__name__}: {exc}")
             return False
         self.path = path
@@ -830,6 +840,23 @@ class RoomTab(QWidget):
         self.canvas.model.remove_node(node)
         self.canvas.rebuild(keep_image=True)
         self._edited()
+
+    def _on_canvas_corner(self, index: int) -> None:
+        self.corners.blockSignals(True)
+        self.corners.selectRow(index)
+        self.corners.blockSignals(False)
+
+    def _on_corner_row(self) -> None:
+        """A row picked in the table wins over an older pick on the plan."""
+        if self._filling:
+            return
+        rows = self.corners.selectionModel().selectedRows()
+        scene = self.canvas.scene()
+        scene.blockSignals(True)
+        scene.clearSelection()
+        if rows and rows[0].row() < len(self.canvas.corner_items):
+            self.canvas.corner_items[rows[0].row()].setSelected(True)
+        scene.blockSignals(False)
 
     def _selected_corner(self) -> int:
         on_canvas = [i.index for i in self.canvas.scene().selectedItems()

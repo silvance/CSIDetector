@@ -873,6 +873,18 @@ def room_selection_and_image_move(s: Session) -> None:
     first = canvas.model.corners[0]
     s.click("Remove corner")
     s.expect(first not in canvas.model.corners, "removed the corner selected on the plan")
+    s.click("Add corner")                          # back to four corners
+    canvas.corner_items[0].setSelected(True)       # picked on the plan, then
+    s.widget("Corners").selectRow(2)               # a row picked in the table
+    third = canvas.model.corners[2]
+    s.click("Remove corner")
+    s.expect(third not in canvas.model.corners and len(canvas.model.corners) == 3,
+             "the latest pick (the table row) is removed")
+    # A save that fails mustn't leave the image path rewritten in memory.
+    image = canvas.model.floorplan.image
+    s.fill("links.json path", str(s.host_dir))     # a folder: the save fails
+    s.click("Save")
+    s.expect(canvas.model.floorplan.image == image, "image path unchanged by a failed save")
 
 
 SCENARIOS = {f.__name__: f for f in (
