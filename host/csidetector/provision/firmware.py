@@ -51,6 +51,34 @@ PROJECTS = {
 
 IS_WINDOWS = os.name == "nt"
 EXPORT_NAME = "export.bat" if IS_WINDOWS else "export.sh"
+# Where ESP-IDF usually puts it, for messages.
+EXPORT_EXAMPLE = (r"C:\Espressif\frameworks\esp-idf-v5.x\export.bat" if IS_WINDOWS
+                  else "~/esp/esp-idf/export.sh")
+# The default Windows Mobile hotspot address.
+WINDOWS_HOTSPOT_IP = "192.168.137.1"
+
+
+def local_ipv4_addresses() -> list[str]:
+    """This computer's IPv4 addresses (not loopback), for picking the host
+    IP when the hotspot can't be read automatically (Windows, macOS)."""
+    import socket
+    found: list[str] = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.append(info[4][0])
+    except OSError:
+        pass
+    try:   # the address of the default route (no packet is sent)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("10.255.255.255", 1))
+            found.append(sock.getsockname()[0])
+    except OSError:
+        pass
+    out = []
+    for ip in found:
+        if not ip.startswith("127.") and ip not in out:
+            out.append(ip)
+    return out
 
 
 def repo_firmware_root() -> Path:

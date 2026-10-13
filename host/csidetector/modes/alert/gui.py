@@ -36,7 +36,7 @@ from PyQt6.QtCore import (
     QObject, QThread, Qt, QTimer, pyqtSignal, pyqtSlot,
 )
 from PyQt6.QtGui import (
-    QColor, QFont, QPainter, QPaintEvent, QPen,
+    QColor, QFont, QFontDatabase, QPainter, QPaintEvent, QPen,
 )
 from PyQt6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
@@ -80,7 +80,7 @@ def _friendly_source_error(source: str, exc: Exception) -> str:
 
 @dataclass
 class _PersistedState:
-    source: str = "/dev/ttyACM0"
+    source: str = "COM3" if os.name == "nt" else "/dev/ttyACM0"
     baseline: float = 0.0
     baseline_ts: float = 0.0
     enter_ratio: float = 1.7
@@ -442,7 +442,8 @@ class CSIDetectorWindow(QMainWindow):
         # --- widgets -----------------------------------------------------
         self._badge = _StatusBadge()
         self._ratio_label = QLabel("Ratio: — (threshold —)")
-        self._ratio_label.setFont(QFont("monospace"))
+        mono = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+        self._ratio_label.setFont(mono)
         self._ratio_bar = QProgressBar()
         self._ratio_bar.setRange(0, 300)   # 0.00× to 3.00×
         self._ratio_bar.setTextVisible(False)
@@ -455,7 +456,7 @@ class CSIDetectorWindow(QMainWindow):
         self._sparkline.set_threshold(self._state.enter_ratio)
 
         self._stats = QLabel("")
-        self._stats.setFont(QFont("monospace"))
+        self._stats.setFont(mono)
         self._stats.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
         self._calibrate_btn = QPushButton("Calibrate")

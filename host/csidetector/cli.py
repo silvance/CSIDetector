@@ -395,8 +395,9 @@ def _attach_alert_gui(p: argparse.ArgumentParser) -> None:
 
 def _attach_setup(p: argparse.ArgumentParser) -> None:
     p.add_argument("--idf-export", default=None,
-                   help="path to ESP-IDF's export.sh (default: $IDF_EXPORT, "
-                        "$IDF_PATH/export.sh, or ~/esp/esp-idf/export.sh)")
+                   help="path to ESP-IDF's export.sh, or export.bat on Windows "
+                        "(default: $IDF_EXPORT, $IDF_PATH, ~/esp/esp-idf, or on "
+                        "Windows the ESP-IDF installer's C:\\Espressif)")
     p.add_argument("--wizard", action="store_true",
                    help="open the step-by-step setup wizard straight away")
     p.set_defaults(func=cmd_setup)
