@@ -40,6 +40,11 @@ class Node:
     placed: bool = True        # False: a provisional spot from the wizard
     extra: dict = dataclasses.field(default_factory=dict)   # other JSON keys
 
+    def __post_init__(self) -> None:
+        if self.role not in (ROLE_TX, ROLE_RX):
+            raise ValueError(f"a board in the layout must be a transmitter or a "
+                             f"receiver, not {self.role!r}")
+
     def to_dict(self) -> dict:
         out = dict(self.extra)
         out.update(mac=self.mac, x=round(self.x, 3), y=round(self.y, 3))
@@ -75,7 +80,14 @@ class Floorplan:
         return (self.origin_px[0] + x * self.px_per_m,
                 self.origin_px[1] - y * self.px_per_m)
 
+    def valid(self) -> bool:
+        return (math.isfinite(self.px_per_m) and self.px_per_m > 0
+                and all(math.isfinite(c) for c in self.origin_px))
+
     def to_dict(self) -> dict:
+        if not self.valid():
+            raise ValueError("the floor plan's scale or position is invalid; "
+                             "set the scale again")
         return {"image": self.image, "px_per_m": round(self.px_per_m, 4),
                 "origin_px": [round(self.origin_px[0], 2), round(self.origin_px[1], 2)],
                 "opacity": round(self.opacity, 2)}
@@ -102,12 +114,14 @@ class Layout:
     def __init__(self, corners: Optional[list[Point]] = None,
                  nodes: Optional[list[Node]] = None,
                  floorplan: Optional[Floorplan] = None,
-                 extra: Optional[dict] = None):
+                 extra: Optional[dict] = None,
+                 room_extra: Optional[dict] = None):
         w, h = DEFAULT_SIZE
         self.corners: list[Point] = list(corners or [(0, 0), (w, 0), (w, h), (0, h)])
         self.nodes: list[Node] = list(nodes or [])
         self.floorplan = floorplan
         self.extra: dict = dict(extra or {})     # top-level keys we don't edit
+        self.room_extra: dict = dict(room_extra or {})   # e.g. a "_comment" in room
 
     # -- (de)serialisation -------------------------------------------------
 
@@ -117,6 +131,8 @@ class Layout:
         pf.validate_links_shape(data)
         data = copy.deepcopy(data)
         room = data.pop("room", None) or {}
+        room_extra = {k: v for k, v in room.items()
+                      if k not in ("polygon", "width_m", "height_m")}
         if "polygon" in room:
             corners = [(float(x), float(y)) for x, y in room["polygon"]]
         elif "width_m" in room:
@@ -131,8 +147,10 @@ class Layout:
         rxs = data.pop("rxs", None) or []
         nodes = [cls._node(n, ROLE_TX) for n in txs or []]
         nodes += [cls._node(n, ROLE_RX) for n in rxs]
-        floorplan = Floorplan.from_dict(data.pop("floorplan", None))
-        return cls(corners, nodes, floorplan, data)
+        floorplan = Floorplan.from_dict(data.get("floorplan"))
+        if floorplan is not None:
+            del data["floorplan"]        # else it stays in extra, untouched
+        return cls(corners, nodes, floorplan, data, room_extra)
 
     @staticmethod
     def _node(raw: dict, role: str) -> Node:
@@ -145,7 +163,8 @@ class Layout:
 
     def to_dict(self) -> dict:
         out = dict(self.extra)
-        out["room"] = {"polygon": [[round(x, 3), round(y, 3)] for x, y in self.corners]}
+        out["room"] = dict(self.room_extra)
+        out["room"]["polygon"] = [[round(x, 3), round(y, 3)] for x, y in self.corners]
         out["txs"] = [n.to_dict() for n in self.nodes if n.role == ROLE_TX]
         out["rxs"] = [n.to_dict() for n in self.nodes if n.role == ROLE_RX]
         if self.floorplan is not None:
@@ -166,7 +185,12 @@ class Layout:
         return cls.from_dict(data)
 
     def save(self, path: Path) -> Optional[Path]:
-        """Validate and write (keeping a backup). Returns the backup path."""
+        """Validate and write (keeping a backup). Returns the backup path.
+        Raises ValueError, writing nothing, if problems() isn't empty: the
+        heatmap can't use a layout without a TX and an RX, say."""
+        problems = self.problems()
+        if problems:
+            raise ValueError(" ".join(problems))
         return pf.save_links(Path(path), self.to_dict())
 
     # -- queries -------------------------------------------------------------
@@ -245,11 +269,18 @@ class Layout:
         self.corners = [(0.0, 0.0), (width, 0.0), (width, height), (0.0, height)]
 
     def add_node(self, mac: str, role: str, label: str = "") -> Node:
-        """Add a board at the room's middle, marked not placed."""
+        """Add a board near the room's middle, marked not placed (fanned out
+        so several added in a row don't hide each other)."""
         if self.find(mac) is not None:
             raise ValueError(f"{mac} is already in the layout")
         cx, cy = centroid(self.corners)
-        node = Node(normalize_mac(mac), role, cx, cy, label, placed=False)
+        for k in range(len(self.nodes) + 1):
+            # A loose spiral of 0.4 m steps around the centre.
+            angle, radius = k * 2.4, 0.4 * math.sqrt(k)
+            x, y = cx + radius * math.cos(angle), cy + radius * math.sin(angle)
+            if all(math.hypot(n.x - x, n.y - y) > 0.3 for n in self.nodes):
+                break
+        node = Node(normalize_mac(mac), role, round(x, 2), round(y, 2), label, placed=False)
         self.nodes.append(node)
         return node
 
@@ -288,7 +319,8 @@ def _segments_cross(p1: Point, p2: Point, p3: Point, p4: Point) -> bool:
 
 
 def self_intersects(pts: list[Point]) -> bool:
-    """Proper crossings between non-adjacent walls."""
+    """Walls crossing each other — properly, or by one passing through a
+    corner of a non-adjacent wall (easy to make with snapping)."""
     n = len(pts)
     edges = [(pts[i], pts[(i + 1) % n]) for i in range(n)]
     for i in range(n):
@@ -296,6 +328,16 @@ def self_intersects(pts: list[Point]) -> bool:
             if i == 0 and j == n - 1:
                 continue                     # adjacent through the closing wall
             if _segments_cross(*edges[i], *edges[j]):
+                return True
+    for k in range(n):
+        # Corner k lies on a wall that doesn't end at it, and the outline
+        # goes from one side of that wall to the other through it.
+        prev, here, nxt = pts[k - 1], pts[k], pts[(k + 1) % n]
+        for i, (a, b) in enumerate(edges):
+            if i in (k, (k - 1) % n) or _dist_to_segment(here, a, b) > 1e-9:
+                continue
+            side = lambda p: (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])
+            if side(prev) * side(nxt) < 0:
                 return True
     return False
 

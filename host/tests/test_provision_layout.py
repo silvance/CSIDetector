@@ -124,3 +124,39 @@ def test_image_paths_relative_to_links(tmp_path):
     assert lo.resolve_image_path("plans/office.png", links) == img
     outside = tmp_path / "elsewhere.png"
     assert lo.relative_image_path(str(outside), links) == str(outside)
+
+
+def test_review_fixes(tmp_path):
+    # Saving what the heatmap can't load is refused.
+    layout = lo.Layout()
+    layout.add_node("aa:bb:cc:dd:ee:10", ROLE_TX)
+    with pytest.raises(ValueError, match="no receivers"):
+        layout.save(tmp_path / "links.json")
+    assert not (tmp_path / "links.json").exists()
+    # Only transmitters and receivers can be in a layout.
+    with pytest.raises(ValueError):
+        layout.add_node("aa:bb:cc:dd:ee:11", "")
+    # Room extras and a floorplan block we can't parse survive a round trip.
+    data = {"room": {"width_m": 4, "height_m": 3, "_comment": "taped"},
+            "txs": [{"mac": "aa:bb:cc:dd:ee:12", "x": 0, "y": 0}],
+            "rxs": [{"mac": "aa:bb:cc:dd:ee:13", "x": 4, "y": 3}],
+            "floorplan": {"image": "plan.png", "px_per_m": "120px"}}
+    out = lo.Layout.from_dict(data).to_dict()
+    assert out["room"]["_comment"] == "taped"
+    assert out["floorplan"] == data["floorplan"]
+    # A crossing through a corner counts.
+    assert lo.self_intersects([(0, 4), (4, 0), (5, 5), (2, 2), (0, 0)])
+    assert not lo.self_intersects([(0, 0), (5, 0), (5, 4), (2.5, 4), (2.5, 2.5), (0, 2.5)])
+
+
+def test_save_writes_through_a_symlink(tmp_path):
+    real = tmp_path / "rooms" / "office" / "links.json"
+    real.parent.mkdir(parents=True)
+    real.write_text(EXAMPLE_LINKS.read_text())
+    link = tmp_path / "links.json"
+    link.symlink_to(real)
+    layout = lo.Layout.load(link)
+    layout.move_node(layout.nodes[0], 1.0, 1.0)
+    layout.save(link)
+    assert link.is_symlink()
+    assert json.loads(real.read_text())["txs"][0]["x"] == 1.0

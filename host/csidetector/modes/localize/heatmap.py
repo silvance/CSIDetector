@@ -132,6 +132,10 @@ def _load_links(path: str) -> tuple[dict, list[_Node], list[_Node]]:
     rxs = [_Node(mac=r["mac"].lower(), x=float(r["x"]), y=float(r["y"]),
                  label=r.get("label", r["mac"][-5:]))
            for r in cfg["rxs"]]
+    if not txs or not rxs:
+        raise SystemExit(
+            f"links config {path}: needs at least one transmitter and one "
+            f"receiver (has {len(txs)} TX, {len(rxs)} RX).")
     return cfg, txs, rxs
 
 

@@ -364,7 +364,9 @@ def save_links(path: Path, data: dict) -> Optional[Path]:
     nothing is written.
     """
     validate_links_shape(data)
-    path = Path(path)
+    # Through a symlink, not over it: the image path stored relative to
+    # links.json is relative to the real file's folder.
+    path = Path(path).resolve()
     backup = _backup(path, mode=0o644)
     _atomic_write(path, json.dumps(data, indent=2) + "\n")
     return backup
