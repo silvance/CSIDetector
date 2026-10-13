@@ -354,3 +354,17 @@ def write_links(path: Path, txs: list[tuple[str, str]],
     backup = _backup(path, mode=0o644)
     _atomic_write(path, json.dumps(data, indent=2) + "\n")
     return data, backup
+
+
+def save_links(path: Path, data: dict) -> Optional[Path]:
+    """Write a whole links.json (the floorplan editor's save). Returns the
+    backup of the previous file, if there was one.
+
+    Validated first: a shape the viewers can't load raises ValueError and
+    nothing is written.
+    """
+    validate_links_shape(data)
+    path = Path(path)
+    backup = _backup(path, mode=0o644)
+    _atomic_write(path, json.dumps(data, indent=2) + "\n")
+    return backup
