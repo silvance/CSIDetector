@@ -63,11 +63,12 @@ from typing import Any, Callable, Optional
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QPoint, Qt, QtMsgType, qInstallMessageHandler  # noqa: E402
+from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt, QtMsgType, qInstallMessageHandler  # noqa: E402
+from PyQt6.QtGui import QMouseEvent  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
-    QAbstractButton, QAbstractItemView, QAbstractSpinBox, QApplication, QBoxLayout,
-    QCheckBox,
+    QAbstractButton, QAbstractItemView, QAbstractScrollArea, QAbstractSpinBox,
+    QApplication, QBoxLayout, QCheckBox, QDoubleSpinBox, QGraphicsView,
     QComboBox, QFileDialog, QFormLayout, QLabel, QLayout, QLineEdit, QListWidget,
     QMessageBox, QPlainTextEdit, QProgressBar, QRadioButton, QSpinBox, QTableWidget,
     QTabWidget, QWidget, QWizard,
@@ -830,7 +831,7 @@ class Session:
                          else w.text())
                 ro = " (read-only)" if w.isReadOnly() else ""
                 lines.append(f"field{tag} = {value!r}{off}{ro}")
-            elif isinstance(w, QSpinBox):
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
                 lines.append(f"spin{tag} = {w.value()}{w.suffix()}{off}")
             elif isinstance(w, QComboBox):
                 lines.append(f"dropdown{tag} = {w.currentText()!r} "
@@ -859,6 +860,12 @@ class Session:
                 value = f"{w.value()}%" if w.value() >= w.minimum() else "empty"
                 lines.append(f"progress{tag} = {value}"
                              f"{' (text hidden)' if not w.isTextVisible() else ''}")
+            elif isinstance(w, QGraphicsView):
+                canvas = getattr(w, "node_items", None)
+                extra = (f": {len(canvas)} board marker(s), "
+                         f"{len(getattr(w, 'corner_items', []))} corner(s)"
+                         if canvas is not None else "")
+                lines.append(f"canvas{tag}{extra}")
             elif isinstance(w, QTabWidget):
                 tabs = [("*" if i == w.currentIndex() else "") + w.tabText(i).replace("&&", "&")
                         for i in range(w.count())]
@@ -906,7 +913,7 @@ class Session:
 
     def field(self, name: str, nth: Optional[int] = None) -> QWidget:
         names = self._label_map()
-        kinds = (QLineEdit, QSpinBox, QComboBox, QListWidget, QTableWidget,
+        kinds = (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QListWidget, QTableWidget,
                  QPlainTextEdit, QCheckBox, QRadioButton)
         cands = []
         for w in self._visible():
@@ -948,8 +955,8 @@ class Session:
             w.editingFinished.emit()
             shown = "●" * len(str(value)) if w.echoMode() != QLineEdit.EchoMode.Normal else value
             self._step(f"type {shown!r} into {name!r}", "typed")
-        elif isinstance(w, QSpinBox):
-            w.setValue(int(value))
+        elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+            w.setValue(int(value) if isinstance(w, QSpinBox) else float(value))
             self._step(f"set {name!r} to {w.value()}", "set")
         elif isinstance(w, QComboBox):
             return self._choose(w, name, str(value))
@@ -1014,6 +1021,60 @@ class Session:
                     self._step(f"select row {text!r}", " | ".join(cells))
                     return
         raise DriverError(f"no table row contains {text!r}")
+
+    def widget(self, name: str, nth: Optional[int] = None) -> QWidget:
+        """Any visible widget by its label / accessible name (e.g. a canvas)."""
+        names = self._label_map()
+        cands = [(_norm(n), w) for w in self._visible() for n in names.get(id(w), [])]
+        return self._pick("widget", cands, name, nth)
+
+    def _mouse(self, w: QWidget, kind: QEvent.Type, pos: QPoint,
+               button: Qt.MouseButton, buttons: Qt.MouseButton) -> None:
+        target = w.viewport() if isinstance(w, QAbstractScrollArea) else w
+        ev = QMouseEvent(kind, QPointF(pos), QPointF(target.mapToGlobal(pos)),
+                         button, buttons, Qt.KeyboardModifier.NoModifier)
+        QApplication.sendEvent(target, ev)
+
+    def click_at(self, name: str, pos: QPoint, double: bool = False) -> None:
+        """Click at a point in a widget (viewport pixels for a canvas)."""
+        w = self.widget(name)
+        left, none = Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
+        self._mouse(w, QEvent.Type.MouseButtonPress, pos, left, left)
+        self._mouse(w, QEvent.Type.MouseButtonRelease, pos, left, none)
+        if double:
+            self._mouse(w, QEvent.Type.MouseButtonDblClick, pos, left, left)
+            self._mouse(w, QEvent.Type.MouseButtonRelease, pos, left, none)
+        self._step(f"{'double-' if double else ''}click {name!r} at ({pos.x()}, {pos.y()})",
+                   "clicked")
+
+    def drag(self, name: str, start: QPoint, end: QPoint, steps: int = 8) -> None:
+        """Press at ``start``, move to ``end`` with the button held, release.
+        (QTest.mouseMove can't hold a button, which item drags need.)"""
+        w = self.widget(name)
+        left, none = Qt.MouseButton.LeftButton, Qt.MouseButton.NoButton
+        self._mouse(w, QEvent.Type.MouseButtonPress, start, left, left)
+        for i in range(1, steps + 1):
+            p = QPoint(start.x() + (end.x() - start.x()) * i // steps,
+                       start.y() + (end.y() - start.y()) * i // steps)
+            self._mouse(w, QEvent.Type.MouseMove, p, none, left)
+        self._mouse(w, QEvent.Type.MouseButtonRelease, end, left, none)
+        self._step(f"drag in {name!r} from ({start.x()}, {start.y()}) to "
+                   f"({end.x()}, {end.y()})", "dragged")
+
+    def edit_cell(self, table: str, row_text: str, column: str, value: Any) -> None:
+        """Type into a table cell: the row containing ``row_text``, the
+        column whose header starts with ``column``."""
+        t = self.widget(table)
+        cols = [_norm(t.horizontalHeaderItem(c).text()) for c in range(t.columnCount())]
+        col = next((c for c, h in enumerate(cols) if h.startswith(_norm(column))), None)
+        rows = [r for r in range(t.rowCount())
+                if any(_norm(row_text) == _norm(t.item(r, c).text())
+                       for c in range(t.columnCount()) if t.item(r, c))]
+        if col is None or len(rows) != 1:
+            raise DriverError(f"cell {row_text!r}/{column!r} in {table!r}: "
+                              f"{'no column' if col is None else f'{len(rows)} rows'}")
+        t.item(rows[0], col).setText(str(value))
+        self._step(f"set {table!r} [{row_text} / {column}] to {value!r}", "edited")
 
     def tab(self, name: str) -> None:
         for tw in self._visible(QTabWidget):

@@ -338,7 +338,7 @@ def write_links(path: Path, txs: list[tuple[str, str]],
     Raises ValueError (file untouched) when the existing file isn't valid
     JSON or isn't a usable links.json shape.
     """
-    path = Path(path)
+    path = Path(path).resolve()           # through a symlink, not over it
     existing = None
     if path.exists():
         try:
@@ -354,3 +354,19 @@ def write_links(path: Path, txs: list[tuple[str, str]],
     backup = _backup(path, mode=0o644)
     _atomic_write(path, json.dumps(data, indent=2) + "\n")
     return data, backup
+
+
+def save_links(path: Path, data: dict) -> Optional[Path]:
+    """Write a whole links.json (the floorplan editor's save). Returns the
+    backup of the previous file, if there was one.
+
+    Validated first: a shape the viewers can't load raises ValueError and
+    nothing is written.
+    """
+    validate_links_shape(data)
+    # Through a symlink, not over it: the image path stored relative to
+    # links.json is relative to the real file's folder.
+    path = Path(path).resolve()
+    backup = _backup(path, mode=0o644)
+    _atomic_write(path, json.dumps(data, indent=2) + "\n")
+    return backup
