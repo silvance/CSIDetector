@@ -53,6 +53,41 @@ def test_a_recording_cut_off_mid_write_still_replays(tmp_path, csi_data_line):
     assert 300 < sum(1 for _ in rec.samples()) <= 400
 
 
+def test_silence_at_the_start_and_end_counts_as_a_gap(tmp_path, monkeypatch, csi_data_line):
+    """A transmitter that starts late or dies early mustn't read as a
+    continuous recording."""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(recording.time, "monotonic", lambda: clock["t"])
+    w = recording.RecordingWriter(tmp_path / "late.csi.gz", {})
+    clock["t"] += 30.0                              # 30 s before the first sample
+    for i in range(100):
+        w.write(csi_data_line(seq=i))
+        clock["t"] += 0.01
+    clock["t"] += 60.0                              # then it went quiet
+    s = w.close("timer")
+    assert s["gaps_over_1s"] == 2 and s["max_gap_s"] == pytest.approx(60.0, abs=0.1)
+    assert s["first_sample_s"] == pytest.approx(30.0) and s["duration_s"] == pytest.approx(91.0)
+    empty = recording.RecordingWriter(tmp_path / "empty.csi.gz", {})
+    clock["t"] += 5.0
+    assert empty.close("timer")["gaps_over_1s"] == 1
+
+
+def test_recordings_in_the_same_second_get_their_own_files(tmp_path, csi_data_line):
+    when = 1_760_000_000.0
+    a = recording.new_recording(tmp_path, "walk", {"n": 1}, when)
+    a.write(csi_data_line())
+    a.close("timer")
+    b = recording.new_recording(tmp_path, "walk", {"n": 2}, when)
+    b.abandon()                                     # must not delete the first
+    c = recording.new_recording(tmp_path, "walk", {"n": 3}, when)
+    c.close("timer")
+    assert a.path.exists() and c.path.name.endswith("_walk-2.csi.gz")
+    assert recording.read_recording(a.path).meta == {"n": 1}
+    with pytest.raises(FileExistsError):
+        recording.RecordingWriter(a.path, {})       # never over an existing file
+    assert recording.read_recording(a.path).end["samples"] == 1
+
+
 def test_abandon_removes_the_file(tmp_path):
     w = _write(tmp_path, [])
     w.abandon()

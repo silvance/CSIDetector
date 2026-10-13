@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -161,7 +162,7 @@ def _fake_serial_lines(lines_per_s: float, line: str = ""):
     return fake
 
 
-def _record(gui, tmp_path, delay_s, length_s):
+def _record(gui, tmp_path, delay_s, length_s, stop_after_s=None):
     worker = gui._RecordWorker("/dev/ttyACM1", tmp_path / "recs",
                                {"condition": "empty", "note": ""},
                                delay_s=delay_s, length_s=length_s)
@@ -169,6 +170,8 @@ def _record(gui, tmp_path, delay_s, length_s):
     worker.saved.connect(lambda path, summary: out["saved"].append((path, summary)))
     worker.error_occurred.connect(out["errors"].append)
     worker.progress.connect(lambda phase, left, n: out["phases"].add(phase))
+    if stop_after_s is not None:
+        threading.Timer(stop_after_s, worker.request_stop, ("stop button",)).start()
     worker.run()                 # in this thread: the signals are delivered directly
     return out
 
@@ -186,6 +189,16 @@ def test_record_worker_waits_then_records_for_its_length(qt_app, tmp_path, monke
     rec = recording.read_recording(path)
     assert rec.meta["condition"] == "empty" and "started" in rec.meta
     assert rec.end["samples"] == summary["samples"] > 20
+
+
+def test_record_worker_stopped_during_the_countdown_saves_nothing_quietly(
+        qt_app, tmp_path, monkeypatch, csi_data_line):
+    import csidetector.modes.alert.gui as gui
+    monkeypatch.setattr(gui.csi_collector, "iter_serial_lines",
+                        _fake_serial_lines(200, csi_data_line() + "\n"))
+    out = _record(gui, tmp_path, delay_s=0.5, length_s=5, stop_after_s=0.2)
+    assert out["saved"] == [] and out["errors"] == []
+    assert not (tmp_path / "recs").exists() or not list((tmp_path / "recs").glob("*"))
 
 
 def test_record_worker_saves_nothing_without_csi(qt_app, tmp_path, monkeypatch):

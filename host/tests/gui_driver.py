@@ -672,6 +672,8 @@ class Session:
                     time.sleep(self.timeout)
                     return b""
                 time.sleep(1.0 / stream["rate"])
+                if self.port not in session.boards:      # unplugged meanwhile
+                    raise pyserial.SerialException("device disconnected")
                 stream["seq"] += 1
                 return session._csi_line(self.port, stream).encode()
 
