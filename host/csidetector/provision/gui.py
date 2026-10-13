@@ -1145,8 +1145,15 @@ class SetupWindow(QMainWindow):
         self._list_boards = tab_kwargs.get("list_boards", dv.list_boards)
         self._detect_hotspots = tab_kwargs.get("detect_hotspots", fw.detect_hotspots)
         self.devices = DevicesTab(self.registry, idf_export=idf_export, **tab_kwargs)
+        from csidetector.provision import wizard as wizard_module
+        from csidetector.provision.floorplan import RoomTab
+        self.room = RoomTab(self.registry, wizard_module.default_host_dir() / "links.json")
         self.tabs = QTabWidget()
         self.tabs.addTab(self.devices, "Devices && Flashing")
+        self.tabs.addTab(self.room, "Room layout")
+        self.room.dirty_changed.connect(
+            lambda dirty: self.tabs.setTabText(self.tabs.indexOf(self.room),
+                                               "Room layout *" if dirty else "Room layout"))
 
         self.wizard_btn = QPushButton("Setup wizard…")
         self.wizard_btn.setToolTip("Step-by-step: flash a transmitter and receiver, "
@@ -1203,8 +1210,14 @@ class SetupWindow(QMainWindow):
     def _wizard_closed(self, wiz, result: int) -> None:
         self.wizard = None
         open_monitor, config_path = bool(result and wiz.open_monitor), wiz.alert_config_path
+        localize = bool(result) and wiz.state.mode == "localize"
+        written = [Path(p) for p in wiz.written]
         wiz.deleteLater()
         self.devices._force_refresh()
+        if localize and written:
+            # Next step is placing the new boards: show them.
+            self.room.reload_if_clean(written[0])
+            self.tabs.setCurrentWidget(self.room)
         if open_monitor:
             self.open_monitor(config_path)
 
@@ -1252,6 +1265,17 @@ class SetupWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        if self.room.dirty:
+            answer = QMessageBox.question(
+                self, "Unsaved room layout",
+                "Save the room layout changes to links.json before quitting?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes)
+            if answer == QMessageBox.StandardButton.Cancel or (
+                    answer == QMessageBox.StandardButton.Yes and not self.room.save()):
                 event.ignore()
                 return
         self.devices.shutdown()

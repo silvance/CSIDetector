@@ -702,6 +702,135 @@ def devices_swapped_bridge_board(s: Session) -> None:
              "re-identified and flashed")
 
 
+# --------------------------------------------------------------------------
+# Room layout (floorplan editor)
+# --------------------------------------------------------------------------
+
+def _canvas(s: Session):
+    return s.widget("Room canvas")
+
+
+def _drag_node(s: Session, mac: str, x: float, y: float) -> None:
+    canvas = _canvas(s)
+    node = canvas.model.find(mac)
+    s.drag("Room canvas", canvas.to_view(node.x, node.y), canvas.to_view(x, y))
+
+
+def _links(s: Session) -> dict:
+    return json.loads((s.host_dir / "links.json").read_text())
+
+
+def room_place_boards_after_wizard(s: Session) -> None:
+    """Localize wizard → the Room layout tab opens with the new boards marked
+    unplaced; drag one, type the other's position, save."""
+    s.hotspot()
+    for port, mac in (("/dev/ttyACM0", TX_MAC), ("/dev/ttyACM1", RX_MAC)):
+        s.plug(port, mac=mac)
+    _start_wizard(s, localize=True)
+    _flash_here(s, "/dev/ttyACM0", "Desk TX")
+    s.next()
+    _flash_here(s, "/dev/ttyACM1", "Hall RX", "receiver")
+    s.next()
+    s.next()
+    s.finish()
+    s.expect(s.window.tabs.currentWidget() is s.window.room, "the Room layout tab opens")
+    s.expect("not placed" in s.texts(), "new boards are marked not placed")
+    s.snap("room layout after the wizard")
+    _drag_node(s, RX_MAC, 1.0, 0.0)
+    node = _canvas(s).model.find(RX_MAC)
+    s.expect((round(node.x, 2), round(node.y, 2)) == (1.0, 0.0) and node.placed,
+             "dragging places the receiver (snapped to 0.1 m)")
+    s.edit_cell("Boards", "Desk TX", "X", "4.5")
+    s.edit_cell("Boards", "Desk TX", "Y", "3.2")
+    s.expect("room layout *" in s.texts(), "the tab shows unsaved changes")
+    s.click("Save")
+    data = _links(s)
+    tx = next(n for n in data["txs"] if n["mac"] == TX_MAC)
+    s.expect((tx["x"], tx["y"]) == (4.5, 3.2) and "placed" not in tx,
+             "typed position saved, now placed")
+    s.expect(not s.window.room.dirty, "saved: no unsaved changes")
+
+
+def room_draw_the_room(s: Session) -> None:
+    """Make a rectangle, add a corner by double-clicking a wall, drag it in
+    to make an L; a self-crossing outline can't be saved."""
+    s.window.registry.upsert(TX_MAC, role="tx", label="TX")
+    s.window.registry.upsert(RX_MAC, role="rx", label="RX")
+    s.tab("Room layout")
+    s.choose("Board to add", "TX")
+    s.click("Add")
+    s.choose("Board to add", "RX")
+    s.click("Add")
+    s.fill("Room width", 6.0)
+    s.fill("Room depth", 4.0)
+    s.click("Make rectangle")
+    canvas = _canvas(s)
+    s.click_at("Room canvas", canvas.to_view(6.0, 2.0), double=True)
+    s.expect(len(canvas.model.corners) == 5, "double-clicking a wall adds a corner")
+    i = canvas.model.corners.index((6.0, 2.0))
+    s.drag("Room canvas", canvas.to_view(6.0, 2.0), canvas.to_view(3.0, 2.0))
+    s.expect(canvas.model.corners[i] == (3.0, 2.0), "the corner moved")
+    s.snap("L-shaped room")
+    s.edit_cell("Corners", "3.00", "X", "-2")      # past the far wall: crosses
+    s.expect("crosses itself" in s.texts(), "the panel says the outline crosses")
+    s.click("Save")
+    s.expect(any(d.title == "Can't save yet" and "crosses itself" in d.text
+                 for d in s.dialogs), "a crossing outline is refused")
+    s.expect(not (s.host_dir / "links.json").exists(), "and nothing is written")
+
+
+def room_floorplan_image(s: Session) -> None:
+    """Put a floor plan under the room, scale it from two clicks, save, reopen."""
+    from PyQt6.QtGui import QColor, QImage, QPainter
+    img = QImage(800, 600, QImage.Format.Format_RGB32)
+    img.fill(QColor("white"))
+    painter = QPainter(img)
+    painter.drawRect(100, 100, 600, 400)            # a 600 px wall = 6 m below
+    painter.end()
+    plan = s.host_dir / "plans" / "office.png"
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    img.save(str(plan))
+    s.window.registry.upsert(TX_MAC, role="tx", label="TX")
+    s.window.registry.upsert(RX_MAC, role="rx", label="RX")
+    s.tab("Room layout")
+    for label in ("TX", "RX"):
+        s.choose("Board to add", label)
+        s.click("Add")
+    s.choose_file(str(plan))
+    s.click("Floor plan image")
+    room = s.window.room
+    fp = room.canvas.model.floorplan
+    s.expect(fp is not None and fp.image == "plans/office.png",
+             "image stored relative to links.json")
+    # Two clicks on the plan's wall ends (pixels 100 and 700 on y=500), 6 m apart.
+    a, b = fp.to_meters(100, 500), fp.to_meters(700, 500)
+    canvas = _canvas(s)
+    s.click("Set scale")
+    s.click_at("Room canvas", canvas.to_view(*a))
+    s.click_at("Room canvas", canvas.to_view(*b))
+    s.fill("Distance between the points", 6.0)
+    s.click("Apply scale")
+    s.expect(abs(fp.px_per_m - 100.0) < 2.0, f"scale ≈ 100 px/m (got {fp.px_per_m:.1f})")
+    s.snap("plan scaled")
+    s.click("Save")
+    s.expect(_links(s)["floorplan"]["image"] == "plans/office.png", "saved with the plan")
+    s.click("Reload")
+    s.expect(room.canvas.image_pixmap() is not None, "the plan comes back on reload")
+
+
+def room_unsaved_changes_on_quit(s: Session) -> None:
+    """Quitting with unsaved layout edits offers to save them."""
+    s.window.registry.upsert(TX_MAC, role="tx", label="TX")
+    s.tab("Room layout")
+    s.click("Add")
+    s.answer("Yes")
+    s.window.close()
+    s.expect(any(d.title == "Unsaved room layout" for d in s.dialogs), "asked to save")
+    s.expect(any(d.title == "Can't save yet" for d in s.dialogs),
+             "an incomplete layout (no receiver) isn't saved")
+    s.expect(s.window.isVisible(), "so the window stays open")
+
+
 SCENARIOS = {f.__name__: f for f in (
     alert_happy_path,
     alert_telegram_failure,
@@ -733,4 +862,8 @@ SCENARIOS = {f.__name__: f for f in (
     devices_label_saved_on_flash,
     devices_identify_then_flash_native,
     devices_swapped_bridge_board,
+    room_place_boards_after_wizard,
+    room_draw_the_room,
+    room_floorplan_image,
+    room_unsaved_changes_on_quit,
 )}

@@ -1010,8 +1010,8 @@ class LinksPage(QWizardPage):
         self.summary.setText(
             f"Transmitters: {tx}\nReceivers: {rx}\n\n"
             "Boards not already in links.json get placeholder spots on the room's "
-            "edge (marked \"placed\": false). Measure where they really are and "
-            "update their x / y before calibrating.")
+            "edge (marked \"placed\": false). After Finish, the Room layout tab "
+            "opens: drag them to where they really are before calibrating.")
 
     def nextId(self) -> int:  # noqa: N802
         return PAGE_FINISH
@@ -1066,7 +1066,8 @@ class FinishPage(QWizardPage):
             start = shlex.quote(str(self.wiz.host_dir.parent / "start.sh"))
             self.next_steps = [
                 "Next steps:",
-                f"  1. Measure each new board's position and set its x / y in {links}.",
+                "  1. Place each new board in the setup app's Room layout tab "
+                "(opens when you click Finish; dashed markers aren't placed yet).",
                 "  2. Leave the room and run:",
                 f"     cd {host} && python run.py localize calibrate-links "
                 f"udp:{st.host_port} --out baselines.json --settle 30",
