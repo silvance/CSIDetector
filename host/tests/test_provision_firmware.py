@@ -345,7 +345,7 @@ def test_windows_export_env_for_the_installer_layout(tmp_path):
     env = fw.windows_export_env(export, {"Path": "/usr/bin", "MSYSTEM": "MINGW64"})
     assert "MSYSTEM" not in env                      # export.bat refuses to run with it
     assert env["IDF_TOOLS_PATH"] == str(root)
-    parts = env["Path"].split(os.pathsep)
+    parts = env["Path"].split(";")
     assert parts[0].endswith("3.11.2") and parts[1].endswith("cmd") and parts[-1] == "/usr/bin"
     other = fw.windows_export_env(tmp_path / "esp-idf" / "export.bat", {"PATH": "/bin"})
     assert other == {"PATH": "/bin"}                 # not the installer layout: as is
@@ -366,20 +366,31 @@ def test_windows_export_env_picks_the_python_the_idf_virtualenv_was_made_with(tm
     for idf in ("esp-idf-v5.2.1", "esp-idf-v4.4.7", "esp-idf-v5.5"):
         (root / "frameworks" / idf).mkdir(parents=True)
 
-    def front(idf):
-        env = fw.windows_export_env(root / "frameworks" / idf / "export.bat", {"Path": "/bin"})
+    def front(idf, base=None):
+        env = fw.windows_export_env(root / "frameworks" / idf / "export.bat",
+                                    base or {"Path": "/bin"})
         return [os.path.basename(os.path.dirname(p)) if p.endswith("cmd")
-                else os.path.basename(p) for p in env["Path"].split(os.pathsep)[:2]]
+                else os.path.basename(p) for p in env["Path"].split(";")[:2]]
 
     assert front("esp-idf-v5.2.1") == ["3.11.2", "2.44.0"]
     assert front("esp-idf-v4.4.7") == ["3.8.7", "2.44.0"]
     assert front("esp-idf-v5.5") == ["3.11.2", "2.44.0"]     # no virtualenv yet: newest
+    # export.bat looks under IDF_TOOLS_PATH when that's set (the installer
+    # keeps it in the registry): a second root with only a 3.8 virtualenv.
+    other = tmp_path / "Other"
+    (other / "python_env" / "idf5.2_py3.8_env").mkdir(parents=True)
+    assert front("esp-idf-v5.2.1", {"Path": "/bin", "IDF_TOOLS_PATH": str(other)}) \
+        == ["3.8.7", "2.44.0"]
     # Started from an "ESP-IDF 5.2 CMD" prompt: the virtualenv is already
     # on PATH and export.bat won't re-add it, so nothing goes in front.
-    prompt = {"Path": "C:\\Espressif\\python_env\\idf5.2_py3.11_env\\Scripts;C:\\Windows",
-              "IDF_PYTHON_ENV_PATH": "C:\\Espressif\\python_env\\idf5.2_py3.11_env"}
+    venv = "C:\\Espressif\\python_env\\idf5.2_py3.11_env"
+    prompt = {"Path": f"{venv}\\scripts;C:\\Windows", "IDF_PYTHON_ENV_PATH": venv}
     env = fw.windows_export_env(root / "frameworks" / "esp-idf-v5.2.1" / "export.bat", prompt)
     assert env["Path"] == prompt["Path"] and env["IDF_TOOLS_PATH"] == str(root)
+    # Only the variable set (a hand-made override), nothing on PATH: export.bat
+    # still needs python and git in front.
+    assert front("esp-idf-v5.2.1", {"Path": "C:\\Windows", "IDF_PYTHON_ENV_PATH": venv}) \
+        == ["3.11.2", "2.44.0"]
 
 
 def test_esptool_missing_hint():
