@@ -418,6 +418,9 @@ class CSIDetectorWindow(QMainWindow):
         self._detect_worker: Optional[_DetectWorker] = None
         self._calib_thread: Optional[QThread] = None
         self._calib_worker: Optional[_CalibrateWorker] = None
+        # Set on close: a calibration result still queued from the worker
+        # must not be saved over state written after the window closed.
+        self._closed = False
         self._notifier_active = None      # the queuing notifier currently in use
         self._last_alert_ts: float = 0.0
         self._pkt_rate: float = 0.0
@@ -458,6 +461,8 @@ class CSIDetectorWindow(QMainWindow):
         self._badge.set_state("CALIB", f"{phase} — {remaining:.0f}s")
 
     def _on_calib_done(self, baseline: float, n_samples: int) -> None:
+        if self._closed:
+            return
         self._state.baseline = baseline
         self._state.baseline_ts = time.time()
         self._state.save()
@@ -673,6 +678,7 @@ class CSIDetectorWindow(QMainWindow):
         self._stats.setText("\n".join(lines))
 
     def closeEvent(self, ev) -> None:  # noqa: N802
+        self._closed = True
         if self._detect_worker is not None:
             self._detect_worker.request_stop()
             if self._detect_thread is not None:

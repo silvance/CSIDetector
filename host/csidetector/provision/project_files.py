@@ -28,23 +28,44 @@ _CHAT_ID_RE = re.compile(r"^(-?\d{3,}|@[A-Za-z][A-Za-z0-9_]{4,})$")
 DEFAULT_ROOM = {"polygon": [[0.0, 0.0], [5.0, 0.0], [5.0, 4.0], [0.0, 4.0]]}
 
 
+def _write_new(path: Path, data: bytes, mode: int, exclusive: bool) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_TRUNC)
+    fd = os.open(path, flags, mode)
+    try:
+        # fchmod before writing: O_CREAT's mode is masked by the umask and
+        # ignored for a pre-existing file, and the content may be a secret.
+        os.fchmod(fd, mode)
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
 def _atomic_write(path: Path, text: str, mode: int = 0o644) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
-    with os.fdopen(fd, "w") as f:
-        f.write(text)
-    os.chmod(tmp, mode)
+    _write_new(tmp, text.encode(), mode, exclusive=False)
     os.replace(tmp, path)
 
 
-def _backup(path: Path) -> Optional[Path]:
+def _backup(path: Path, mode: int) -> Optional[Path]:
+    """Copy ``path`` aside with ``mode`` permissions under a unique name.
+
+    The mode is set explicitly rather than copied: an alert.toml that was
+    0644 before chmod 600 must not leave a world-readable token copy.
+    """
     if not path.exists():
         return None
-    backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
-    backup.write_bytes(path.read_bytes())
-    os.chmod(backup, path.stat().st_mode & 0o777)
-    return backup
+    data = path.read_bytes()
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(1000):
+        suffix = f".bak-{stamp}" + (f"-{n}" if n else "")
+        backup = path.with_name(path.name + suffix)
+        try:
+            _write_new(backup, data, mode, exclusive=True)
+            return backup
+        except FileExistsError:
+            continue
+    raise OSError(f"could not create a backup name for {path}")
 
 
 # --------------------------------------------------------------------------
@@ -129,7 +150,7 @@ def write_alert_toml(path: Path, bot_token: str, chat_id: str,
                if isinstance(v, (bool, int, float, str))},
     )
     tomllib.loads(text)   # never write something the loader can't read
-    backup = _backup(path)
+    backup = _backup(path, mode=0o600)
     _atomic_write(path, text, mode=0o600)
     return backup
 
@@ -137,6 +158,49 @@ def write_alert_toml(path: Path, bot_token: str, chat_id: str,
 # --------------------------------------------------------------------------
 # links.json
 # --------------------------------------------------------------------------
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def validate_links_shape(data) -> None:
+    """Raise ValueError if ``data`` isn't a links.json shape the viewers
+    (and merge_links) can use. Catches hand-edits like a polygon point
+    missing its y, ``"room": null`` or a non-string MAC before they turn
+    into a crash."""
+    if not isinstance(data, dict):
+        raise ValueError("links.json must be a JSON object")
+    room = data.get("room", DEFAULT_ROOM)
+    if not isinstance(room, dict):
+        raise ValueError("'room' must be an object")
+    if "polygon" in room:
+        poly = room["polygon"]
+        if (not isinstance(poly, list) or len(poly) < 3 or not all(
+                isinstance(pt, (list, tuple)) and len(pt) == 2
+                and all(_is_num(c) for c in pt) for pt in poly)):
+            raise ValueError("'room.polygon' must be a list of at least three "
+                             "[x, y] number pairs")
+    else:
+        for key in ("width_m", "height_m"):
+            if key in room and not (_is_num(room[key]) and room[key] > 0):
+                raise ValueError(f"'room.{key}' must be a positive number")
+    lists = [("txs", data.get("txs")), ("rxs", data.get("rxs"))]
+    if "tx" in data:
+        lists.append(("tx", [data["tx"]]))
+    for key, nodes in lists:
+        if nodes is None:
+            continue
+        if not isinstance(nodes, list):
+            raise ValueError(f"'{key}' must be a list")
+        for i, node in enumerate(nodes):
+            where = f"'{key}'[{i}]" if key != "tx" else "'tx'"
+            if not isinstance(node, dict):
+                raise ValueError(f"{where} must be an object")
+            if not isinstance(node.get("mac"), str) or not try_normalize_mac(node["mac"]):
+                raise ValueError(f"{where} needs a 'mac' like aa:bb:cc:dd:ee:ff")
+            if not (_is_num(node.get("x")) and _is_num(node.get("y"))):
+                raise ValueError(f"{where} needs numeric 'x' and 'y'")
+
 
 def _room_bbox(room: dict) -> tuple[float, float, float, float]:
     if isinstance(room.get("polygon"), list) and room["polygon"]:
@@ -150,7 +214,7 @@ def _room_bbox(room: dict) -> tuple[float, float, float, float]:
 
 def _perimeter_points(bbox, n: int) -> list[tuple[float, float]]:
     """n points evenly spaced around the bbox perimeter, starting at the
-    bottom-left corner — provisional spots that keep the viewer usable."""
+    bottom-left corner."""
     x0, y0, x1, y1 = bbox
     w, h = x1 - x0, y1 - y0
     per = 2 * (w + h) or 1.0
@@ -168,48 +232,85 @@ def _perimeter_points(bbox, n: int) -> list[tuple[float, float]]:
     return [(round(x, 2), round(y, 2)) for x, y in pts]
 
 
+def _placeholder_spots(bbox, taken: list[tuple[float, float]],
+                       n: int) -> list[tuple[float, float]]:
+    """Pick n perimeter spots, each as far as possible from existing nodes
+    and from each other (greedy farthest-point), so provisional nodes
+    don't land on top of placed ones."""
+    candidates = _perimeter_points(bbox, max(16, 8 * (n + len(taken))))
+    chosen: list[tuple[float, float]] = []
+    occupied = list(taken)
+    for _ in range(n):
+        if not occupied:
+            best = candidates[0]
+        else:
+            best = max(candidates, key=lambda c: min(
+                (c[0] - o[0]) ** 2 + (c[1] - o[1]) ** 2 for o in occupied))
+        chosen.append(best)
+        occupied.append(best)
+    return chosen
+
+
 def merge_links(existing: Optional[dict],
                 txs: list[tuple[str, str]],
                 rxs: list[tuple[str, str]]) -> dict:
     """Add (mac, label) nodes to a links.json dict without disturbing
     nodes that are already there.
 
-    Existing nodes keep their position and label. New nodes are spread
-    around the room perimeter and flagged ``"placed": false``. A legacy
-    single ``"tx"`` entry is converted to a ``"txs"`` list.
+    Existing nodes keep their position and label. A board that changed
+    role (reflashed TX → RX or back) moves to the other list, keeping its
+    position. New nodes get provisional perimeter spots away from existing
+    nodes and are flagged ``"placed": false``. A legacy single ``"tx"``
+    entry is converted to a ``"txs"`` list. Raises ValueError for a
+    malformed ``existing`` or a MAC given in both roles.
     """
+    if existing is not None:
+        validate_links_shape(existing)
+    tx_norm = [(normalize_mac(m), l) for m, l in txs]
+    rx_norm = [(normalize_mac(m), l) for m, l in rxs]
+    both = {m for m, _ in tx_norm} & {m for m, _ in rx_norm}
+    if both:
+        raise ValueError(f"MAC(s) listed as both TX and RX: {', '.join(sorted(both))}")
+
     out = dict(existing or {})
     out.setdefault("room", dict(DEFAULT_ROOM))
     legacy_tx = out.pop("tx", None)
-    old_txs = list(out.get("txs") or [])
-    if isinstance(legacy_tx, dict) and not old_txs:
-        old_txs = [legacy_tx]
-    old_rxs = list(out.get("rxs") or [])
+    tx_nodes = [dict(n) for n in (out.get("txs") or []) if isinstance(n, dict)]
+    if isinstance(legacy_tx, dict) and not tx_nodes:
+        tx_nodes = [dict(legacy_tx)]
+    rx_nodes = [dict(n) for n in (out.get("rxs") or []) if isinstance(n, dict)]
 
-    def merged(old: list, new: list[tuple[str, str]]):
-        nodes = [dict(n) for n in old if isinstance(n, dict)]
-        known = {try_normalize_mac(n.get("mac", "")) for n in nodes}
-        fresh = []
+    def take(nodes: list, mac: str) -> Optional[dict]:
+        for i, n in enumerate(nodes):
+            if try_normalize_mac(n.get("mac", "")) == mac:
+                return nodes.pop(i)
+        return None
+
+    def present(nodes: list, mac: str) -> bool:
+        return any(try_normalize_mac(n.get("mac", "")) == mac for n in nodes)
+
+    fresh: list[tuple[list, str, str, str]] = []    # (dest, mac, label, prefix)
+    for dest, other, new, prefix in ((tx_nodes, rx_nodes, tx_norm, "TX"),
+                                     (rx_nodes, tx_nodes, rx_norm, "RX")):
         for mac, label in new:
-            norm = normalize_mac(mac)
-            if norm in known:
+            if present(dest, mac):
                 continue
-            known.add(norm)
-            fresh.append((norm, label))
-        return nodes, fresh
+            moved = take(other, mac)
+            if moved is not None:
+                moved["mac"] = mac
+                if label:
+                    moved["label"] = label
+                dest.append(moved)
+            else:
+                fresh.append((dest, mac, label, prefix))
 
-    tx_nodes, tx_new = merged(old_txs, txs)
-    rx_nodes, rx_new = merged(old_rxs, rxs)
-    spots = iter(_perimeter_points(_room_bbox(out["room"]),
-                                   len(tx_new) + len(rx_new)))
-    for i, (mac, label) in enumerate(tx_new, start=len(tx_nodes) + 1):
+    taken = [(float(n["x"]), float(n["y"])) for n in tx_nodes + rx_nodes
+             if _is_num(n.get("x")) and _is_num(n.get("y"))]
+    spots = iter(_placeholder_spots(_room_bbox(out["room"]), taken, len(fresh)))
+    for dest, mac, label, prefix in fresh:
         x, y = next(spots)
-        tx_nodes.append({"mac": mac, "x": x, "y": y,
-                         "label": label or f"TX{i}", "placed": False})
-    for i, (mac, label) in enumerate(rx_new, start=len(rx_nodes) + 1):
-        x, y = next(spots)
-        rx_nodes.append({"mac": mac, "x": x, "y": y,
-                         "label": label or f"RX{i}", "placed": False})
+        dest.append({"mac": mac, "x": x, "y": y,
+                     "label": label or f"{prefix}{len(dest) + 1}", "placed": False})
     out["txs"] = tx_nodes
     out["rxs"] = rx_nodes
     return out
@@ -217,7 +318,11 @@ def merge_links(existing: Optional[dict],
 
 def write_links(path: Path, txs: list[tuple[str, str]],
                 rxs: list[tuple[str, str]]) -> tuple[dict, Optional[Path]]:
-    """Merge nodes into links.json at ``path``. Returns (data, backup)."""
+    """Merge nodes into links.json at ``path``. Returns (data, backup).
+
+    Raises ValueError (file untouched) when the existing file isn't valid
+    JSON or isn't a usable links.json shape.
+    """
     path = Path(path)
     existing = None
     if path.exists():
@@ -226,9 +331,11 @@ def write_links(path: Path, txs: list[tuple[str, str]],
         except (OSError, ValueError) as exc:
             raise ValueError(f"{path} exists but isn't valid JSON ({exc}); "
                              f"fix or move it first") from exc
-        if not isinstance(existing, dict):
-            raise ValueError(f"{path} is not a JSON object")
+        try:
+            validate_links_shape(existing)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}. Fix or move it first.") from exc
     data = merge_links(existing, txs, rxs)
-    backup = _backup(path)
+    backup = _backup(path, mode=0o644)
     _atomic_write(path, json.dumps(data, indent=2) + "\n")
     return data, backup

@@ -261,10 +261,33 @@ def test_flashing_a_tx_adds_it_to_the_rx_filter(tab):
 def test_rx_plan_warns_when_registered_tx_missing_from_filter(tab):
     tab.registry.upsert(TX_MAC, label="Desk TX", role=dv.ROLE_TX)
     _select(tab, "/dev/ttyACM0")
-    tab.mode_rx_alert.setChecked(True)
+    tab.mode_rx_loc.setChecked(True)
+    tab.ssid_edit.setText("CSIDetector")
+    tab.host_ip_edit.setText("10.42.1.1")
     tab.macs_edit.setText(FAR_TX)            # stale: doesn't include Desk TX
     plan = tab.plan_flash()
     assert any("Desk TX" in w and "ignore" in w for w in plan.warnings)
+
+
+def test_alert_rx_prefills_only_the_latest_tx(tab):
+    tab.registry.upsert(TX_MAC, label="Desk TX", role=dv.ROLE_TX,
+                        last_flashed=time.time())
+    _select(tab, "/dev/ttyACM0")
+    tab.mode_rx_loc.setChecked(True)
+    tab.fill_tx_macs()
+    assert set(tab._filter_macs()) == {FAR_TX, TX_MAC}
+    tab.mode_rx_alert.setChecked(True)
+    tab.fill_tx_macs()
+    assert tab._filter_macs() == [TX_MAC]
+    # Not-listed transmitters aren't nagged about in alert mode: one is right.
+    assert not any("ignore" in w for w in tab.plan_flash().warnings)
+
+
+def test_alert_rx_with_several_txs_warns_about_interleaving(tab):
+    _select(tab, "/dev/ttyACM0")
+    tab.mode_rx_alert.setChecked(True)
+    tab.macs_edit.setText(f"{FAR_TX}, {TX_MAC}")
+    assert any("exactly one transmitter" in w for w in tab.plan_flash().warnings)
 
 
 def test_flash_output_mac_wins_over_inferred_mac(tab):
@@ -322,6 +345,7 @@ def test_tx_plan_warns_when_rx_on_other_channel(tab):
 def test_fill_tx_macs_reports_truncation(tab):
     for i in range(5):
         tab.registry.upsert(f"aa:bb:cc:dd:ee:{i:02x}", role=dv.ROLE_TX)
+    tab.mode_rx_loc.setChecked(True)
     tab.fill_tx_macs()
     assert len(tab._filter_macs()) == fw.MAX_FILTER_MACS
     assert "left out" in tab.log.toPlainText()
@@ -405,3 +429,47 @@ def test_process_runner_reports_failed_start(qt_app):
     runner.start(["/nonexistent/binary-xyz"], dict(os.environ))
     res = _run_until_finished(runner)
     assert res["code"] == -1 and "could not start" in res["out"]
+
+
+def test_wizard_retires_the_open_monitor_before_rewriting_its_state(qt_app, tmp_path,
+                                                                    monkeypatch):
+    """An open monitor writes the settings it loaded at startup back on its
+    next Calibrate, undoing the wizard's new receiver port."""
+    from csidetector.provision import wizard as wz
+    win = gui.SetupWindow(dv.Registry(tmp_path / "devices.json"), idf_export="",
+                          list_boards=_boards, detect_hotspots=lambda: [],
+                          settings_path=tmp_path / "setup.json", auto_refresh=False)
+    hooks = []
+    monkeypatch.setattr(wz.SetupWizard, "exec",
+                        lambda self: hooks.append(self.before_alert_apply) or 0)
+    win.open_wizard()
+    assert hooks == [win.retire_monitor]
+
+    class FakeMonitor:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    mon = FakeMonitor()
+    win._monitor = mon
+    win.retire_monitor()
+    assert mon.closed and win._monitor is None
+    assert win._retired_monitors == [mon]    # kept alive while its thread winds down
+    win.retire_monitor()                     # nothing open: no-op
+    win.devices.shutdown()
+    win.deleteLater()
+
+
+def test_excepthook_reports_instead_of_aborting(qt_app, monkeypatch, capsys):
+    """PyQt6 aborts on an exception escaping a slot unless the hook is set."""
+    shown = []
+    monkeypatch.setattr(gui.QMessageBox, "critical", lambda *a: shown.append(a))
+    monkeypatch.setattr(gui.sys, "excepthook", gui.sys.excepthook)   # restored after
+    gui._install_excepthook()
+    try:
+        raise KeyError("rxs")
+    except KeyError as exc:
+        gui.sys.excepthook(type(exc), exc, exc.__traceback__)
+    assert shown and "KeyError" in shown[0][2]
+    assert "Traceback" in capsys.readouterr().err

@@ -735,6 +735,13 @@ class DevicesTab(QWidget):
             self.fill_tx_macs()
 
     def fill_tx_macs(self) -> None:
+        if self.mode() == MODE_RX_ALERT:
+            # Alert detection treats the receiver's samples as one stream,
+            # so it must hear exactly one transmitter: the latest one.
+            txs = sorted((r for r in self.registry.all() if r.role == dv.ROLE_TX),
+                         key=lambda r: r.last_flashed or 0, reverse=True)
+            self.macs_edit.setText(txs[0].mac if txs else "")
+            return
         macs = self.registry.tx_macs()
         if len(macs) > fw.MAX_FILTER_MACS:
             self._append_log(
@@ -832,6 +839,13 @@ class DevicesTab(QWidget):
                 plan.warnings.append(
                     "The TX MAC filter is empty, so this receiver will report CSI "
                     "from ANY ESP-NOW transmitter nearby.")
+            elif config.uart_only:
+                if len(config.tx_macs) > 1:
+                    plan.warnings.append(
+                        f"Alert mode treats everything this receiver hears as one "
+                        f"stream. With {len(config.tx_macs)} transmitters in the "
+                        f"filter their CSI interleaves, which inflates the motion "
+                        f"score — keep exactly one transmitter for alert mode.")
             else:
                 in_filter = {dv.normalize_mac(m) for m in config.tx_macs}
                 missing = [r for r in self.registry.all()
@@ -1040,6 +1054,11 @@ class SetupWindow(QMainWindow):
         lay.addWidget(self.tabs)
         self.setCentralWidget(central)
         self._monitor = None
+        # Closed monitors stay referenced: a parentless window that's
+        # garbage-collected while its detect QThread is still winding down
+        # aborts the process ("QThread: Destroyed while thread is still
+        # running").
+        self._retired_monitors: list = []
 
     def open_wizard(self) -> int:
         from csidetector.provision.wizard import SetupWizard
@@ -1050,6 +1069,7 @@ class SetupWindow(QMainWindow):
         wiz = SetupWizard(self.registry, list_boards=self._list_boards,
                           detect_hotspots=self._detect_hotspots,
                           idf_export=self.devices.export_edit.text().strip(),
+                          before_alert_apply=self.retire_monitor,
                           parent=self)
         result = wiz.exec()
         self.devices._force_refresh()
@@ -1057,8 +1077,22 @@ class SetupWindow(QMainWindow):
             self.open_monitor(wiz.alert_config_path)
         return result
 
+    def retire_monitor(self) -> None:
+        """Close the open alert monitor, if any.
+
+        The wizard calls this before rewriting the monitor's saved state:
+        an open monitor keeps the settings it loaded at startup and would
+        write them back over the new ones on its next Calibrate.
+        """
+        if self._monitor is None:
+            return
+        self._monitor.close()      # stops its detect/calibrate workers
+        self._retired_monitors.append(self._monitor)
+        self._monitor = None
+
     def open_monitor(self, alert_config_path: str) -> None:
         from csidetector.modes.alert.gui import CSIDetectorWindow
+        self.retire_monitor()
         self._monitor = CSIDetectorWindow(alert_config_path=alert_config_path)
         self._monitor.show()
 
@@ -1076,8 +1110,31 @@ class SetupWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _install_excepthook() -> None:
+    """Report unhandled exceptions instead of aborting.
+
+    PyQt6 calls qFatal() — i.e. abort() — on an exception that escapes a
+    slot unless sys.excepthook has been replaced. One unexpected error in a
+    button handler shouldn't kill the app mid-setup (or mid-flash).
+    """
+    import traceback
+
+    def hook(exc_type, exc, tb):
+        text = "".join(traceback.format_exception(exc_type, exc, tb))
+        sys.stderr.write(text)
+        app = QApplication.instance()
+        if app is not None:
+            QMessageBox.critical(
+                app.activeWindow(), "Unexpected error",
+                f"{exc_type.__name__}: {exc}\n\nThe details were printed to "
+                f"the terminal. The app is still running.")
+
+    sys.excepthook = hook
+
+
 def run_setup_gui(idf_export: Optional[str] = None, wizard: bool = False) -> int:
     app = QApplication.instance() or QApplication(sys.argv)
+    _install_excepthook()
     win = SetupWindow(idf_export=idf_export)
     win.show()
     if wizard:

@@ -282,8 +282,13 @@ class FlashPage(QWizardPage):
         lay.addWidget(self.ready_note)
 
         self._boards: list[dv.AttachedBoard] = []
-        self._ports: dict[str, str] = {}      # mac → port for boards flashed here
+        # mac → port, for bridge boards flashed here (their MAC isn't in the
+        # USB serial, so the live board list can't map it back).
+        self._ports: dict[str, str] = {}
         self._flashing: tuple[Optional[dv.AttachedBoard], str] = (None, "")
+        self._identifying: tuple[Optional[dv.AttachedBoard], str] = (None, "")
+        # Ticks survive Back → Next: initializePage rebuilds the list.
+        self._remembered: set[str] = set()
         self._page_id = PAGE_TX if role == dv.ROLE_TX else PAGE_RX
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._auto_refresh)
@@ -294,6 +299,7 @@ class FlashPage(QWizardPage):
         wiz.flasher.line.connect(self._on_line)
         wiz.flasher.progress.connect(self._on_progress)
         wiz.flasher.flash_finished.connect(self._on_finished)
+        wiz.flasher.identify_finished.connect(self._on_identified)
         wiz.currentIdChanged.connect(self._on_page_changed)
 
     def _current(self) -> bool:
@@ -305,16 +311,25 @@ class FlashPage(QWizardPage):
         else:
             self._timer.stop()
 
+    @property
+    def _single(self) -> bool:
+        """Alert mode: exactly one TX and one RX (the detector treats the
+        receiver's samples as a single stream; several TXs would mix)."""
+        return self.wiz.state.mode == MODE_ALERT
+
     # -- lifecycle -------------------------------------------------------
 
     def initializePage(self) -> None:  # noqa: N802
         st = self.wiz.state
         if self.role == dv.ROLE_TX:
             self.instructions.setText(
-                "Plug in a board to use as a transmitter, pick it below, and flash "
-                "it. Afterwards it only needs power — any USB charger works. "
-                "Already-flashed transmitters are listed at the bottom; tick the "
-                "ones to use.")
+                ("Plug in the board to use as the transmitter (alert mode uses "
+                 "exactly one), pick it below, and flash it. " if self._single else
+                 "Plug in a board to use as a transmitter, pick it below, and flash "
+                 "it. ")
+                + "Afterwards it only needs power — any USB charger works. "
+                "Already-flashed transmitters are listed at the bottom; tick to "
+                "reuse one.")
         elif st.mode == MODE_ALERT:
             names = ", ".join(st.txs.values()) or "(none)"
             self.instructions.setText(
@@ -329,14 +344,17 @@ class FlashPage(QWizardPage):
         self.refresh_boards()
 
     def cleanupPage(self) -> None:  # noqa: N802 — Back pressed
-        # Leaving mid-flash cancels it rather than letting it finish
-        # unobserved and half-recorded.
+        # Navigation is locked while busy, so this is a safety net: never
+        # let a flash finish unobserved and half-recorded.
         if self.wiz.flasher.busy:
             self.wiz.flasher.cancel()
         self._flashing = (None, "")
+        self._identifying = (None, "")
+        self._remembered = set(self.checked_macs())
 
     def _populate_ready(self) -> None:
-        chosen = self.wiz.state.txs if self.role == dv.ROLE_TX else self.wiz.state.rxs
+        chosen = set(self.wiz.state.txs if self.role == dv.ROLE_TX
+                     else self.wiz.state.rxs) | self._remembered
         self.ready.blockSignals(True)
         self.ready.clear()
         for rec in self.wiz.registry.all():
@@ -377,8 +395,8 @@ class FlashPage(QWizardPage):
             boards = []
             self.log.appendPlainText(f"could not list serial ports: {exc}")
         current = self.board_combo.currentData()
-        key = [(b.port, b.mac, b.chip) for b in boards]
-        if key == [(b.port, b.mac, b.chip) for b in self._boards]:
+        key = [(b.port, b.mac, b.chip, b.vid) for b in boards]
+        if key == [(b.port, b.mac, b.chip, b.vid) for b in self._boards]:
             return
         self._boards = boards
         self.board_combo.blockSignals(True)
@@ -386,7 +404,7 @@ class FlashPage(QWizardPage):
         for b in boards:
             rec = self.wiz.registry.get(b.mac) if b.mac else None
             desc = " · ".join(x for x in (
-                b.port, b.chip or (rec.chip if rec else ""), b.mac or "MAC unknown",
+                b.port, self._board_chip(b), b.mac or "MAC unknown",
                 (rec.label if rec and rec.label else ""),
                 (f"currently {rec.role.upper()}" if rec and rec.role else "")) if x)
             self.board_combo.addItem(desc, b.port)
@@ -409,16 +427,20 @@ class FlashPage(QWizardPage):
         port = self.board_combo.currentData()
         return next((b for b in self._boards if b.port == port), None)
 
+    def _board_chip(self, board: dv.AttachedBoard) -> str:
+        """Chip from the live board, else from the registry; "" if unknown.
+        list_boards() never knows the chip — it isn't in the USB descriptor."""
+        if board.chip:
+            return board.chip
+        rec = self.wiz.registry.get(board.mac) if board.mac else None
+        return rec.chip if rec else ""
+
     def _sync_buttons(self) -> None:
         busy = self.wiz.flasher.busy
         self.flash_btn.setEnabled(not busy and self._selected_board() is not None)
         self.cancel_btn.setEnabled(busy)
-        # completeChanged makes QWizard refresh its buttons (re-enabling
-        # Back), so emit first, then disable Back for the flash.
+        self.wiz.set_navigation_locked(busy)
         self.completeChanged.emit()
-        back = self.wiz.button(QWizard.WizardButton.BackButton)
-        if back is not None and busy:
-            back.setEnabled(False)
 
     # -- flashing --------------------------------------------------------
 
@@ -434,17 +456,66 @@ class FlashPage(QWizardPage):
                 config.password = st.password
                 config.host_ip = st.host_ip
                 config.host_port = st.host_port
-        target = dv.chip_to_target(board.chip)
-        if target not in fw.TARGETS:
-            target = fw.DEFAULT_TARGET
-        return fw.FlashJob(port=board.port, config=config, target=target)
+        # No silent default: flashing an S3 build onto a C3 fails, and an
+        # unknown chip is identified before we get here.
+        return fw.FlashJob(port=board.port, config=config,
+                           target=dv.chip_to_target(self._board_chip(board)))
 
     def flash(self) -> None:
         board = self._selected_board()
         if board is None or self.wiz.flasher.busy:
             return
+        label = self.label_edit.text().strip()
+        if not self._board_chip(board):
+            self._start_identify(board, label)
+        else:
+            self._flash_board(board, label)
+
+    def _start_identify(self, board: dv.AttachedBoard, label: str) -> None:
+        self.log.clear()
+        self.progress.setValue(0)
+        self.status.setText("Identifying the chip…")
+        self._identifying = (board, label)
+        try:
+            self.wiz.flasher.identify(board.port, board.usb_serial,
+                                      Path(self.wiz.state.export).expanduser())
+        except RuntimeError as exc:
+            self._identifying = (None, "")
+            QMessageBox.warning(self, "Can't identify", str(exc))
+            return
+        self._sync_buttons()
+
+    def _on_identified(self, res) -> None:
+        if not self._current():
+            return
+        board, label = self._identifying
+        self._identifying = (None, "")
+        if board is None:
+            return
+        if res.ok and res.chip:
+            board.chip = res.chip
+            board.mac = board.mac or res.mac
+            self._sync_buttons()
+            self._flash_board(board, label)
+            return
+        self._sync_buttons()
+        self.status.setText("Cancelled" if res.cancelled else "Couldn't identify the chip")
+        if not res.cancelled:
+            hints = fw.failure_hints(res.output)
+            for hint in hints:
+                self.log.appendPlainText(f"[hint] {hint}")
+            QMessageBox.warning(
+                self, "Couldn't identify the chip",
+                "The wizard needs to know which ESP32 this is to build the right "
+                "firmware.\n\n" + ("\n\n".join(hints) if hints else
+                                   "See the log for details."))
+
+    def _flash_board(self, board: dv.AttachedBoard, label: str) -> None:
         job = self.build_job(board)
         errors = job.validate()
+        if job.target not in fw.TARGETS:
+            errors = [f"{self._board_chip(board) or 'This chip'} isn't supported "
+                      f"by this firmware (supported: {', '.join(fw.TARGETS)})."]
         if errors:
             QMessageBox.warning(self, "Can't flash", "\n\n".join(errors))
             return
@@ -461,18 +532,19 @@ class FlashPage(QWizardPage):
             if not self.wiz.confirm(
                     "Use the native USB port",
                     f"This receiver streams CSI over the chip's native USB port, not "
-                    f"the {board.interface} you're flashing through. Afterwards, "
-                    f"connect the board's native USB port to this computer.\n\n"
-                    f"Flash anyway?"):
+                    f"the {board.interface} you're flashing through. After flashing, "
+                    f"connect the board's native USB port to this computer — the "
+                    f"wizard waits for it before continuing.\n\nFlash anyway?"):
                 return
         self.log.clear()
         self.progress.setValue(0)
         self.status.setText("Building…")
-        self._flashing = (board, self.label_edit.text().strip())
+        self._flashing = (board, label)
         try:
             self.wiz.flasher.flash(job, Path(self.wiz.state.export).expanduser(),
                                    inferred_mac=board.mac, inferred_chip=board.chip)
         except (OSError, ValueError, RuntimeError) as exc:
+            self._flashing = (None, "")
             self.status.setText("Can't flash")
             QMessageBox.warning(self, "Can't flash", f"Could not start the flash: {exc}")
             return
@@ -500,10 +572,10 @@ class FlashPage(QWizardPage):
                 if label:
                     self.wiz.registry.upsert(res.mac, label=label)
                 rec = self.wiz.registry.get(res.mac)
-                if board is not None:
+                if board is not None and not board.mac:
                     self._ports[res.mac] = board.port
-                if self.role == dv.ROLE_RX and self.wiz.state.mode == MODE_ALERT:
-                    # One receiver in alert mode: the new one replaces any tick.
+                if self._single:
+                    # One per role in alert mode: the new board replaces any tick.
                     for i in range(self.ready.count()):
                         self.ready.item(i).setCheckState(Qt.CheckState.Unchecked)
                 self._add_ready(res.mac, rec.label if rec else label, checked=True)
@@ -531,26 +603,76 @@ class FlashPage(QWizardPage):
     # -- completion ------------------------------------------------------
 
     def _attached_port(self, mac: str) -> str:
-        if mac in self._ports:
-            return self._ports[mac]
-        return next((b.port for b in self._boards if b.mac == mac), "")
+        """The port this board is on *now*, preferring its native USB port
+        (where an S3/C3/C5 receiver's console — and CSI — goes)."""
+        live = [b for b in self._boards if b.mac == mac]
+        native = [b for b in live if b.vid == dv.ESPRESSIF_VID]
+        if native:
+            return native[0].port
+        if live:
+            return live[0].port
+        # A bridge board flashed on this page: its MAC isn't in the USB
+        # serial, so trust the recorded port only while a MAC-less board
+        # is still there.
+        port = self._ports.get(mac, "")
+        if port and any(b.port == port and not b.mac for b in self._boards):
+            return port
+        return ""
+
+    def _config_problems(self, macs: list[str]) -> list[str]:
+        """Boards reused without reflashing must have been flashed for this
+        setup's channel / transmitters / mode, or they can't work."""
+        st = self.wiz.state
+        out = []
+        for mac in macs:
+            rec = self.wiz.registry.get(mac)
+            cfg = rec.config if rec and isinstance(rec.config, dict) else {}
+            if not cfg:
+                continue            # flashed outside the setup app: unknown
+            name = rec.label or mac
+            if isinstance(cfg.get("channel"), int) and cfg["channel"] != st.channel:
+                out.append(f"{name} was flashed for channel {cfg['channel']}, but this "
+                           f"setup uses channel {st.channel}. Reflash it.")
+                continue
+            if self.role != dv.ROLE_RX:
+                continue
+            want = "uart" if st.mode == MODE_ALERT else "hotspot"
+            if cfg.get("mode") and cfg["mode"] != want:
+                kind = "USB-only (alert)" if cfg["mode"] == "uart" else "hotspot (localize)"
+                out.append(f"{name} was flashed for {kind} mode. Reflash it.")
+            elif set(cfg.get("tx_macs") or []) != set(st.txs):
+                out.append(f"{name} listens for different transmitters than the ones "
+                           f"chosen for this setup. Reflash it.")
+            elif want == "hotspot" and (cfg.get("ssid"), cfg.get("host_ip"),
+                                        cfg.get("host_port")) != (st.ssid, st.host_ip,
+                                                                  st.host_port):
+                out.append(f"{name} was flashed for a different hotspot or host "
+                           f"address. Reflash it.")
+        return out
 
     def problems(self) -> list[str]:
         macs = self.checked_macs()
+        noun = "transmitter" if self.role == dv.ROLE_TX else "receiver"
         if self.wiz.flasher.busy:
             return ["Wait for the flash to finish."]
         if not macs:
-            return [f"Flash or tick at least one "
-                    f"{'transmitter' if self.role == dv.ROLE_TX else 'receiver'}."]
+            return [f"Flash or tick at least one {noun}."]
+        if self._single and len(macs) != 1:
+            return [f"Alert mode uses exactly one {noun}."]
         if self.role == dv.ROLE_TX and len(macs) > fw.MAX_FILTER_MACS:
             return [f"A receiver can listen to at most {fw.MAX_FILTER_MACS} "
                     f"transmitters; untick some."]
-        if self.role == dv.ROLE_RX and self.wiz.state.mode == MODE_ALERT:
-            if len(macs) != 1:
-                return ["Alert mode uses exactly one receiver."]
-            if not self._attached_port(macs[0]):
+        if self.role == dv.ROLE_RX and self._single:
+            port = self._attached_port(macs[0])
+            if not port:
                 return ["The ticked receiver isn't plugged into this computer."]
-        return []
+            board = next(b for b in self._boards if b.port == port)
+            rec = self.wiz.registry.get(macs[0])
+            target = dv.chip_to_target(board.chip or (rec.chip if rec else ""))
+            if board.vid != dv.ESPRESSIF_VID and target in fw.USB_JTAG_TARGETS:
+                return [f"This receiver sends CSI over its native USB port, not the "
+                        f"{board.interface}. Plug the native port into this computer."]
+        return self._config_problems(macs)
 
     def isComplete(self) -> bool:  # noqa: N802
         problems = self.problems()
@@ -730,15 +852,22 @@ class FinishPage(QWizardPage):
             self.open_monitor.setVisible(True)
         else:
             lp = self.wiz.page(PAGE_LINKS)
+            links = Path(lp.path.text().strip()).expanduser()
+            env = []
+            if st.host_port != 5566:
+                env.append(f"PORT={st.host_port}")
+            if links.resolve() != (self.wiz.host_dir / "links.json").resolve():
+                env.append(f"LINKS={links}")
             lines = [
-                f"Update {lp.path.text()} with "
+                f"Update {links} with "
                 f"{len(st.txs)} transmitter(s) and {len(st.rxs)} receiver(s).",
                 "",
                 "Next steps:",
-                "  1. Measure each new board's position and set its x / y in links.json.",
-                "  2. Leave the room and run:",
-                "     python run.py localize calibrate-links udp:5566 --out baselines.json",
-                "  3. ./start.sh  (hotspot + heatmap)",
+                f"  1. Measure each new board's position and set its x / y in {links.name}.",
+                "  2. Leave the room and run (from host/):",
+                f"     python run.py localize calibrate-links udp:{st.host_port} "
+                "--out baselines.json --settle 30",
+                f"  3. {' '.join(env + ['./start.sh'])}  (hotspot + heatmap)",
             ]
             self.open_monitor.setVisible(False)
         self.summary.setText("\n".join(lines))
@@ -746,8 +875,8 @@ class FinishPage(QWizardPage):
     def validatePage(self) -> bool:  # noqa: N802
         try:
             self.wiz.apply()
-        except (OSError, ValueError) as exc:
-            QMessageBox.warning(self, "Couldn't save", str(exc))
+        except Exception as exc:  # noqa: BLE001 — anything here would abort Qt
+            QMessageBox.warning(self, "Couldn't save", f"{type(exc).__name__}: {exc}")
             return False
         return True
 
@@ -762,7 +891,8 @@ class SetupWizard(QWizard):
                  detect_hotspots: Callable[[], list[fw.HotspotInfo]] = fw.detect_hotspots,
                  idf_export: str = "",
                  host_dir: Optional[Path] = None,
-                 parent: Optional[QWidget] = None):
+                 parent: Optional[QWidget] = None,
+                 before_alert_apply: Optional[Callable[[], None]] = None):
         super().__init__(parent)
         self.setWindowTitle("CSIDetector setup wizard")
         self.resize(760, 640)
@@ -770,6 +900,10 @@ class SetupWizard(QWizard):
         self.list_boards = list_boards
         self.detect_hotspots = detect_hotspots
         self.host_dir = Path(host_dir) if host_dir else default_host_dir()
+        # Called before alert mode rewrites the monitor's state file, so an
+        # open monitor is closed first and can't save over the new state.
+        self.before_alert_apply = before_alert_apply
+        self.set_navigation_locked(False)
         self.flasher = Flasher(registry, self)
         self.state = WizardState()
         found = fw.find_idf_export()
@@ -795,12 +929,31 @@ class SetupWizard(QWizard):
             QMessageBox.StandardButton.No)
         return answer == QMessageBox.StandardButton.Yes
 
+    _NAV_BUTTONS = [QWizard.WizardButton.Stretch, QWizard.WizardButton.BackButton,
+                    QWizard.WizardButton.NextButton, QWizard.WizardButton.FinishButton,
+                    QWizard.WizardButton.CancelButton]
+
+    def set_navigation_locked(self, locked: bool) -> None:
+        """Hide Back while a flash runs.
+
+        Back runs cleanupPage, which would kill the flash without asking,
+        and QWizard re-enables Back whenever a page's completeChanged
+        fires, so disabling the button doesn't stick. Removing it from the
+        layout does. Next/Finish stay gated by isComplete; Cancel goes
+        through reject(), which asks first.
+        """
+        layout = [b for b in self._NAV_BUTTONS
+                  if not (locked and b == QWizard.WizardButton.BackButton)]
+        self.setButtonLayout(layout)
+
     def apply(self) -> None:
         """Write the config files for the chosen mode."""
         st = self.state
         self.written = []
         if st.mode == MODE_ALERT:
             from csidetector.modes.alert.gui import _PersistedState
+            if self.before_alert_apply is not None:
+                self.before_alert_apply()
             tg: TelegramPage = self.page(PAGE_TELEGRAM)
             config_path = ""
             if not tg.skip.isChecked():

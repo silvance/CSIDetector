@@ -112,6 +112,20 @@ def test_main_window_constructs(qt_app):
         win.close()
 
 
+def test_closed_window_ignores_late_calibration_result(qt_app, tmp_path, monkeypatch):
+    """A calibration result still queued when the monitor closes must not
+    overwrite state saved after the close (the setup wizard rewrites it)."""
+    import csidetector.modes.alert.gui as gui
+    monkeypatch.setattr(gui, "_STATE_DIR", tmp_path)
+    monkeypatch.setattr(gui, "_STATE_PATH", tmp_path / "state.json")
+    win = gui.CSIDetectorWindow(alert_config_path="")
+    win.close()
+    gui._PersistedState(source="/dev/ttyACM9").save()
+    win._on_calib_done(3.0, 100)
+    assert gui._PersistedState.load().source == "/dev/ttyACM9"
+    assert gui._PersistedState.load().baseline == 0.0
+
+
 def test_status_badge_state_transitions(qt_app):
     from csidetector.modes.alert.gui import _StatusBadge
     b = _StatusBadge()
