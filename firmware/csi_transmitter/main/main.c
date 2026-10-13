@@ -40,14 +40,21 @@ static void wifi_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+#if CONFIG_IDF_TARGET_ESP32C5
+    // Dual-band chip: stay on 2.4 GHz. In its 2.4+5 GHz mode
+    // esp_wifi_set_protocol/set_bandwidth return ESP_ERR_NOT_SUPPORTED.
+    // As esp-csi's csi_send/csi_recv do for the C5.
+    ESP_ERROR_CHECK(esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY));
+#endif
 
     // Force HT20 / 11n. ESP-NOW broadcasts default to legacy 11b without
     // HT-LTF, which means the receiver's CSI engine never fires for our
     // frames. Selecting 11n + HT20 makes every broadcast carry HT-LTF so
-    // CSI samples are produced. Matches esp-csi/csi_send.
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
+    // CSI samples are produced. Matches esp-csi/csi_send. Not fatal: the
+    // per-peer rate config below is what pins the broadcasts to HT20.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_protocol(WIFI_IF_STA,
         WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N));
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
 
     // Pin to a fixed channel so receivers can stay tuned.
     ESP_ERROR_CHECK(esp_wifi_set_channel(s_cfg.channel, WIFI_SECOND_CHAN_NONE));

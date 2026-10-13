@@ -180,6 +180,10 @@ class RxConfig:
                               "or 8–64 characters.")
             if _has_control_chars(self.password):
                 errors.append("Wi-Fi password contains control characters.")
+            elif len(self.password) == 64 and not re.fullmatch(r"[0-9A-Fa-f]{64}",
+                                                               self.password):
+                errors.append("A 64-character Wi-Fi key must be hexadecimal (0-9, "
+                              "a-f); a passphrase is 8–63 characters.")
             try:
                 ipaddress.IPv4Address(self.host_ip)
             except (ipaddress.AddressValueError, ValueError):
@@ -365,13 +369,7 @@ def write_settings_file(job: FlashJob, image: FirmwareImage) -> Path:
     crash are removed here, next time."""
     blob = board_settings.encode(job.config.settings(), image.settings_size)
     folder = private_dir()
-    now = time.time()
-    for old in folder.glob("settings-*.bin"):
-        try:
-            if now - old.stat().st_mtime > _STALE_SETTINGS_S:
-                old.unlink()
-        except OSError:
-            pass
+    clear_stale_settings_files(folder)
     fd, name = tempfile.mkstemp(prefix="settings-", suffix=".bin", dir=folder)
     with os.fdopen(fd, "wb") as f:
         f.write(blob)
@@ -386,6 +384,18 @@ def blank_file(size: int) -> Path:
     if not path.is_file() or path.stat().st_size != size:
         path.write_bytes(b"\xff" * size)
     return path
+
+
+def clear_stale_settings_files(folder: Optional[Path] = None) -> None:
+    """Remove settings files a crash left behind (older than a flash takes)."""
+    folder = folder or private_dir()
+    now = time.time()
+    for old in folder.glob("settings-*.bin"):
+        try:
+            if now - old.stat().st_mtime > _STALE_SETTINGS_S:
+                old.unlink()
+        except OSError:
+            pass
 
 
 def remove_settings_file(path: Optional[Path]) -> None:

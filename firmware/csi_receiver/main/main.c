@@ -317,8 +317,12 @@ static void wifi_init(void) {
         ESP_ERROR_CHECK(esp_event_handler_instance_register(
             IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
         wifi_config_t sta_cfg = {0};
-        strlcpy((char *)sta_cfg.sta.ssid, s_cfg.ssid, sizeof(sta_cfg.sta.ssid));
-        strlcpy((char *)sta_cfg.sta.password, s_cfg.password, sizeof(sta_cfg.sta.password));
+        // memcpy, not strlcpy: a 32-byte SSID or 64-character (hex) key
+        // fills the field with no room for a NUL, which it doesn't need.
+        memcpy(sta_cfg.sta.ssid, s_cfg.ssid,
+               strnlen(s_cfg.ssid, sizeof(sta_cfg.sta.ssid)));
+        memcpy(sta_cfg.sta.password, s_cfg.password,
+               strnlen(s_cfg.password, sizeof(sta_cfg.sta.password)));
         // Fast-scan on the configured channel so association doesn't
         // sweep all 13 channels.
         sta_cfg.sta.channel = s_cfg.channel;
@@ -327,13 +331,20 @@ static void wifi_init(void) {
     }
 
     ESP_ERROR_CHECK(esp_wifi_start());
+#if CONFIG_IDF_TARGET_ESP32C5
+    // Dual-band chip: stay on 2.4 GHz. In its 2.4+5 GHz mode
+    // esp_wifi_set_protocol/set_bandwidth return ESP_ERR_NOT_SUPPORTED.
+    // As esp-csi's csi_send/csi_recv do for the C5.
+    ESP_ERROR_CHECK(esp_wifi_set_band_mode(WIFI_BAND_MODE_2G_ONLY));
+#endif
 
     // Set protocol + bandwidth BEFORE connecting. Calling these on an
     // already-associated STA forces a renegotiation and the AP drops
-    // us (reason 8, LEAVING). Pre-connect they're harmless.
-    ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA,
+    // us (reason 8, LEAVING). Pre-connect they're harmless. Not fatal:
+    // CSI capture works without them.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_protocol(WIFI_IF_STA,
         WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N | WIFI_PROTOCOL_LR));
-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT40));
 
     if (wifi_enabled) {
         // Associated path: the AP's channel becomes the radio's

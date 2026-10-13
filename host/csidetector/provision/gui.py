@@ -237,6 +237,10 @@ class Flasher(QObject):
         self._runner.progress.connect(self.progress)
         self._runner.finished.connect(self._on_finished)
         self._pending: Optional[dict] = None
+        try:
+            fw.clear_stale_settings_files()
+        except OSError:
+            pass
 
     @property
     def busy(self) -> bool:
@@ -251,10 +255,15 @@ class Flasher(QObject):
         image = job.image()
         fw.check_image(image)
         settings = fw.write_settings_file(job, image)
+        try:
+            argv = fw.flash_command(job, image, settings)
+        except BaseException:
+            fw.remove_settings_file(settings)       # it holds the password
+            raise
         self._pending = {"kind": "flash", "job": job, "settings": settings,
                          "mac": inferred_mac, "chip": inferred_chip}
         self.line.emit(f"[setup] flashing {job.project} ({job.target}) to {job.port}")
-        self._runner.start(fw.flash_command(job, image, settings), fw.esptool_env())
+        self._runner.start(argv, fw.esptool_env())
         self.started.emit("Flashing…")
 
     def identify(self, port: str, usb_serial: str) -> None:

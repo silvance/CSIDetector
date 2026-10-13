@@ -29,8 +29,9 @@ void csi_settings_load(csi_settings_t *s) {
         ESP_LOGE(TAG, "reading %s failed (%s): using the built-in defaults",
                  CSI_SETTINGS_LABEL, esp_err_to_name(err));
     } else if (rc == CSI_SETTINGS_OK) {
-        ESP_LOGI(TAG, "settings from the setup app%s%s%s", s->label[0] ? " for \"" : "",
-                 s->label, s->label[0] ? "\"" : "");
+        ESP_LOGI(TAG, "settings from the setup app%s%s%s (they take precedence over "
+                      "menuconfig; idf.py erase-flash clears them)",
+                 s->label[0] ? " for \"" : "", s->label, s->label[0] ? "\"" : "");
     } else if (rc == CSI_SETTINGS_ERR_EMPTY) {
         ESP_LOGI(TAG, "no settings from the setup app: using the built-in defaults");
     } else {

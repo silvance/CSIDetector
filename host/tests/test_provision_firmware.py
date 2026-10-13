@@ -59,6 +59,11 @@ def test_rx_hotspot_config_and_summary_excludes_password():
     assert "hunter22" not in repr(cfg.summary())
 
 
+def test_full_length_ssid_and_hex_key_are_accepted():
+    cfg = fw.RxConfig(ssid="S" * 32, password="0123456789abcdef" * 4)
+    assert cfg.validate() == []
+
+
 def test_labels_are_cut_to_what_the_board_holds():
     cfg = fw.TxConfig(label="  " + "Küche " * 20)
     assert len(cfg.settings()["label"].encode()) <= 63
@@ -70,6 +75,7 @@ def test_labels_are_cut_to_what_the_board_holds():
     ({"tx_macs": ["nope"]}, "Not a MAC"),
     ({"ssid": "x", "host_ip": "10.42.0"}, "IPv4"),
     ({"ssid": "x", "password": "short"}, "8–64"),
+    ({"ssid": "x", "password": "g" * 64}, "hexadecimal"),
     ({"ssid": "a" * 33}, "32 bytes"),
     ({"ssid": "x", "host_port": 0}, "port"),
     ({"channel": 0}, "Channel"),

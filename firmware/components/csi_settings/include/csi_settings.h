@@ -13,8 +13,9 @@
 //   12  payload         UTF-8 "key=value\n" lines; unknown keys ignored
 //
 // Anything else (an erased partition reads 0xFF) means "not set by the
-// setup app": the Kconfig defaults stay in force, so `idf.py flash` from
-// a developer's tree still works as before.
+// setup app": the Kconfig defaults stay in force. `idf.py flash` doesn't
+// write this partition, so on a board the setup app has flashed its
+// settings still win over menuconfig until `idf.py erase-flash`.
 
 #pragma once
 

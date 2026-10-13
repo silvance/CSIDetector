@@ -133,21 +133,22 @@ def list_boards(comports: Optional[Iterable] = None) -> list[AttachedBoard]:
 
 
 # esptool v4 prints "Chip is ESP32-S3 (QFN56) ..." and "MAC: aa:..";
-# v5 prints "Chip type:   ESP32-S3 (QFN56) ..." and "MAC:   aa:..",
-# and on some chips "BASE MAC:". Accept all of them.
+# v5 prints "Chip type:   ESP32-S3 (QFN56) ..." and "MAC:   aa:..". On the
+# C5/C6 "MAC:" is the 8-byte EUI-64 (60:55:f9:ff:fe:f7:2c:a2) and the
+# Wi-Fi MAC is on the "BASE MAC:" line, which wins when there is one.
 _CHIP_RE = re.compile(r"(?:Chip type:\s*|Chip is\s+)(ESP32[-A-Za-z0-9]*)")
-_MAC_LINE_RE = re.compile(
-    r"^\s*(?:BASE\s+)?MAC:\s*((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})\b",
-    re.MULTILINE)
+_MAC6 = r"((?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})(?![:0-9a-fA-F])"
+_BASE_MAC_RE = re.compile(r"^\s*BASE\s+MAC:\s*" + _MAC6, re.MULTILINE)
+_MAC_LINE_RE = re.compile(r"^\s*MAC:\s*" + _MAC6, re.MULTILINE)
 
 
 def parse_esptool_identify(output: str) -> tuple[str, str]:
-    """Extract (chip, mac) from esptool ``read_mac`` / ``chip_id`` output.
+    """Extract (chip, mac) from esptool ``read-mac`` / flash output.
 
     Either value is "" when not found.
     """
     chip_m = _CHIP_RE.search(output or "")
-    mac_m = _MAC_LINE_RE.search(output or "")
+    mac_m = _BASE_MAC_RE.search(output or "") or _MAC_LINE_RE.search(output or "")
     chip = chip_m.group(1).upper() if chip_m else ""
     mac = mac_m.group(1).lower() if mac_m else ""
     return chip, mac

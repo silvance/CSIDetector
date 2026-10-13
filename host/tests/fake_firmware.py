@@ -125,7 +125,13 @@ if want and chip_target(chip) != want:
 out("Connected to %s on %s:" % (target_name(chip_target(chip)), port))
 out("Chip type:          %s (revision v0.2)" % chip)
 out("Features:           Wi-Fi, BT 5 (LE)")
-out("MAC:                " + board["mac"])
+if chip_target(chip) in ("esp32c5", "esp32c6"):        # as esptool 5 prints them
+    o = board["mac"].split(":")
+    out("MAC:                " + ":".join(o[:3] + ["ff", "fe"] + o[3:]))
+    out("BASE MAC:           " + board["mac"])
+    out("MAC_EXT:            ff:fe")
+else:
+    out("MAC:                " + board["mac"])
 if cmd == "read-mac":
     out("Stub flasher running.")
     hard_reset(port)

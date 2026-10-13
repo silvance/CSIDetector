@@ -556,6 +556,16 @@ def test_flash_writes_the_image_and_the_settings_block_then_deletes_it(
     assert not any("hunter22" in line for line in lines)
 
 
+def test_the_settings_file_is_removed_if_the_flash_cant_start(qt_app, tmp_path, prebuilt,
+                                                             monkeypatch):
+    flasher = gui.Flasher(dv.Registry(tmp_path / "devices.json"))
+    monkeypatch.setattr(fw, "blank_file", lambda size: (_ for _ in ()).throw(OSError("full")))
+    with pytest.raises(OSError):
+        flasher.flash(fw.FlashJob(port="COM5", config=fw.RxConfig(ssid="Lab",
+                                                                 password="hunter22")))
+    assert not list((tmp_path / "cache").rglob("settings-*.bin")) and not flasher.busy
+
+
 def test_damaged_firmware_is_refused_before_anything_runs(qt_app, tmp_path, prebuilt,
                                                          monkeypatch):
     flasher = gui.Flasher(dv.Registry(tmp_path / "devices.json"))
