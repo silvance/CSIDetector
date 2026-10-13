@@ -62,6 +62,13 @@ where it came from. Add to it rather than opening another review round.
   file is flushed every 2 s, so it keeps everything but the last
   couple of seconds and has no end summary; it still replays.
 
+- **Command-line `alert detect` / `alert calibrate` time with the wall
+  clock** (monotonic-clock review). Their settle period, cooldown and
+  deadline use `time.time()`, so a clock sync mid-run (a Pi without a
+  real-time clock syncing after boot) can shorten a calibration. The
+  alert monitor window uses the monotonic clock.
+  `host/csidetector/modes/alert/detect.py`, `calibrate.py`.
+
 ## Ideas, not started
 
 - **Read a board's settings back on Identify.** esptool `read-flash` of

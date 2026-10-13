@@ -185,7 +185,7 @@ class _DetectWorker(QObject):
         # None until the detector is warmed up, so its first verdict (STILL
         # included) is reported; the badge says INITIALIZING until then.
         last_motion: Optional[bool] = None
-        last_alert_ts = 0.0
+        last_alert_ts = float("-inf")  # the first motion always alerts
         ts_history: list[float] = []   # recent push timestamps for pkt rate
         last_rate_emit = 0.0
         self.state_changed.emit("INIT")
