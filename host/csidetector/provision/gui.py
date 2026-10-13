@@ -43,7 +43,6 @@ from csidetector.provision import devices as dv
 from csidetector.provision import firmware as fw
 
 _OUTPUT_CAP = 256 * 1024          # chars of process output kept for hints
-_WRONG_CHIP_RE = re.compile(r"This chip is ESP32[-\w]*,? not ESP32", re.I)
 # Each command runs in its own session so Cancel can signal the whole
 # process group at once (Linux util-linux; elsewhere only the /proc walk).
 _SETSID = shutil.which("setsid") if sys.platform.startswith("linux") else None
@@ -445,7 +444,8 @@ class DevicesTab(QWidget):
         # (port, usb_serial) to flash once its identify finishes.
         self._flash_after_identify: Optional[tuple[str, str]] = None
         self._listed: Optional[list[dv.AttachedBoard]] = None   # last port scan
-        self._details_for: Optional[tuple] = None    # row the details form shows
+        self._details_for: Optional[tuple] = None    # board the details form shows
+        self._details_edited = False                 # typed since it was filled
         # (port, label) typed in the details box when a flash started: saved
         # with the result so it isn't lost for want of clicking Save.
         self._pending_label: Optional[tuple[str, str]] = None
@@ -502,6 +502,7 @@ class DevicesTab(QWidget):
         # Details: label / role
         self.label_edit = QLineEdit()
         self.label_edit.setPlaceholderText("e.g. South RX, Desk TX")
+        self.label_edit.textEdited.connect(lambda *_: setattr(self, "_details_edited", True))
         self.role_combo = QComboBox()
         self.role_combo.addItems(["—", "TX", "RX"])
         self.save_details_btn = QPushButton("Save")
@@ -793,11 +794,19 @@ class DevicesTab(QWidget):
     def _on_selection(self) -> None:
         row = self._selected_row()
         rec = row.record if row else None
-        ident = row.identity() if row else None
-        if ident != self._details_for:
-            # Only when the selection moves to another board: a refresh that
-            # reselects the same row mustn't wipe a label being typed.
-            self._details_for = ident
+        # The board — by its USB serial, which is the MAC on a native board
+        # (so a different board on the same port counts as one) and fixed on
+        # a bridge (so its MAC appearing after Identify doesn't) — and what
+        # the registry says about it now.
+        board_id = ((row.identity(), row.board.usb_serial if row.board else row.mac)
+                    if row else None)
+        saved = (rec.label, rec.role) if rec else ("", "")
+        shown_id, shown = self._details_for or (None, None)
+        if board_id != shown_id or (not self._details_edited and saved != shown):
+            # Another board, or the label changed elsewhere (wizard, Save)
+            # and nothing is being typed here: show what's saved.
+            self._details_for = (board_id, saved)
+            self._details_edited = False
             self.label_edit.setText(rec.label if rec else "")
             self.role_combo.setCurrentIndex(
                 {"tx": 1, "rx": 2}.get(rec.role if rec else "", 0))
@@ -833,6 +842,7 @@ class DevicesTab(QWidget):
         if row.chip:
             changes["chip"] = row.chip
         self.registry.upsert(row.mac, **changes)
+        self._details_edited = False
         self._table_sig = None
         self.refresh()
 
@@ -1081,9 +1091,8 @@ class DevicesTab(QWidget):
         row = self._selected_row()
         board = row.board if row and row.board and row.board.port == job.port else None
         label = self.label_edit.text().strip()
-        current = row.record.label if row and row.record else ""
-        self._pending_label = (job.port, label) if board and label and label != current \
-            else None
+        self._pending_label = ((job.port, label)
+                               if board and label and self._details_edited else None)
         self._save_settings()
         self.log.clear()
         try:
@@ -1173,6 +1182,7 @@ class DevicesTab(QWidget):
                 pending = self._pending_label
                 if pending and pending[0] == job.port:
                     self.registry.upsert(res.mac, label=pending[1])
+                    self._details_edited = False
                 if job.role == dv.ROLE_TX:
                     self._add_tx_to_filter(res.mac)
             else:
@@ -1184,7 +1194,7 @@ class DevicesTab(QWidget):
             self._append_log("[setup] cancelled")
         else:
             self._idle("Flash failed")
-            if _WRONG_CHIP_RE.search(res.output):
+            if fw.WRONG_CHIP_RE.search(res.output):
                 # The cached identify is stale (a board swapped on this
                 # port): forget it, so the next Flash identifies again.
                 self._identified = {k: v for k, v in self._identified.items()
@@ -1337,6 +1347,11 @@ class SetupWindow(QMainWindow):
         self.devices.shutdown()
         if self.wizard is not None:
             self.wizard.flasher.shutdown()
+        # app.exit() skips close events: stop the monitor's detect /
+        # calibrate threads here, or Qt aborts destroying them mid-run.
+        for monitor in (self._monitor, *self._retired_monitors):
+            if monitor is not None:
+                monitor.stop_workers()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self.devices.busy:

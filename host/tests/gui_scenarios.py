@@ -887,6 +887,80 @@ def room_selection_and_image_move(s: Session) -> None:
     s.expect(canvas.model.floorplan.image == image, "image path unchanged by a failed save")
 
 
+# --------------------------------------------------------------------------
+# Review of #36
+# --------------------------------------------------------------------------
+
+def identify_keeps_the_chosen_board(s: Session) -> None:
+    """Identify resets a native board (off the bus for a moment): the board
+    list mustn't fall back to the transmitter and stay there."""
+    s.plug("/dev/ttyACM0", mac=TX_MAC)
+    s.plug("/dev/ttyACM1", mac=RX_MAC)
+    _start_wizard(s)
+    _flash_here(s, "/dev/ttyACM0", "Desk TX")
+    s.next()
+    s.choose("Board", "/dev/ttyACM1")
+    s.click("Identify")
+    s.wait_idle()
+    s.wait_refresh()
+    s.expect(s.field("Board").currentData() == "/dev/ttyACM1",
+             "still the board the user chose, not the transmitter")
+
+
+def devices_swapped_board_keeps_its_label(s: Session) -> None:
+    """A different board on the same cable doesn't inherit the old label."""
+    s.plug("/dev/ttyACM0", mac=TX_MAC)
+    s.click("Refresh")
+    s.select_row("/dev/ttyACM0")
+    s.fill("Label", "Desk TX")
+    s.click("Save")
+    s.unplug("/dev/ttyACM0")
+    s.plug("/dev/ttyACM0", mac=RX_MAC)                # another board, same port
+    s.click("Refresh")
+    s.select_row("/dev/ttyACM0")
+    s.fill("Receiver — alert mode", True)
+    s.click("Flash selected board")
+    s.wait_idle()
+    s.wait_idle()
+    rec = s.window.registry.get(RX_MAC)
+    s.expect(rec is not None and rec.label != "Desk TX", "the new board isn't 'Desk TX'")
+    s.expect(s.window.registry.get(TX_MAC).label == "Desk TX", "the old board keeps it")
+
+
+def quit_with_the_monitor_armed(s: Session) -> None:
+    """Ctrl+C / SIGTERM (app.exit, no close events) with the monitor armed:
+    its detect thread must be stopped, or Qt aborts tearing it down."""
+    _alert_setup(s)
+    mon = _monitor(s)
+    s.csi("/dev/ttyACM1")
+    s.click("Calibrate")
+    s.wait_for(lambda: _dialog(s, "Calibration complete"), timeout=10, what="calibration")
+    s.click("Arm")
+    s.wait_for(lambda: "ARMED" in mon._badge.text(), what="armed")
+    thread = mon._detect_thread
+    s.window.shutdown_processes()                    # what aboutToQuit runs
+    s.expect(thread is not None and not thread.isRunning(), "the detect thread stopped")
+
+
+def wizard_swapped_bridge_board(s: Session) -> None:
+    """A different board on the same adapter port: the wrong-chip failure
+    drops the old mapping and the next Flash identifies and works."""
+    s.plug("/dev/ttyUSB0", chip="ESP32-C3", mac=TX_MAC, via="cp2102")
+    _start_wizard(s)
+    _flash_here(s, "/dev/ttyUSB0", "Desk TX")
+    s.wait_idle()
+    s.plug("/dev/ttyUSB0", chip="ESP32-D0WD-V3", mac=TX2_MAC, via="cp2102")   # swapped
+    s.click("Flash as transmitter")
+    s.wait_idle()
+    s.expect(_dialog(s, "Flash failed"), "the old chip's build fails")
+    s.dialogs.clear()
+    s.click("Flash as transmitter")
+    s.wait_idle()
+    s.wait_idle()
+    fwt = s.firmware(TX2_MAC)
+    s.expect(fwt and fwt["target"] == "esp32", "identified again and flashed")
+
+
 SCENARIOS = {f.__name__: f for f in (
     alert_happy_path,
     alert_telegram_failure,
@@ -923,4 +997,8 @@ SCENARIOS = {f.__name__: f for f in (
     room_floorplan_image,
     room_unsaved_changes_on_quit,
     room_selection_and_image_move,
+    identify_keeps_the_chosen_board,
+    devices_swapped_board_keeps_its_label,
+    quit_with_the_monitor_armed,
+    wizard_swapped_bridge_board,
 )}

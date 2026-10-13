@@ -672,6 +672,9 @@ _HINTS = [
 ]
 
 
+WRONG_CHIP_RE = re.compile(r"This chip is ESP32[-\w]*,? not ESP32", re.I)
+
+
 def failure_hints(output: str) -> list[str]:
     return [hint for rx, hint in _HINTS if rx.search(output or "")]
 

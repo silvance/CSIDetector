@@ -43,6 +43,7 @@ def qt_app():
 @pytest.fixture
 def env(qt_app, tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(dv, "stable_port", lambda port, mac="", by_id_dir=None: port)
     monkeypatch.setattr(alert_gui, "_STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(alert_gui, "_STATE_PATH", tmp_path / "state" / "state.json")
     boards = [
@@ -585,3 +586,15 @@ def test_windows_localize_flow_without_networkmanager(env, monkeypatch):
     text = wiz.currentPage().summary.text()
     assert "start.sh" not in text and "localize heatmap udp:5566" in text
     assert "cd /d" in text and "allow it on private networks" in text
+
+
+def test_calibration_is_kept_only_on_the_same_channel(env):
+    wiz = env.wiz
+    wiz.state.txs = {MAC_A: "TX"}
+    wiz.state.rxs = {MAC_B: ("RX", "/dev/ttyACM1")}
+    wiz.state.channel = 6
+    state = alert_gui._PersistedState(baseline=0.7, receiver_mac=MAC_B,
+                                      transmitter_mac=MAC_A, channel=11)
+    assert not wiz.keeps_baseline(state)
+    state.channel = 6
+    assert wiz.keeps_baseline(state)
