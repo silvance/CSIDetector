@@ -7,14 +7,24 @@ where it came from. Add to it rather than opening another review round.
 
 ## Not verified yet
 
+- **The prebuilt firmware on real boards.** CI compiles it; nobody has
+  flashed it yet. On the first boards, check: the boot log says
+  "settings from the setup app" with the board's label; a receiver
+  streams CSI on the channel set in the app; a localize receiver joins
+  the Wi-Fi typed into the app; a board flashed earlier with ESP-IDF
+  (default partition table) boots after the app reflashes it.
+- **ESP32-C5 / C6 CSI.** Their receiver code path (Wi-Fi 6 reception
+  metadata, the CSI acquire config) compiles but has never run. Whether
+  they produce CSI from the transmitter's HT20 broadcasts, and whether
+  the detector copes with their subcarrier layout, is unknown until a
+  recording from one is looked at.
 - **Windows on real hardware.** CI runs the whole suite on windows-latest,
-  but against fake idf.py/esptool. Nobody has yet run the setup app on a
-  Windows PC with a real ESP-IDF install, the USB drivers, the firewall
-  prompt and a Mobile hotspot. Things to watch on that first run: the
-  export.bat capture with the installer layout (`C:\Espressif`), which
-  Python the IDF virtualenv was made for, COM port names in the Devices
-  tab and monitor, the firewall prompt for UDP 5566, and the Mobile
-  hotspot's channel (it picks its own).
+  but against a fake esptool. Nobody has yet run the setup app on a
+  Windows PC with real boards, the USB drivers, the firewall prompt and a
+  Mobile hotspot. Things to watch on that first run: COM port names in
+  the Devices tab and monitor, esptool's progress output in the log, the
+  firewall prompt for UDP 5566, and the Mobile hotspot's channel (it
+  picks its own).
 - **macOS.** Never run and not in CI. The monitor accepts `/dev/cu.*`
   ports; nothing else has been checked.
 
@@ -32,23 +42,13 @@ where it came from. Add to it rather than opening another review round.
   board is placed at the outline's centroid, which for a concave room
   can be outside it. `warnings()` reports the board as outside; the
   editor doesn't move it. `host/csidetector/provision/layout.py`.
-- **Windows: Cancel is a hard kill** (Windows review). Cancel stops the
-  idf.py tree with `taskkill /F`, like Ctrl+C in a terminal, so a flash
+- **Windows: Cancel is a hard kill** (Windows review). Cancel stops
+  esptool with `taskkill /F`, like Ctrl+C in a terminal, so a flash
   cancelled mid-write leaves the board needing a reflash. There is no
   graceful stop on Windows.
 - **Windows: alert.toml is not 0600** (Windows support). The Telegram
   token file is protected by the user profile's ACL only; NTFS has no
   owner-only mode bit to set.
-- **Windows: user names with spaces** (Windows support). The build
-  directory lives under `%LOCALAPPDATA%` and uses the 8.3 short name
-  when the path has spaces. On a volume with short names disabled,
-  flashing refuses with the "path with spaces" message and asks for
-  `CSIDETECTOR_BUILD_DIR`.
-- **Windows: export.bat writes into the app's working directory**
-  (Windows CI review). ESP-IDF's export.bat (v5.2) writes an
-  `UNINSTALL_OUTPUT` file in the current directory, which is `host\`
-  when started from setup-windows.bat. A read-only folder only adds an
-  error line to the flash log.
 - **links.json files saved on Windows before the forward-slash fix**
   (Windows CI review) keep a backslash image path and show "Floor plan
   image not found" when opened on Linux. Re-select the image once and
@@ -62,12 +62,23 @@ where it came from. Add to it rather than opening another review round.
   file is flushed every 2 s, so it keeps everything but the last
   couple of seconds and has no end summary; it still replays.
 
+## Ideas, not started
+
+- **Read a board's settings back on Identify.** esptool `read-flash` of
+  the csi_cfg partition would show what a board was set up with (role,
+  label, channel, Wi-Fi name) on a computer that didn't flash it.
+- **Change Wi-Fi without rewriting the app.** Writing only the 4 KB
+  settings block would take a second; today the whole image is flashed
+  again (still only seconds, nothing is rebuilt).
+- **ESP32-S2** isn't in the prebuilt set (no USB-Serial/JTAG; it was a
+  build-from-source target before).
+
 ## Test tooling
 
-- **The fake idf.py reads the bench once** (GUI tester). It loads
+- **The fake esptool reads the bench once** (GUI tester). It loads
   `boards.json` when it starts, so unplugging a board mid-flash in a
   scenario doesn't fail the flash the way a real unplug would.
-  `host/tests/gui_driver.py`, `_FAKE_IDF`.
+  `host/tests/fake_firmware.py`.
 - **`Session.tick` misses some checkboxes** (room-tab review). A
   checkbox that isn't the field of a form row can't always be found by
   its label; `fill(name, True)` on the row's label works instead.
