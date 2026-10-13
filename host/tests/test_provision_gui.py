@@ -49,18 +49,16 @@ def _boards():
 
 
 @pytest.fixture
-def tab(qt_app, tmp_path):
+def tab(qt_app, tmp_path, idf_export):
     reg = dv.Registry(tmp_path / "devices.json")
     reg.upsert(FAR_TX, label="Corner TX", role=dv.ROLE_TX, chip="ESP32-S3",
                config={"channel": 11})
-    export = tmp_path / "export.sh"
-    export.write_text("")
     hotspots = [fw.HotspotInfo(connection="Hotspot", iface="wlp2s0u2",
                                ssid="CSIDetector", channel=11, ip="10.42.1.1")]
     t = gui.DevicesTab(reg, list_boards=_boards,
                        detect_hotspots=lambda: hotspots,
                        settings_path=tmp_path / "setup.json",
-                       idf_export=str(export), auto_refresh=False)
+                       idf_export=str(idf_export), auto_refresh=False)
     yield t
     t.shutdown()
     t.deleteLater()
@@ -80,9 +78,9 @@ def _finish_flash(tab, job, code, output, mac="", chip=""):
     tab.flasher._on_finished(code, output)
 
 
-def _finish_identify(tab, port, usb_serial, code, output, tmp_path):
+def _finish_identify(tab, port, usb_serial, code, output):
     tab.flasher._pending = {"kind": "identify", "port": port, "usb_serial": usb_serial,
-                            "cmd": "read_mac", "export": tmp_path / "export.sh"}
+                            "cmd": "read_mac", "export": Path(tab.export_edit.text())}
     tab.flasher._on_finished(code, output)
 
 
@@ -159,7 +157,7 @@ def test_chip_target_mismatch_is_an_error(tab):
 def test_missing_idf_export_is_an_error(tab, tmp_path):
     _select(tab, "/dev/ttyACM0")
     tab.export_edit.setText(str(tmp_path / "nope.sh"))
-    assert any("export.sh" in e for e in tab.plan_flash().errors)
+    assert any(fw.EXPORT_NAME in e for e in tab.plan_flash().errors)
 
 
 def test_save_details_writes_registry(tab):
@@ -203,10 +201,10 @@ def test_failed_flash_shows_hints_without_recording(tab, monkeypatch):
     assert "[hint]" in tab.log.toPlainText()
 
 
-def test_identify_result_updates_row_and_registry(tab, tmp_path):
+def test_identify_result_updates_row_and_registry(tab):
     _select(tab, "/dev/ttyUSB0")
     _finish_identify(tab, "/dev/ttyUSB0", "0001", 0,
-                     "Chip is ESP32-S3 (QFN56)\nMAC: 34:85:18:aa:bb:cc\n", tmp_path)
+                     "Chip is ESP32-S3 (QFN56)\nMAC: 34:85:18:aa:bb:cc\n")
     tab._force_refresh()
     row = _select(tab, "/dev/ttyUSB0")
     assert row.mac == "34:85:18:aa:bb:cc" and row.chip == "ESP32-S3"
@@ -222,18 +220,18 @@ def test_identify_button_click_runs_read_mac(tab, monkeypatch):
     _select(tab, "/dev/ttyUSB0")
     tab.identify_btn.click()
     assert started, "identify did not start"
-    assert started[0][-1].endswith("--port /dev/ttyUSB0 read_mac")
+    # POSIX: one bash -c script; Windows: python -m esptool … directly.
+    assert " ".join(started[0]).endswith("--port /dev/ttyUSB0 read_mac")
     assert tab.flasher._pending["cmd"] == "read_mac"
 
 
-def test_identify_retries_with_dashed_command_on_invalid_choice(tab, monkeypatch, tmp_path):
+def test_identify_retries_with_dashed_command_on_invalid_choice(tab, monkeypatch):
     started = []
     monkeypatch.setattr(tab.flasher._runner, "start",
                         lambda argv, env: started.append(argv))
     _finish_identify(tab, "/dev/ttyUSB0", "0001", 2,
-                     "esptool: error: argument operation: invalid choice: 'read_mac'",
-                     tmp_path)
-    assert started and started[0][-1].endswith("--port /dev/ttyUSB0 read-mac")
+                     "esptool: error: argument operation: invalid choice: 'read_mac'")
+    assert started and " ".join(started[0]).endswith("--port /dev/ttyUSB0 read-mac")
 
 
 def test_selection_clears_when_selected_board_disappears(qt_app, tmp_path):
@@ -323,12 +321,10 @@ def test_rx_alert_on_bridge_board_warns_about_native_usb(tab):
     assert not any("native USB" in w for w in tab.plan_flash().warnings)
 
 
-def test_localize_plan_warns_when_no_hotspot_running(qt_app, tmp_path):
-    export = tmp_path / "export.sh"
-    export.write_text("")
+def test_localize_plan_warns_when_no_hotspot_running(qt_app, tmp_path, idf_export):
     t = gui.DevicesTab(dv.Registry(tmp_path / "d.json"), list_boards=_boards,
                        detect_hotspots=lambda: [], settings_path=tmp_path / "s.json",
-                       idf_export=str(export), auto_refresh=False)
+                       idf_export=str(idf_export), auto_refresh=False)
     try:
         t.select_port("/dev/ttyACM0")
         t.mode_rx_loc.setChecked(True)

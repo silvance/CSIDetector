@@ -209,15 +209,15 @@ def test_idf_env_strips_active_venv():
 
 
 def test_find_idf_export_priority(tmp_path):
-    explicit = tmp_path / "a" / "export.sh"
+    explicit = tmp_path / "a" / fw.EXPORT_NAME
     idf_path = tmp_path / "b"
     explicit.parent.mkdir()
     explicit.write_text("")
     idf_path.mkdir()
-    (idf_path / "export.sh").write_text("")
+    (idf_path / fw.EXPORT_NAME).write_text("")
     assert fw.find_idf_export({"IDF_EXPORT": str(explicit),
                                "IDF_PATH": str(idf_path)}) == explicit
-    assert fw.find_idf_export({"IDF_PATH": str(idf_path)}) == idf_path / "export.sh"
+    assert fw.find_idf_export({"IDF_PATH": str(idf_path)}) == idf_path / fw.EXPORT_NAME
 
 
 # --------------------------------------------------------------------------
@@ -240,8 +240,8 @@ def test_failure_hints():
         "serial.serialutil.SerialException: could not open port /dev/ttyACM0"))
     assert any("BOOT" in h for h in fw.failure_hints(
         "A fatal error occurred: Failed to connect to ESP32-S3: No serial data received."))
-    assert any("export.sh" in h for h in fw.failure_hints(
-        "ESP-IDF export.sh failed to load"))
+    assert any(fw.EXPORT_NAME in h for h in fw.failure_hints(
+        f"ESP-IDF {fw.EXPORT_NAME} failed to load"))
     assert any("different chip" in h for h in fw.failure_hints(
         "A fatal error occurred: This chip is ESP32-C3, not ESP32-S3. "
         "Wrong --chip argument?"))

@@ -25,12 +25,11 @@ pytest.importorskip("PyQt6.QtWidgets")
 # Persistence — no Qt needed.
 # --------------------------------------------------------------------------
 
-def test_persisted_state_round_trip(tmp_path, monkeypatch):
+def test_persisted_state_round_trip(home):
     """State written to disk reads back identically. Defaults fill in
     when a field is missing."""
-    # Point _STATE_DIR/_STATE_PATH at the tmp dir BEFORE importing the
+    # Point _STATE_DIR/_STATE_PATH at the home dir BEFORE importing the
     # module so the dataclass picks up the override.
-    monkeypatch.setenv("HOME", str(tmp_path))
     import importlib
     gui = importlib.import_module("csidetector.modes.alert.gui")
     importlib.reload(gui)   # re-evaluate _STATE_DIR with the new HOME
@@ -45,7 +44,7 @@ def test_persisted_state_round_trip(tmp_path, monkeypatch):
         alert_config_path="/etc/foo.toml",
     )
     s.save()
-    assert (tmp_path / ".csidetector" / "state.json").exists()
+    assert (home / ".csidetector" / "state.json").exists()
 
     loaded = gui._PersistedState.load()
     assert loaded.source == "/dev/ttyACM1"
@@ -53,23 +52,21 @@ def test_persisted_state_round_trip(tmp_path, monkeypatch):
     assert loaded.location == "Lab"
 
 
-def test_persisted_state_missing_file_yields_defaults(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+def test_persisted_state_missing_file_yields_defaults(home):
     import importlib
     gui = importlib.import_module("csidetector.modes.alert.gui")
     importlib.reload(gui)
 
     s = gui._PersistedState.load()
-    assert s.source == "/dev/ttyACM0"
+    assert s.source == ("COM3" if os.name == "nt" else "/dev/ttyACM0")
     assert s.baseline == 0.0
     assert s.alert_config_path == ""
 
 
-def test_persisted_state_corrupt_file_yields_defaults(tmp_path, monkeypatch):
+def test_persisted_state_corrupt_file_yields_defaults(home):
     """A truncated state.json (interrupted write) must not crash the GUI;
     falling back to defaults is the right behavior."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    sdir = tmp_path / ".csidetector"
+    sdir = home / ".csidetector"
     sdir.mkdir()
     (sdir / "state.json").write_text("{not valid json")
 
