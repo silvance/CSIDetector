@@ -20,3 +20,6 @@ host/alert.toml
 host/links.json
 host/baselines.json
 *.bak-*
+
+# GUI walkthrough output (python -m tests.gui_driver)
+host/gui-run/

@@ -31,7 +31,7 @@ from PyQt6.QtWidgets import (
 from csidetector.provision import devices as dv
 from csidetector.provision import firmware as fw
 from csidetector.provision import project_files as pf
-from csidetector.provision.gui import Flasher, FlashResult
+from csidetector.provision.gui import TIMING, Flasher, FlashResult
 
 MODE_ALERT = "alert"
 MODE_LOCALIZE = "localize"
@@ -244,6 +244,7 @@ class FlashPage(QWizardPage):
         self.instructions = QLabel()
         self.instructions.setWordWrap(True)
         self.board_combo = QComboBox()
+        self.board_combo.setAccessibleName("Board")
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh_boards)
         self.label_edit = QLineEdit()
@@ -255,12 +256,15 @@ class FlashPage(QWizardPage):
         self.cancel_btn.clicked.connect(self.wiz.flasher.cancel)
         self.cancel_btn.setEnabled(False)
         self.progress = QProgressBar()
+        self.progress.setAccessibleName("Flash progress")
         self.status = QLabel("")
         self.log = QPlainTextEdit()
+        self.log.setAccessibleName("Flash log")
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(500)
         self.log.setMaximumHeight(110)
         self.ready = QListWidget()
+        self.ready.setAccessibleName("Use these in this setup")
         self.ready.itemChanged.connect(lambda *_: self.completeChanged.emit())
         self.ready_note = QLabel("")
         self.ready_note.setWordWrap(True)
@@ -313,7 +317,7 @@ class FlashPage(QWizardPage):
 
     def _on_page_changed(self, page_id: int) -> None:
         if page_id == self._page_id:
-            self._timer.start(2000)
+            self._timer.start(TIMING.auto_refresh_ms)
         else:
             self._timer.stop()
 
@@ -608,7 +612,7 @@ class FlashPage(QWizardPage):
             QMessageBox.warning(self, "Flash failed",
                                 "\n\n".join(hints) if hints else "See the log for details.")
         self._sync_buttons()
-        QTimer.singleShot(1500, self.refresh_boards)
+        QTimer.singleShot(TIMING.post_process_refresh_ms, self.refresh_boards)
 
     # -- completion ------------------------------------------------------
 
