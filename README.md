@@ -372,6 +372,35 @@ window relaunches with sensible defaults.
 
 PyQt6 is already in `requirements.txt`.
 
+### 3.6. Record data for the developers
+
+Improving detection needs real captures, so the monitor has a
+**Record data for the developers** panel. For each recording:
+
+1. Pick the **Condition**: empty room, someone sitting still, someone
+   walking through, someone walking along the walls, or other. Add a
+   **Note** for anything unusual (door open, two people, where the
+   boards are).
+2. **Start in** gives you time to get into position (leave the room for
+   an empty-room recording). **Length** is how long it records; 2
+   minutes is plenty.
+3. Click **Record**. Click **Mark** whenever something happens, such as
+   someone walking in or sitting down. **Stop recording** ends it early
+   and keeps what was recorded.
+
+Each recording is one file in `Documents/CSIDetector recordings`, for
+example `2026-10-13_213102_walk.csi.gz` (**Open folder** shows it). That
+file is what to send: it holds the receiver's raw CSI lines plus what
+they were recorded under (condition, note, marks, boards, channel,
+baseline, app version). It holds no Wi-Fi password or Telegram token, and
+the firmware's other log lines are left out. A useful set is one
+recording of each condition with the boards where they'll be used.
+
+Recording uses the receiver's serial port, so it runs while the monitor
+is disarmed. A recording also replays anywhere a capture file is
+accepted. A file is read instantly, so turn off the start-up settle
+time, e.g. `python run.py alert calibrate <file> --settle 0`.
+
 ### How offline alerts survive an internet outage
 
 Each alert is enqueued in a SQLite file (default

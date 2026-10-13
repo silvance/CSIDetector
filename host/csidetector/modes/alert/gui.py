@@ -23,6 +23,8 @@ from __future__ import annotations
 import json
 import os
 import platform
+import queue
+import re
 import subprocess
 import threading
 import time
@@ -33,18 +35,21 @@ from typing import Optional
 import numpy as np
 
 from PyQt6.QtCore import (
-    QObject, QThread, Qt, QTimer, pyqtSignal, pyqtSlot,
+    QObject, QStandardPaths, QThread, Qt, QTimer, QUrl, pyqtSignal, pyqtSlot,
 )
 from PyQt6.QtGui import (
-    QColor, QFont, QFontDatabase, QPainter, QPaintEvent, QPen,
+    QColor, QDesktopServices, QFont, QFontDatabase, QPainter, QPaintEvent, QPen,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMessageBox, QProgressBar, QPushButton, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
+import csidetector
 from csidetector.core import collector as csi_collector
 from csidetector.core import detector
+from csidetector.core import recording
 from csidetector.modes.alert.calibrate import collect_amplitudes
 from csidetector.modes.alert.config import build_notifier, load_config
 from csidetector.modes.alert.notifier import Event, NullNotifier
@@ -64,6 +69,20 @@ CALIBRATE_SETTLE_S = 30.0
 CALIBRATE_RECORD_S = 30.0
 # Say so after this long without a single CSI sample (s).
 NO_DATA_WARN_S = 3.0
+# The detector window the monitor arms with (recorded with each recording).
+DETECT_WINDOW = 50
+
+
+def recordings_dir() -> Path:
+    """Where Record saves: Documents/CSIDetector recordings, easy to find
+    and attach to an email or a chat."""
+    docs = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation)
+    return Path(docs or Path.home()) / "CSIDetector recordings"
+
+
+def _is_serial(source: str) -> bool:
+    """A serial port the collector opens (/dev/tty*, /dev/cu.*, by-id, COMn)."""
+    return source.startswith("/dev/") or source.upper().startswith("COM")
 
 
 def _friendly_source_error(source: str, exc: Exception) -> str:
@@ -341,6 +360,154 @@ class _CalibrateWorker(QObject):
         self.done.emit(float(baseline), amps.shape[0])
 
 
+class _RecordWorker(QObject):
+    """Saves the receiver's raw CSI lines to a recording file: waits
+    ``delay_s`` (time to get into position), then records ``length_s``."""
+
+    progress = pyqtSignal(str, float, int)    # 'WAIT' | 'REC', seconds left, samples
+    no_data = pyqtSignal(float)               # seconds without CSI; 0 = resumed
+    saved = pyqtSignal(str, object)           # path, summary
+    error_occurred = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, source: str, folder: Path, meta: dict,
+                 delay_s: float, length_s: float):
+        super().__init__()
+        self._source = source
+        self._folder = Path(folder)
+        self._meta = dict(meta)
+        self._delay_s = delay_s
+        self._length_s = length_s
+        self._stop = threading.Event()
+        self._stopped_by = "stopped"
+        self._marks: "queue.SimpleQueue[None]" = queue.SimpleQueue()
+        self._writer: Optional[recording.RecordingWriter] = None
+        self._end_at = 0.0
+
+    def request_stop(self, reason: str = "stopped") -> None:
+        if not self._stop.is_set():
+            self._stopped_by = reason
+        self._stop.set()
+
+    def add_mark(self) -> None:
+        """From the GUI thread: written by the worker with its time."""
+        self._marks.put(None)
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            self._run_inner()
+        except Exception as exc:  # noqa: BLE001
+            self._stopped_by = "error"
+            self.error_occurred.emit(_friendly_source_error(self._source, exc))
+        finally:
+            try:
+                self._finish_file()
+            except Exception as exc:  # noqa: BLE001
+                self.error_occurred.emit(f"Couldn't finish the recording: {exc}")
+            self.finished.emit()
+
+    def _run_inner(self) -> None:
+        self._meta.setdefault("git_commit", _git_commit())
+        start_at = time.time() + self._delay_s
+        st = {"emit": 0.0, "data": time.time(), "warned": False}
+
+        def tick(now: float) -> None:
+            if self._writer is None and now >= start_at:
+                self._open(now)
+            w = self._writer
+            if w is not None:
+                while True:
+                    try:
+                        self._marks.get_nowait()
+                    except queue.Empty:
+                        break
+                    w.mark()
+                if now >= self._end_at:
+                    self.request_stop("timer")
+            if now - st["emit"] >= 0.25:
+                st["emit"] = now
+                if w is None:
+                    self.progress.emit("WAIT", max(0.0, start_at - now), 0)
+                else:
+                    self.progress.emit("REC", max(0.0, self._end_at - now), w.samples)
+
+        def idle() -> None:
+            now = time.time()
+            tick(now)
+            if now - st["data"] >= NO_DATA_WARN_S:
+                st["warned"] = True
+                self.no_data.emit(now - st["data"])
+
+        for line in csi_collector.iter_serial_lines(self._source, stop=self._stop,
+                                                    on_idle=idle):
+            now = time.time()
+            tick(now)
+            if self._stop.is_set():
+                break
+            if line.startswith("CSI_DATA,"):
+                st["data"] = now
+                if st["warned"]:
+                    st["warned"] = False
+                    self.no_data.emit(0.0)
+            if self._writer is not None:
+                self._writer.write(line)
+
+    def _open(self, now: float) -> None:
+        meta = dict(self._meta)
+        meta["started"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
+        meta["started_unix"] = round(now, 3)
+        path = self._folder / recording.recording_name(meta.get("condition", ""), now)
+        self._writer = recording.RecordingWriter(path, meta)
+        self._end_at = now + self._length_s
+
+    def _finish_file(self) -> None:
+        w, self._writer = self._writer, None
+        if w is None:
+            return                         # stopped before recording began
+        if w.samples == 0:
+            w.abandon()
+            if self._stopped_by != "error":
+                self.error_occurred.emit(
+                    f"No CSI arrived from {self._source} while recording, so "
+                    f"nothing was saved. Check that the transmitter is powered "
+                    f"and was flashed for the same channel as the receiver.")
+            return
+        summary = w.close(self._stopped_by)
+        self.saved.emit(str(w.path), summary)
+
+
+def _git_commit() -> str:
+    """The checked-out commit, so a recording says which code made it."""
+    try:
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             cwd=Path(__file__).resolve().parent,
+                             capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def _board_info(mac: str) -> dict:
+    """What the setup app knows about a board (label, chip, firmware,
+    channel). Read-only, and never anything secret."""
+    if not mac:
+        return {}
+    try:
+        raw = json.loads((_STATE_DIR / "devices.json").read_text())
+        rec = raw.get("devices", {}).get(mac, {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(rec, dict):
+        return {}
+    out = {k: rec[k] for k in ("label", "role", "chip", "firmware") if k in rec}
+    config = rec.get("config")
+    if isinstance(config, dict):
+        out["config"] = {k: v for k, v in config.items()
+                         if not re.search(r"pass|psk|token|secret", k, re.I)}
+    return out
+
+
 # --------------------------------------------------------------------------
 # Custom widgets
 # --------------------------------------------------------------------------
@@ -403,6 +570,7 @@ class _StatusBadge(QLabel):
         "MOTION":   ("MOTION DETECTED",  "#d94545"),
         "ERROR":    ("ERROR",            "#b54a4a"),
         "CALIB":    ("CALIBRATING",      "#1c7eb6"),
+        "REC":      ("RECORDING",        "#7a3fb0"),
     }
 
     def __init__(self) -> None:
@@ -474,6 +642,38 @@ class CSIDetectorWindow(QMainWindow):
         self._disarm_btn.setEnabled(False)
         self.test_result.connect(self._on_test_result)
 
+        # Record: raw CSI to a file for working on detection offline.
+        self._rec_condition = QComboBox()
+        for key, label in recording.CONDITIONS:
+            self._rec_condition.addItem(label, key)
+        self._rec_note = QLineEdit()
+        self._rec_note.setPlaceholderText("optional: e.g. door open, two people, TX on the shelf")
+        self._rec_delay = QSpinBox()
+        self._rec_delay.setRange(0, 300)
+        self._rec_delay.setValue(15)
+        self._rec_delay.setSuffix(" s")
+        self._rec_delay.setToolTip("Time to get into position first (leave the "
+                                   "room for an empty-room recording).")
+        self._rec_length = QSpinBox()
+        self._rec_length.setRange(1, 60)
+        self._rec_length.setValue(2)
+        self._rec_length.setSuffix(" min")
+        self._record_btn = QPushButton("Record")
+        self._mark_btn = QPushButton("Mark")
+        self._mark_btn.setToolTip("Press when something happens (someone walks "
+                                  "in, sits down, leaves); saved with the time.")
+        self._mark_btn.setEnabled(False)
+        self._open_rec_btn = QPushButton("Open folder")
+        self._rec_status = QLabel(
+            f"Saves the receiver's raw CSI to a file in {recordings_dir()}, "
+            f"one file per recording, to send to the developers.")
+        self._rec_status.setWordWrap(True)
+        self._rec_status.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        self._record_btn.clicked.connect(self._on_record)
+        self._mark_btn.clicked.connect(self._on_mark)
+        self._open_rec_btn.clicked.connect(self._on_open_recordings)
+
         # --- layout ------------------------------------------------------
         central = QWidget()
         v = QVBoxLayout(central)
@@ -488,6 +688,27 @@ class CSIDetectorWindow(QMainWindow):
                   self._test_btn, self._edit_btn):
             h.addWidget(b)
         v.addLayout(h)
+        rec_box = QGroupBox("Record data for the developers")
+        rv = QVBoxLayout(rec_box)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Condition:"))
+        row.addWidget(self._rec_condition, 1)
+        rv.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Note:"))
+        row.addWidget(self._rec_note, 1)
+        rv.addLayout(row)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Start in:"))
+        row.addWidget(self._rec_delay)
+        row.addWidget(QLabel("Length:"))
+        row.addWidget(self._rec_length)
+        row.addStretch(1)
+        for b in (self._record_btn, self._mark_btn, self._open_rec_btn):
+            row.addWidget(b)
+        rv.addLayout(row)
+        rv.addWidget(self._rec_status)
+        v.addWidget(rec_box)
         self.setCentralWidget(central)
 
         # --- worker state ------------------------------------------------
@@ -495,6 +716,10 @@ class CSIDetectorWindow(QMainWindow):
         self._detect_worker: Optional[_DetectWorker] = None
         self._calib_thread: Optional[QThread] = None
         self._calib_worker: Optional[_CalibrateWorker] = None
+        self._rec_thread: Optional[QThread] = None
+        self._rec_worker: Optional[_RecordWorker] = None
+        self._rec_saved = False           # this recording produced a file
+        self._rec_rate_ref: Optional[tuple[float, int]] = None   # (time, samples)
         # Set on close: a calibration result still queued from the worker
         # must not be saved over state written after the window closed.
         self._closed = False
@@ -517,12 +742,13 @@ class CSIDetectorWindow(QMainWindow):
             self._badge.set_state("CALIB", "stopping…")
             self._calib_worker.request_stop()
             return
-        if self._detect_thread is not None:
+        if self._detect_thread is not None or self._rec_thread is not None:
             return
         source = self._resolve_source()
         self._badge.set_state("CALIB", "starting…")
         self._calibrate_btn.setText("Cancel calibration")
         self._arm_btn.setEnabled(False)
+        self._record_btn.setEnabled(False)
 
         thread = QThread(self)
         worker = _CalibrateWorker(source=source)
@@ -566,6 +792,7 @@ class CSIDetectorWindow(QMainWindow):
         self._calibrate_btn.setText("Calibrate")
         self._calibrate_btn.setEnabled(True)
         self._arm_btn.setEnabled(True)
+        self._record_btn.setEnabled(True)
         self._on_no_data(0.0)
         self._badge.set_state("DISARMED")
         self._refresh_stats()
@@ -581,7 +808,7 @@ class CSIDetectorWindow(QMainWindow):
                 "Run Calibrate first — there's no still-room baseline to "
                 "compare current σ against.")
             return
-        if self._detect_thread is not None:
+        if self._detect_thread is not None or self._rec_thread is not None:
             return
 
         # Construct notifier from alert.toml (or NullNotifier).
@@ -625,6 +852,7 @@ class CSIDetectorWindow(QMainWindow):
 
         self._arm_btn.setEnabled(False)
         self._calibrate_btn.setEnabled(False)
+        self._record_btn.setEnabled(False)
         self._disarm_btn.setEnabled(True)
         self._badge.set_state("INIT")
 
@@ -670,6 +898,7 @@ class CSIDetectorWindow(QMainWindow):
         self._notifier_active = None
         self._arm_btn.setEnabled(True)
         self._calibrate_btn.setEnabled(True)
+        self._record_btn.setEnabled(True)
         self._disarm_btn.setEnabled(False)
         self._badge.set_state("DISARMED")
         self._ratio_bar.setVisible(False)
@@ -693,12 +922,8 @@ class CSIDetectorWindow(QMainWindow):
         (its USB serial number). Bridge boards can't be, so their saved
         port (ideally a /dev/serial/by-id link) is used as is."""
         source, mac = self._state.source, self._state.receiver_mac
-        # Serial ports the collector opens (/dev/tty*, macOS /dev/cu.*, COMn),
-        # but not a /dev/serial/by-id link, which already names the board.
-        serial_port = ((source.startswith("/dev/")
-                        and not source.startswith("/dev/serial/by-id/"))
-                       or source.upper().startswith("COM"))
-        if mac and serial_port:
+        # Not a /dev/serial/by-id link, which already names the board.
+        if mac and _is_serial(source) and not source.startswith("/dev/serial/by-id/"):
             from csidetector.provision import devices as dv
             try:
                 boards = dv.list_boards()
@@ -710,6 +935,152 @@ class CSIDetectorWindow(QMainWindow):
                 self._state.save()
                 self._refresh_stats()
         return self._state.source
+
+    # ----------------------------------------------------------------------
+    # Record
+    # ----------------------------------------------------------------------
+
+    def _on_record(self) -> None:
+        if self._rec_worker is not None:          # the button reads "Stop"
+            self._rec_worker.request_stop("stop button")
+            self._record_btn.setEnabled(False)    # until the file is closed
+            return
+        if self._detect_thread is not None or self._calib_thread is not None:
+            return
+        source = self._resolve_source()
+        if not _is_serial(source):
+            QMessageBox.information(
+                self, "Can't record from here",
+                f"Recording reads the receiver's serial port, but this monitor "
+                f"reads {source}. Run the setup wizard to point it at the "
+                f"receiver.")
+            return
+        st = self._state
+        key = self._rec_condition.currentData()
+        meta = {
+            "format": recording.FORMAT,
+            "condition": key,
+            "condition_label": self._rec_condition.currentText(),
+            "note": self._rec_note.text().strip(),
+            "source": source,
+            "receiver_mac": st.receiver_mac,
+            "transmitter_mac": st.transmitter_mac,
+            "receiver": _board_info(st.receiver_mac),
+            "transmitter": _board_info(st.transmitter_mac),
+            "channel": st.channel,
+            "location": st.location,
+            "baseline": st.baseline,
+            "baseline_age_s": round(time.time() - st.baseline_ts) if st.baseline_ts else None,
+            "enter_ratio": st.enter_ratio,
+            "exit_ratio": st.exit_ratio,
+            "detector_window": DETECT_WINDOW,
+            "start_delay_s": self._rec_delay.value(),
+            "planned_length_s": self._rec_length.value() * 60,
+            "app_version": csidetector.__version__,
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+        }
+        worker = _RecordWorker(source, recordings_dir(), meta,
+                               delay_s=float(self._rec_delay.value()),
+                               length_s=float(self._rec_length.value() * 60))
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_rec_progress)
+        worker.no_data.connect(self._on_no_data)
+        worker.saved.connect(self._on_rec_saved)
+        worker.error_occurred.connect(self._on_rec_error)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_rec_finished)
+        thread.start()
+        self._rec_thread = thread
+        self._rec_worker = worker
+        self._rec_saved = False
+        self._rec_rate_ref = None
+
+        self._record_btn.setText("Stop recording")
+        self._arm_btn.setEnabled(False)
+        self._calibrate_btn.setEnabled(False)
+        for w in (self._rec_condition, self._rec_note, self._rec_delay, self._rec_length):
+            w.setEnabled(False)
+        self._badge.set_state("REC", "starting…")
+        self._rec_status.setText(f"Recording: {self._rec_condition.currentText()}.")
+
+    def _on_rec_progress(self, phase: str, seconds_left: float, samples: int) -> None:
+        left = f"{int(seconds_left) // 60}:{int(seconds_left) % 60:02d}"
+        if phase == "WAIT":
+            self._badge.set_state("REC", f"starts in {left}")
+            return
+        self._mark_btn.setEnabled(True)
+        self._badge.set_state("REC", f"{left} left · {samples:,} samples")
+        # The packet rate while recording, so a thin stream shows up now
+        # rather than in the file.
+        now = time.monotonic()
+        prev = self._rec_rate_ref
+        if prev is not None and now - prev[0] >= 1.0:
+            self._pkt_rate = max(0.0, (samples - prev[1]) / (now - prev[0]))
+            self._rec_rate_ref = (now, samples)
+            self._refresh_stats()
+        elif prev is None:
+            self._rec_rate_ref = (now, samples)
+
+    def _on_mark(self) -> None:
+        if self._rec_worker is not None:
+            self._rec_worker.add_mark()
+
+    def _on_rec_saved(self, path: str, summary: dict) -> None:
+        self._rec_saved = True
+        if self._closed:
+            return
+        p = Path(path)
+        try:
+            n = p.stat().st_size
+            size = f"{n / 1e6:.1f} MB" if n >= 1e6 else f"{max(1, round(n / 1e3))} KB"
+        except OSError:
+            size = "?"
+        secs = int(summary.get("duration_s", 0))
+        text = (f"✓ Saved {p.name} ({size}, {secs // 60}:{secs % 60:02d}, "
+                f"{summary.get('samples', 0):,} samples at "
+                f"{summary.get('rate_hz', 0):.0f} Hz) in {p.parent}. "
+                f"Send this file to the developers.")
+        if summary.get("gaps_over_1s"):
+            text += (f" ⚠ The stream paused {summary['gaps_over_1s']} time(s) "
+                     f"for over a second.")
+        self._rec_status.setText(text)
+
+    def _on_rec_error(self, msg: str) -> None:
+        if not self._closed:
+            QMessageBox.warning(self, "Recording problem", msg)
+
+    def _on_rec_finished(self) -> None:
+        self._rec_thread = None
+        self._rec_worker = None
+        if self._closed:
+            return
+        if not self._rec_saved and self._rec_status.text().startswith("Recording:"):
+            self._rec_status.setText("Stopped before recording began: nothing saved.")
+        self._record_btn.setText("Record")
+        self._record_btn.setEnabled(True)
+        self._mark_btn.setEnabled(False)
+        self._arm_btn.setEnabled(True)
+        self._calibrate_btn.setEnabled(True)
+        for w in (self._rec_condition, self._rec_note, self._rec_delay, self._rec_length):
+            w.setEnabled(True)
+        self._on_no_data(0.0)
+        self._pkt_rate = 0.0
+        self._refresh_stats()
+        self._badge.set_state("DISARMED")
+
+    def _on_open_recordings(self) -> None:
+        folder = recordings_dir()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "Can't open the folder", str(exc))
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     # ----------------------------------------------------------------------
     # Test alert + edit config
@@ -817,11 +1188,13 @@ class CSIDetectorWindow(QMainWindow):
         self._stats.setText("\n".join(lines))
 
     def stop_workers(self, wait_ms: int = 3000) -> None:
-        """Stop detect / calibration and wait for their threads (they check
-        the stop flag at least every ~1 s, even with no CSI arriving)."""
+        """Stop detect / calibration / recording and wait for their threads
+        (they check the stop flag at least every ~1 s, even with no CSI
+        arriving). A recording in progress is closed and kept."""
         self._closed = True
         for worker, thread in ((self._detect_worker, self._detect_thread),
-                               (self._calib_worker, self._calib_thread)):
+                               (self._calib_worker, self._calib_thread),
+                               (self._rec_worker, self._rec_thread)):
             try:
                 if worker is not None:
                     worker.request_stop()

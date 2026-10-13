@@ -65,7 +65,7 @@ from typing import Any, Callable, Optional
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QEvent, QPoint, QPointF, Qt, QtMsgType, qInstallMessageHandler  # noqa: E402
-from PyQt6.QtGui import QMouseEvent  # noqa: E402
+from PyQt6.QtGui import QDesktopServices, QMouseEvent  # noqa: E402
 from PyQt6.QtTest import QTest  # noqa: E402
 from PyQt6.QtWidgets import (  # noqa: E402
     QAbstractButton, QAbstractItemView, QAbstractScrollArea, QAbstractSpinBox,
@@ -397,6 +397,8 @@ class Session:
         self.bench = self._tmp / "bench"
         self.home = self._tmp / "home"
         self.host_dir = self._tmp / "host"
+        self.recordings = self._tmp / "recordings"     # the monitor's Record
+        self.opened: list[str] = []                     # folders "opened" in a file manager
         self.boards: dict[str, FakeBoard] = {}
         self.hotspots: list[fw.HotspotInfo] = []
         self.telegram_ok = True
@@ -504,6 +506,9 @@ class Session:
         state_dir = self.home / ".csidetector"
         self._patch(alert_gui, "_STATE_DIR", state_dir)
         self._patch(alert_gui, "_STATE_PATH", state_dir / "state.json")
+        self._patch(alert_gui, "recordings_dir", lambda: self.recordings)
+        self._patch(QDesktopServices, "openUrl",
+                    lambda url: self.opened.append(url.toLocalFile()) or True)
         self._patch(wz, "default_host_dir", lambda: self.host_dir)
         if self._fast_timers:
             self._patch(gui.TIMING, "auto_refresh_ms", 250)

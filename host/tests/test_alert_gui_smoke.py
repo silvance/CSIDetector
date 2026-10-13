@@ -145,10 +145,62 @@ def test_explicit_sources_are_not_replaced_by_the_receiver_lookup(qt_app, tmp_pa
         win.close()
 
 
+def _fake_serial_lines(lines_per_s: float, line: str = ""):
+    """Stands in for collector.iter_serial_lines: ``line`` at a rate (or
+    nothing, with on_idle ticks) until stopped."""
+    import time
+
+    def fake(port, baud=921600, stop=None, on_idle=None):
+        while not stop.is_set():
+            if line:
+                time.sleep(1.0 / lines_per_s)
+                yield line
+            else:
+                time.sleep(0.05)
+                on_idle()
+    return fake
+
+
+def _record(gui, tmp_path, delay_s, length_s):
+    worker = gui._RecordWorker("/dev/ttyACM1", tmp_path / "recs",
+                               {"condition": "empty", "note": ""},
+                               delay_s=delay_s, length_s=length_s)
+    out = {"saved": [], "errors": [], "phases": set()}
+    worker.saved.connect(lambda path, summary: out["saved"].append((path, summary)))
+    worker.error_occurred.connect(out["errors"].append)
+    worker.progress.connect(lambda phase, left, n: out["phases"].add(phase))
+    worker.run()                 # in this thread: the signals are delivered directly
+    return out
+
+
+def test_record_worker_waits_then_records_for_its_length(qt_app, tmp_path, monkeypatch,
+                                                         csi_data_line):
+    import csidetector.modes.alert.gui as gui
+    from csidetector.core import recording
+    monkeypatch.setattr(gui.csi_collector, "iter_serial_lines",
+                        _fake_serial_lines(200, csi_data_line() + "\n"))
+    out = _record(gui, tmp_path, delay_s=0.2, length_s=0.4)
+    assert out["errors"] == [] and out["phases"] == {"WAIT", "REC"}
+    (path, summary), = out["saved"]
+    assert summary["stopped_by"] == "timer" and 0.35 <= summary["duration_s"] <= 1.0
+    rec = recording.read_recording(path)
+    assert rec.meta["condition"] == "empty" and "started" in rec.meta
+    assert rec.end["samples"] == summary["samples"] > 20
+
+
+def test_record_worker_saves_nothing_without_csi(qt_app, tmp_path, monkeypatch):
+    import csidetector.modes.alert.gui as gui
+    monkeypatch.setattr(gui, "NO_DATA_WARN_S", 0.1)
+    monkeypatch.setattr(gui.csi_collector, "iter_serial_lines", _fake_serial_lines(0))
+    out = _record(gui, tmp_path, delay_s=0.0, length_s=0.3)
+    assert out["saved"] == [] and any("nothing was saved" in e for e in out["errors"])
+    assert not list((tmp_path / "recs").glob("*"))
+
+
 def test_status_badge_state_transitions(qt_app):
     from csidetector.modes.alert.gui import _StatusBadge
     b = _StatusBadge()
-    for state in ("DISARMED", "INIT", "STILL", "MOTION", "ERROR", "CALIB"):
+    for state in ("DISARMED", "INIT", "STILL", "MOTION", "ERROR", "CALIB", "REC"):
         b.set_state(state)
         assert b.text(), f"empty text for state {state}"
 

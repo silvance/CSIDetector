@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import csv
 import dataclasses
+import gzip
 import io
 import json
 import struct
@@ -100,10 +101,10 @@ def nonzero_subcarriers(samples: Iterable[CSISample], probe: int = 64) -> np.nda
     return np.flatnonzero(mask)
 
 
-def iter_serial(port: str, baud: int = 921600,
-                stop: Optional[threading.Event] = None,
-                on_idle: Optional[Callable[[], None]] = None) -> Iterator[CSISample]:
-    """CSI samples from a serial port, forever.
+def iter_serial_lines(port: str, baud: int = 921600,
+                      stop: Optional[threading.Event] = None,
+                      on_idle: Optional[Callable[[], None]] = None) -> Iterator[str]:
+    """Every line the board prints on a serial port, decoded, forever.
 
     ``stop`` ends the iterator within ~1 s (one read timeout) even when
     no data is arriving — otherwise a consumer that only checks a flag
@@ -119,21 +120,40 @@ def iter_serial(port: str, baud: int = 921600,
                 if on_idle is not None:
                     on_idle()
                 continue
-            # errors="replace" never raises; the previous UnicodeDecodeError
-            # arm was dead. Garbled bytes become U+FFFD and parse_line
-            # rejects them on the CSV/JSON parse below.
-            line = raw.decode("ascii", errors="replace")
-            sample = parse_line(line)
-            if sample is not None:
-                yield sample
+            # errors="replace" never raises: garbled bytes become U+FFFD,
+            # which parse_line rejects on the CSV/JSON parse.
+            yield raw.decode("ascii", errors="replace")
+
+
+def iter_serial(port: str, baud: int = 921600,
+                stop: Optional[threading.Event] = None,
+                on_idle: Optional[Callable[[], None]] = None) -> Iterator[CSISample]:
+    """CSI samples from a serial port, forever (see iter_serial_lines)."""
+    for line in iter_serial_lines(port, baud, stop=stop, on_idle=on_idle):
+        sample = parse_line(line)
+        if sample is not None:
+            yield sample
+
+
+def open_text(path: str):
+    """A capture file for reading: plain text, or gzip-compressed (.gz),
+    as the alert monitor's Record button writes."""
+    if str(path).lower().endswith(".gz"):
+        return gzip.open(path, "rt", encoding="ascii", errors="replace")
+    return open(path, "r")
 
 
 def iter_file(path: str) -> Iterator[CSISample]:
-    with open(path, "r") as f:
-        for line in f:
-            sample = parse_line(line)
-            if sample is not None:
-                yield sample
+    with open_text(path) as f:
+        try:
+            for line in f:
+                sample = parse_line(line)
+                if sample is not None:
+                    yield sample
+        except EOFError:
+            # A .gz cut off mid-write (the app was killed while recording):
+            # everything before the cut is still good.
+            return
 
 
 def iter_stdin() -> Iterator[CSISample]:
