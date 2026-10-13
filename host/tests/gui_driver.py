@@ -479,6 +479,9 @@ class Session:
         self._patch(alert_gui, "CALIBRATE_RECORD_S", self._calibrate_s[1])
         # The monitor finds its receiver again via list_boards().
         self._patch(dv, "list_boards", lambda comports=None: self._list_boards())
+        # Never the host's real /dev/serial/by-id (a plugged-in board would
+        # change what the wizard saves).
+        self._patch(dv, "stable_port", lambda port, mac="", by_id_dir=None: port)
         self._patch(pyserial, "Serial", self._fake_serial_class())
         for kind in ("warning", "information", "critical", "question"):
             self._patch(QMessageBox, kind, self._message_box(kind))

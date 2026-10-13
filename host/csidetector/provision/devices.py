@@ -78,17 +78,25 @@ class AttachedBoard:
 BY_ID_DIR = "/dev/serial/by-id"
 
 
-def stable_port(port: str, by_id_dir: str = BY_ID_DIR) -> str:
+def stable_port(port: str, mac: str = "", by_id_dir: str = BY_ID_DIR) -> str:
     """A path for ``port`` that survives re-enumeration: its udev
-    /dev/serial/by-id link (named after the USB device), else ``port``.
+    /dev/serial/by-id link, else ``port``.
 
     /dev/ttyACM1 becomes /dev/ttyACM0 when boards are replugged in another
-    order; the by-id link keeps pointing at the same board.
+    order; the by-id link keeps pointing at the same board — but only if
+    its name is unique to the board. Native-USB ESP32s put their MAC in it;
+    two CP2102 (serial "0001") or CH340 (no serial) boards share one name,
+    and udev points it at whichever enumerated last. So the link is used
+    only when it contains ``mac``.
     """
+    if not mac:
+        return port
+    want = normalize_mac(mac).replace(":", "").lower()
     try:
         target = os.path.realpath(port)
         for entry in sorted(os.scandir(by_id_dir), key=lambda e: e.name):
-            if os.path.realpath(entry.path) == target:
+            name = re.sub(r"[^0-9a-f]", "", entry.name.lower())
+            if want in name and os.path.realpath(entry.path) == target:
                 return entry.path
     except OSError:
         pass

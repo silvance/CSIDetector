@@ -92,6 +92,7 @@ class _PersistedState:
     # changes.
     receiver_mac: str = ""
     transmitter_mac: str = ""
+    channel: int = 0             # Wi-Fi channel the baseline was taken on
 
     @classmethod
     def load(cls) -> "_PersistedState":
@@ -691,7 +692,12 @@ class CSIDetectorWindow(QMainWindow):
         (its USB serial number). Bridge boards can't be, so their saved
         port (ideally a /dev/serial/by-id link) is used as is."""
         source, mac = self._state.source, self._state.receiver_mac
-        if mac and not source.startswith("/dev/serial/by-id/"):
+        # Serial ports the collector opens (/dev/tty*, macOS /dev/cu.*, COMn),
+        # but not a /dev/serial/by-id link, which already names the board.
+        serial_port = ((source.startswith("/dev/")
+                        and not source.startswith("/dev/serial/by-id/"))
+                       or source.upper().startswith("COM"))
+        if mac and serial_port:
             from csidetector.provision import devices as dv
             try:
                 boards = dv.list_boards()
@@ -809,16 +815,26 @@ class CSIDetectorWindow(QMainWindow):
             lines.append(f"Config:     {self._state.alert_config_path}")
         self._stats.setText("\n".join(lines))
 
-    def closeEvent(self, ev) -> None:  # noqa: N802
+    def stop_workers(self, wait_ms: int = 3000) -> None:
+        """Stop detect / calibration and wait for their threads (they check
+        the stop flag at least every ~1 s, even with no CSI arriving)."""
         self._closed = True
-        if self._detect_worker is not None:
-            self._detect_worker.request_stop()
-            if self._detect_thread is not None:
-                self._detect_thread.wait(2000)
-        if self._calib_worker is not None:
-            self._calib_worker.request_stop()
-            if self._calib_thread is not None:
-                self._calib_thread.wait(2000)
+        for worker, thread in ((self._detect_worker, self._detect_thread),
+                               (self._calib_worker, self._calib_thread)):
+            try:
+                if worker is not None:
+                    worker.request_stop()
+                if thread is not None:
+                    # quit() here, not only via worker.finished → thread.quit:
+                    # that connection is queued to this (GUI) thread, which
+                    # is blocked in wait() — the thread would never stop.
+                    thread.quit()
+                    thread.wait(wait_ms)
+            except RuntimeError:
+                pass                      # already finished and deleted
+
+    def closeEvent(self, ev) -> None:  # noqa: N802
+        self.stop_workers()
         super().closeEvent(ev)
 
 
@@ -839,6 +855,7 @@ def run_gui(source: Optional[str] = None,
     # CLI overrides land in the persisted state so they survive a relaunch.
     if source:
         win._state.source = source
+        win._state.receiver_mac = ""      # an explicit source isn't looked up
     if baseline is not None and baseline > 0:
         win._state.baseline = baseline
         win._state.baseline_ts = time.time()
