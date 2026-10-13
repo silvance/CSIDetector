@@ -29,7 +29,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 FIRMWARE = REPO / "firmware"
 PROJECTS = ("csi_transmitter", "csi_receiver")
-TARGETS = ("esp32s3", "esp32c3", "esp32c5", "esp32c6")
+TARGETS = ("esp32s3", "esp32c3", "esp32c5", "esp32c6", "esp32")
 SOURCES = ("partitions.csv", "components", *PROJECTS)
 SETTINGS_LABEL = "csi_cfg"
 FORMAT = "csidetector-firmware/1"
@@ -92,6 +92,7 @@ def build_one(project: str, target: str, work: Path, out: Path) -> dict:
                       "sha256": _sha256(dest / src.name)})
     table = (build / args["partition-table"]["file"]).read_bytes()
     s_offset, s_size = partition(table, SETTINGS_LABEL)
+    nvs_offset, nvs_size = partition(table, "nvs")
     settings = args["flash_settings"]
     return {
         "project": project, "target": target,
@@ -100,6 +101,9 @@ def build_one(project: str, target: str, work: Path, out: Path) -> dict:
         "flash_size": settings["flash_size"],
         "files": files,
         "settings": {"offset": hex(s_offset), "size": s_size},
+        # Blanked on every flash: NVS left by another partition layout
+        # can stop nvs_flash_init() at boot.
+        "nvs": {"offset": hex(nvs_offset), "size": nvs_size},
     }
 
 

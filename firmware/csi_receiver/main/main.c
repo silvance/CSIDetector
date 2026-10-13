@@ -181,9 +181,15 @@ static void udp_send_sample(uint32_t seq, int64_t ts, const wifi_csi_info_t *inf
     h->rssi = info->rx_ctrl.rssi;
     h->noise_floor = info->rx_ctrl.noise_floor;
     h->channel = info->rx_ctrl.channel;
+#if CSI_WIFI6_CHIP
+    h->sig_mode = 0;            // not reported by the Wi-Fi 6 chips
+    h->mcs = 0;
+    h->bandwidth = 0;
+#else
     h->sig_mode = info->rx_ctrl.sig_mode;
     h->mcs = info->rx_ctrl.mcs;
     h->bandwidth = info->rx_ctrl.cwb;
+#endif
     h->len = (uint16_t)info->len;
     memcpy(pkt + sizeof(csi_udp_header_t), info->buf, info->len);
 
