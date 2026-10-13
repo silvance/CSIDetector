@@ -301,8 +301,14 @@ class FlashPage(QWizardPage):
         self.board_combo.setPlaceholderText(
             "No ESP32 found. Plug one in with a data USB cable (not charge-only).")
         self.board_combo.currentIndexChanged.connect(lambda *_: self._sync_buttons())
+        # The port the user picked: kept while that board is briefly off the
+        # bus (a reset), instead of sticking to whatever a re-scan fell back to.
+        self._wanted_port: Optional[str] = None
+        self.board_combo.activated.connect(
+            lambda i: setattr(self, "_wanted_port", self.board_combo.itemData(i)))
         refresh = QPushButton("Refresh")
-        refresh.clicked.connect(self.refresh_boards)
+        # Lambda: clicked(bool) would pass `checked` in as relist=False.
+        refresh.clicked.connect(lambda: self.refresh_boards())
         self.identify_btn = QPushButton("Identify")
         self.identify_btn.setToolTip("Read the selected board's chip and MAC "
                                      "(boards on a USB-serial adapter don't report them).")
@@ -479,18 +485,26 @@ class FlashPage(QWizardPage):
         if not self.wiz.flasher.busy and not settling:
             self.refresh_boards()
 
-    def refresh_boards(self) -> None:
-        try:
-            boards = self.wiz.list_boards()
-        except Exception as exc:  # noqa: BLE001
-            boards = []
-            self.log.appendPlainText(f"could not list serial ports: {exc}")
-        # A bridge port that's gone (or now shows a MAC) no longer maps.
-        bridge = {b.port for b in boards if not b.mac}
-        for mac, port in list(self.wiz.bridge_ports.items()):
-            if port not in bridge:
-                del self.wiz.bridge_ports[mac]
+    def refresh_boards(self, relist: bool = True) -> None:
+        """Re-scan the ports and rebuild the board list. ``relist=False``
+        re-describes the last scan — right after an identify, when a native
+        board is off the bus for its reset."""
+        if relist:
+            try:
+                boards = self.wiz.list_boards()
+            except Exception as exc:  # noqa: BLE001
+                boards = []
+                self.log.appendPlainText(f"could not list serial ports: {exc}")
+            # A bridge port that's gone (or now shows a MAC) no longer maps.
+            bridge = {b.port for b in boards if not b.mac}
+            for mac, port in list(self.wiz.bridge_ports.items()):
+                if port not in bridge:
+                    del self.wiz.bridge_ports[mac]
+        else:
+            boards = self._boards
         current = self.board_combo.currentData()
+        if self._wanted_port and any(b.port == self._wanted_port for b in boards):
+            current = self._wanted_port
         key = [(b.port, self._board_mac(b), self._board_chip(b), b.vid) for b in boards]
         if key == self._board_key:
             self._sync_buttons()
@@ -633,7 +647,8 @@ class FlashPage(QWizardPage):
             return
         if res.ok:
             self._board_key = []          # re-describe the boards
-            self.refresh_boards()
+            self.refresh_boards(relist=False)
+            QTimer.singleShot(TIMING.post_process_refresh_ms, self.refresh_boards)
             self.status.setText(f"Identified {res.chip or 'board'} {res.mac}")
             self.progress.setValue(100)
             self.completeChanged.emit()
@@ -743,6 +758,14 @@ class FlashPage(QWizardPage):
             self._not_flashed("Cancelled")
         else:
             self._not_flashed("Flash failed")
+            if board is not None and fw.WRONG_CHIP_RE.search(res.output):
+                # Another board on this adapter port than we mapped: forget
+                # the mapping so the next Flash identifies it.
+                for m, port in list(self.wiz.bridge_ports.items()):
+                    if port == board.port:
+                        del self.wiz.bridge_ports[m]
+                self._board_key = []
+                self.refresh_boards(relist=False)
             hints = fw.failure_hints(res.output)
             for hint in hints:
                 self.log.appendPlainText(f"[hint] {hint}")
@@ -1186,9 +1209,10 @@ class SetupWizard(QWizard):
                 # monitor won't arm until it's recalibrated.
                 state.baseline = 0.0
                 state.baseline_ts = 0.0
-            state.source = dv.stable_port(port)
+            state.source = dv.stable_port(port, mac=rx_mac)
             state.receiver_mac = rx_mac
             state.transmitter_mac = tx_mac
+            state.channel = st.channel
             state.alert_config_path = config_path
             state.location = tg.location.text().strip()
             state.save()
@@ -1212,7 +1236,8 @@ class SetupWizard(QWizard):
             from csidetector.modes.alert.gui import _PersistedState
             state = _PersistedState.load()
         return (state.baseline > 0 and state.receiver_mac == next(iter(st.rxs))
-                and state.transmitter_mac == next(iter(st.txs)))
+                and state.transmitter_mac == next(iter(st.txs))
+                and state.channel == st.channel)
 
     def reject(self) -> None:
         if self.flasher.busy:

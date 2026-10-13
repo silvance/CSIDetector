@@ -126,6 +126,28 @@ def test_closed_window_ignores_late_calibration_result(qt_app, tmp_path, monkeyp
     assert gui._PersistedState.load().baseline == 0.0
 
 
+def test_explicit_sources_are_not_replaced_by_the_receiver_lookup(qt_app, tmp_path,
+                                                                    monkeypatch):
+    """Only serial ports are looked up by the saved receiver MAC; a replay
+    file or udp: source stays as given."""
+    import csidetector.modes.alert.gui as gui
+    from csidetector.provision import devices as dv
+    monkeypatch.setattr(gui, "_STATE_DIR", tmp_path)
+    monkeypatch.setattr(gui, "_STATE_PATH", tmp_path / "state.json")
+    monkeypatch.setattr(dv, "list_boards", lambda comports=None: [
+        dv.AttachedBoard("/dev/ttyACM0", 0x303A, 0x1001, "", "", mac="aa:bb:cc:dd:ee:01")])
+    win = gui.CSIDetectorWindow(alert_config_path="")
+    try:
+        win._state.receiver_mac = "aa:bb:cc:dd:ee:01"
+        for source in ("capture.log", "udp:5566"):
+            win._state.source = source
+            assert win._resolve_source() == source
+        win._state.source = "/dev/ttyACM3"
+        assert win._resolve_source() == "/dev/ttyACM0"     # moved: found by MAC
+    finally:
+        win.close()
+
+
 def test_status_badge_state_transitions(qt_app):
     from csidetector.modes.alert.gui import _StatusBadge
     b = _StatusBadge()

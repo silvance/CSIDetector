@@ -143,14 +143,21 @@ def test_registry_ignores_unknown_keys_and_bad_macs_on_load(tmp_path):
     assert [r.mac for r in reg.all()] == ["a0:f2:62:f0:39:d8"]
 
 
-def test_stable_port_prefers_the_by_id_link(tmp_path):
-    dev = tmp_path / "ttyACM1"
-    dev.write_text("")
+def test_stable_port_uses_by_id_only_when_it_names_the_board(tmp_path):
+    """Native ESP32s put their MAC in the by-id name; two CP2102 boards
+    share one name (udev points it at whichever enumerated last)."""
     by_id = tmp_path / "by-id"
     by_id.mkdir()
+    native = tmp_path / "ttyACM1"
+    native.write_text("")
     link = by_id / "usb-Espressif_USB_JTAG_serial_debug_unit_30:30:F9:00:00:01-if00"
-    link.symlink_to(dev)
-    assert dv.stable_port(str(dev), by_id_dir=str(by_id)) == str(link)
-    assert dv.stable_port(str(tmp_path / "ttyUSB7"), by_id_dir=str(by_id)) == \
-        str(tmp_path / "ttyUSB7")
-    assert dv.stable_port(str(dev), by_id_dir=str(tmp_path / "missing")) == str(dev)
+    link.symlink_to(native)
+    bridge = tmp_path / "ttyUSB0"
+    bridge.write_text("")
+    (by_id / "usb-Silicon_Labs_CP2102_USB_to_UART_Bridge_Controller_0001-if00-port0") \
+        .symlink_to(bridge)
+    mac = "30:30:f9:00:00:01"
+    assert dv.stable_port(str(native), mac, by_id_dir=str(by_id)) == str(link)
+    assert dv.stable_port(str(bridge), "aa:bb:cc:dd:ee:ff", by_id_dir=str(by_id)) == str(bridge)
+    assert dv.stable_port(str(native), "", by_id_dir=str(by_id)) == str(native)
+    assert dv.stable_port(str(native), mac, by_id_dir=str(tmp_path / "missing")) == str(native)

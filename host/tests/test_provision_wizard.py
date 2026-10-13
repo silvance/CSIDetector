@@ -42,6 +42,7 @@ def qt_app():
 @pytest.fixture
 def env(qt_app, tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(dv, "stable_port", lambda port, mac="", by_id_dir=None: port)
     monkeypatch.setattr(alert_gui, "_STATE_DIR", tmp_path / "state")
     monkeypatch.setattr(alert_gui, "_STATE_PATH", tmp_path / "state" / "state.json")
     boards = [
@@ -553,3 +554,15 @@ def test_failed_alert_toml_write_leaves_the_monitor_running(env, tmp_path):
     wiz.button(QWizard.WizardButton.FinishButton).click()
     assert wiz.currentId() == wz.PAGE_FINISH            # stayed: "Couldn't save"
     assert retired == []
+
+
+def test_calibration_is_kept_only_on_the_same_channel(env):
+    wiz = env.wiz
+    wiz.state.txs = {MAC_A: "TX"}
+    wiz.state.rxs = {MAC_B: ("RX", "/dev/ttyACM1")}
+    wiz.state.channel = 6
+    state = alert_gui._PersistedState(baseline=0.7, receiver_mac=MAC_B,
+                                      transmitter_mac=MAC_A, channel=11)
+    assert not wiz.keeps_baseline(state)
+    state.channel = 6
+    assert wiz.keeps_baseline(state)
