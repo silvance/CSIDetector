@@ -42,7 +42,11 @@ def hampel_filter(x: np.ndarray, k: float = 3.0, window: int = 7) -> np.ndarray:
     """Replace points more than k MADs from a rolling median with the median.
 
     Operates per-column when given a 2D array. Window must be odd; we pad
-    with edge values so output shape matches input shape.
+    by reflection so output shape matches input shape. (Edge padding
+    repeats the end value, so an outlier in the first or last row filled
+    most of its own median window and passed through: the detector's
+    window has a fresh packet as its last row, and one glitch packet
+    raised a false MOTION as it entered the window and again as it left.)
     """
     if window % 2 == 0:
         raise ValueError("hampel window must be odd")
@@ -53,7 +57,7 @@ def hampel_filter(x: np.ndarray, k: float = 3.0, window: int = 7) -> np.ndarray:
         squeeze = False
 
     half = window // 2
-    padded = np.pad(x, ((half, half), (0, 0)), mode="edge")
+    padded = np.pad(x, ((half, half), (0, 0)), mode="reflect")
     out = x.copy()
     # Vectorize over the window dimension.
     windows = np.lib.stride_tricks.sliding_window_view(padded, window, axis=0)
