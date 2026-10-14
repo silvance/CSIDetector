@@ -191,6 +191,55 @@ def test_record_worker_waits_then_records_for_its_length(qt_app, tmp_path, monke
     assert rec.end["samples"] == summary["samples"] > 20
 
 
+def test_record_worker_ignores_wall_clock_jumps(qt_app, tmp_path, monkeypatch,
+                                               csi_data_line):
+    """The PC's clock syncing mid-recording (seen on a fresh CI machine)
+    mustn't cut the recording short: lengths run on the monotonic clock."""
+    import time as real
+    import types
+    import csidetector.modes.alert.gui as gui
+    jumps = iter(range(10**6))
+    monkeypatch.setattr(gui, "time", types.SimpleNamespace(
+        time=lambda: real.time() + 3600 * next(jumps),     # an hour per read
+        monotonic=real.monotonic, strftime=real.strftime, localtime=real.localtime))
+    monkeypatch.setattr(gui.csi_collector, "iter_serial_lines",
+                        _fake_serial_lines(200, csi_data_line() + "\n"))
+    out = _record(gui, tmp_path, delay_s=0.2, length_s=0.4)
+    (path, summary), = out["saved"]
+    assert summary["stopped_by"] == "timer" and 0.35 <= summary["duration_s"] <= 1.0
+
+
+def test_first_motion_alerts_soon_after_boot(qt_app, monkeypatch):
+    """The cooldown runs on the monotonic clock, which starts near boot: a
+    monitor armed at startup must still send its first alert."""
+    import time as real
+    import types
+    import numpy as np
+    import csidetector.modes.alert.gui as gui
+    from csidetector.core.collector import CSISample
+    t0 = real.monotonic()
+    monkeypatch.setattr(gui, "time", types.SimpleNamespace(
+        time=real.time, monotonic=lambda: real.monotonic() - t0 + 5.0))   # 5 s up
+    rng = np.random.default_rng(0)
+
+    def moving(source, stop=None, on_idle=None):
+        for i in range(300):                   # someone walking about
+            csi = (20 + rng.normal(0, 8, 64)).astype(np.complex64)
+            yield CSISample(i, i * 10000, "aa:bb:cc:dd:ee:ff", -50, -92, 11, 0, 1, 0, 0, csi)
+    monkeypatch.setattr(gui.csi_collector, "open_source", moving)
+    sent, alerts = [], []
+
+    class Notifier:
+        def send(self, event):
+            sent.append(event)
+
+    worker = gui._DetectWorker("/dev/ttyACM0", baseline=0.01, enter_ratio=1.5,
+                               exit_ratio=1.2, notifier=Notifier(), location="")
+    worker.alert_sent.connect(alerts.append)
+    worker.run()
+    assert len(sent) == 1 and len(alerts) == 1
+
+
 def test_record_worker_stopped_during_the_countdown_saves_nothing_quietly(
         qt_app, tmp_path, monkeypatch, csi_data_line):
     import csidetector.modes.alert.gui as gui

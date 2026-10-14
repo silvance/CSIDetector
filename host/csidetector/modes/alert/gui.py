@@ -185,15 +185,17 @@ class _DetectWorker(QObject):
         # None until the detector is warmed up, so its first verdict (STILL
         # included) is reported; the badge says INITIALIZING until then.
         last_motion: Optional[bool] = None
-        last_alert_ts = 0.0
+        last_alert_ts = float("-inf")  # the first motion always alerts
         ts_history: list[float] = []   # recent push timestamps for pkt rate
         last_rate_emit = 0.0
         self.state_changed.emit("INIT")
-        settle_until = time.time() + self._settle_s
-        quiet = {"since": time.time(), "warned": False}
+        # Intervals on the monotonic clock: a wall-clock sync mid-run must
+        # not cut the settle time or the alert cooldown short.
+        settle_until = time.monotonic() + self._settle_s
+        quiet = {"since": time.monotonic(), "warned": False}
 
         def idle() -> None:
-            gap = time.time() - quiet["since"]
+            gap = time.monotonic() - quiet["since"]
             if gap >= NO_DATA_WARN_S:
                 quiet["warned"] = True
                 self.no_data.emit(gap)
@@ -203,7 +205,7 @@ class _DetectWorker(QObject):
                                                 on_idle=idle):
             if self._stop.is_set():
                 return
-            now = time.time()
+            now = time.monotonic()
             quiet["since"] = now
             if quiet["warned"]:
                 quiet["warned"] = False
@@ -243,7 +245,7 @@ class _DetectWorker(QObject):
                 if should_notify:
                     last_alert_ts = now
                     self._dispatch(kind, ratio)
-                    self.alert_sent.emit(now)
+                    self.alert_sent.emit(time.time())      # shown as a time of day
                 last_motion = motion
 
     def _dispatch(self, kind: str, ratio: float) -> None:
@@ -296,7 +298,7 @@ class _CalibrateWorker(QObject):
     def _run_inner(self) -> None:
         rows: list[np.ndarray] = []
         idx: Optional[np.ndarray] = None
-        start = time.time()
+        start = time.monotonic()            # a clock sync mustn't cut it short
         settle_until = start + self._settle_s
         deadline = settle_until + self._record_s
         st = {"emit": 0.0, "sample": start, "warned": False, "timed_out": False}
@@ -313,7 +315,7 @@ class _CalibrateWorker(QObject):
                 st["emit"] = now
 
         def idle() -> None:
-            now = time.time()
+            now = time.monotonic()
             phase(now)
             if now - st["sample"] >= NO_DATA_WARN_S:
                 st["warned"] = True
@@ -326,7 +328,7 @@ class _CalibrateWorker(QObject):
                                                 on_idle=idle):
             if self._stop.is_set():
                 break
-            now = time.time()
+            now = time.monotonic()
             st["sample"] = now
             if st["warned"]:
                 st["warned"] = False
@@ -408,8 +410,10 @@ class _RecordWorker(QObject):
 
     def _run_inner(self) -> None:
         self._meta.setdefault("git_commit", _git_commit())
-        start_at = time.time() + self._delay_s
-        st = {"emit": 0.0, "data": time.time(), "warned": False}
+        # Monotonic, as the recording's own duration is: a wall-clock sync
+        # mid-recording must not cut it short or stretch it.
+        start_at = time.monotonic() + self._delay_s
+        st = {"emit": 0.0, "data": time.monotonic(), "warned": False}
 
         def tick(now: float) -> None:
             if self._writer is None and now >= start_at and not self._stop.is_set():
@@ -432,7 +436,7 @@ class _RecordWorker(QObject):
                     self.progress.emit("REC", max(0.0, self._end_at - now), w.samples)
 
         def idle() -> None:
-            now = time.time()
+            now = time.monotonic()
             tick(now)
             if now - st["data"] >= NO_DATA_WARN_S:
                 st["warned"] = True
@@ -440,7 +444,7 @@ class _RecordWorker(QObject):
 
         for line in csi_collector.iter_serial_lines(self._source, stop=self._stop,
                                                     on_idle=idle):
-            now = time.time()
+            now = time.monotonic()
             tick(now)
             if self._stop.is_set():
                 break
@@ -453,11 +457,14 @@ class _RecordWorker(QObject):
                 self._writer.write(line)
 
     def _open(self, now: float) -> None:
+        """``now``: time.monotonic(); the file is named and stamped with the
+        wall-clock time."""
+        wall = time.time()
         meta = dict(self._meta)
-        meta["started"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(now))
-        meta["started_unix"] = round(now, 3)
+        meta["started"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(wall))
+        meta["started_unix"] = round(wall, 3)
         self._writer = recording.new_recording(self._folder, meta.get("condition", ""),
-                                               meta, now)
+                                               meta, wall)
         self._end_at = now + self._length_s
 
     def _finish_file(self) -> None:
