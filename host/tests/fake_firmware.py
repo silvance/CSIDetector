@@ -79,6 +79,12 @@ def write_whole(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path + ".tmp", "w") as f:
         f.write(text)
+    for attempt in range(50):
+        try:
+            os.replace(path + ".tmp", path)
+            return
+        except PermissionError:      # Windows: a reader has it open right now
+            time.sleep(0.01)
     os.replace(path + ".tmp", path)
 
 def hard_reset(port):
