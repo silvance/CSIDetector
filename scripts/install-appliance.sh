@@ -205,7 +205,19 @@ if [[ ! -c "$DEVICE" ]]; then
 fi
 
 # A re-run: the running service holds the serial port, and two readers
-# on one port make one of them fail. The restart at the end brings it back.
+# on one port make one of them fail. The restart at the end brings it
+# back; until then any way out (a failed calibration, Ctrl-C) starts it
+# again with its previous calibration rather than leaving the sensor off.
+CAL_ERR=""
+restore_service() {
+    rm -f "$CAL_ERR"
+    if [[ -f "$UNIT_FILE" ]]; then
+        systemctl start "$UNIT_NAME" 2>/dev/null || true
+        echo "The sensor is running again with its previous calibration." >&2
+    fi
+}
+trap restore_service EXIT
+trap 'exit 130' INT TERM
 systemctl stop "$UNIT_NAME" 2>/dev/null || true
 
 echo "Device found. The next step records a 30-second still-room baseline"
@@ -220,13 +232,7 @@ BASELINE_RAW="$(sudo -u "$SERVICE_USER" "$VENV_DIR/bin/python" \
 if [[ "$cal_rc" -ne 0 ]]; then
     echo "ERROR: calibration failed:" >&2
     tail -n 15 "$CAL_ERR" | sed 's/^/         /' >&2
-    rm -f "$CAL_ERR"
-    if [[ -f "$UNIT_FILE" ]]; then
-        # A re-run: don't leave the sensor off; it keeps its old baseline.
-        systemctl start "$UNIT_NAME" 2>/dev/null || true
-        echo "         The sensor is running again with its previous calibration." >&2
-    fi
-    exit 1
+    exit 1                         # restore_service restarts a re-run's sensor
 fi
 rm -f "$CAL_ERR"
 # `alert calibrate` prints the baseline as its single stdout line — but
@@ -301,6 +307,7 @@ EOF
 systemctl daemon-reload
 systemctl enable "$UNIT_NAME" >/dev/null
 systemctl restart "$UNIT_NAME"
+trap - EXIT INT TERM               # running with the new calibration
 
 # --------------------------------------------------------------------------
 # 6. Status + tail.
