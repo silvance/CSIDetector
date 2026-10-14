@@ -11,13 +11,19 @@ desktop walkthrough yet, do that first — it confirms the firmware,
 calibration, and Telegram credentials are all good before you bake
 them into an always-on appliance.
 
+The boards are flashed there, with the setup app on your PC (no ESP-IDF
+or other tools): the transmitter as **Transmitter (TX)**, the receiver as
+**Receiver — alert mode (USB only)**. The Pi doesn't flash anything; you
+just move the flashed receiver over to it.
+
 ## Hardware
 
 - **Raspberry Pi Zero 2 W** (Pi 3 / 4 / 5 also work but are overkill).
   The original Pi Zero W is too slow for numpy + Python 3.11 — skip it.
 - **microSD card**, 16 GB+ (Class 10 / A1 or better)
-- **ESP32-S3 board** (any flavor; SuperMini variants are tiny and
-  match the Pi Zero's footprint)
+- **ESP32 board** for the receiver: an S3 (SuperMini variants are tiny
+  and match the Pi Zero's footprint), C3, C5, C6 or classic ESP32, plus
+  a second one as the transmitter
 - **USB-C PD splitter** if you want to power Pi + ESP32 from one
   outlet, or two USB-C cables and a multi-port wall wart
 - A short USB cable to connect ESP32 → Pi
@@ -57,11 +63,16 @@ sudo apt-get install -y git
 git clone https://github.com/silvance/CSIDetector.git
 cd CSIDetector
 
-# Plug the ESP32-S3 RX into one of the Pi's USB ports.
+# Plug the flashed RX into one of the Pi's USB ports.
 # Confirm it shows up:
-ls /dev/ttyACM*    # should print /dev/ttyACM0 (or similar)
+ls /dev/ttyACM*    # /dev/ttyACM0 (or /dev/ttyUSB0 for a classic ESP32
+                   # on a USB-serial chip)
+ls /dev/serial/by-id/   # the same board by name: this path doesn't change
+                        # if other USB devices are plugged in, so it's the
+                        # better answer to the installer's device prompt
 
-# Run the installer. It will:
+# Run the installer with sudo from the account the service should run
+# as (e.g. pi). It will:
 #   - apt-install python3 + numpy
 #   - create a venv
 #   - prompt for Telegram bot token, chat id, location label
@@ -77,13 +88,17 @@ wasn't empty.
 
 ### 4. Confirm it's running
 
-The installer ends by tailing the service log. You should see:
+The installer ends by tailing the service log. About 10 seconds after
+the service starts you should see:
 
 ```
-csidetector-alert[1234]: 2026-05-12T17:14:22 STILL score=0.142 baseline=0.183 ratio=0.78
+csidetector-alert[1234]: 2026-05-12T17:14:22 watching /dev/ttyACM0 (baseline=0.6521); prints MOTION / STILL when the state changes
 ```
 
-Walk past the sensor — terminal prints `MOTION` and your phone buzzes.
+After that the log only prints changes. Walk past the sensor — it
+prints `MOTION` and your phone buzzes; `STILL` follows once you're gone.
+If the "watching" line never appears, the receiver isn't streaming: see
+Troubleshooting.
 
 `Ctrl-C` exits the log tail; the service keeps running.
 
@@ -97,7 +112,8 @@ sudo systemctl restart csidetector-alert     # after editing config
 sudo systemctl stop csidetector-alert        # quiet hours / debugging
 ```
 
-Inspect the alert queue if a notification didn't arrive:
+Inspect the alert queue if a notification didn't arrive (`sudo apt-get
+install -y sqlite3` the first time):
 
 ```sh
 sqlite3 /var/lib/csidetector/alert-queue.db \
@@ -126,6 +142,12 @@ Removes the systemd unit and `/etc/csidetector/`. Leaves the repo +
 venv on disk in case you want to come back to it.
 
 ## Troubleshooting
+
+### The service keeps restarting with "Permission denied: '/etc/csidetector/alert.toml'"
+
+Installed with an older version of the installer, which made the file
+readable by root only. `git pull`, then re-run the installer: Enter at
+each prompt keeps the current value, and it recalibrates.
 
 ### "device not found at /dev/ttyACM0"
 
