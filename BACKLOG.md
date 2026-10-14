@@ -62,12 +62,13 @@ where it came from. Add to it rather than opening another review round.
   file is flushed every 2 s, so it keeps everything but the last
   couple of seconds and has no end summary; it still replays.
 
-- **Command-line `alert detect` / `alert calibrate` time with the wall
-  clock** (monotonic-clock review). Their settle period, cooldown and
-  deadline use `time.time()`, so a clock sync mid-run (a Pi without a
-  real-time clock syncing after boot) can shorten a calibration. The
-  alert monitor window uses the monotonic clock.
-  `host/csidetector/modes/alert/detect.py`, `calibrate.py`.
+- **Pi appliance not tried on a real Pi** (installer check). The
+  installer was run end to end in a container (apt and systemd stubbed,
+  a fake receiver on a pseudo-terminal): calibration, the service
+  command, MOTION/STILL and the queued alert all work. Untested there:
+  the apt packages on Raspberry Pi OS, systemd starting it at boot, the
+  `dialout` group for the serial port, and a Pi Zero 2 W keeping up with
+  100 samples/s.
 
 ## Ideas, not started
 

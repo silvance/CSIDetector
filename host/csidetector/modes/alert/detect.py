@@ -54,18 +54,25 @@ def run_detect(source: str,
     src = csi_collector.open_source(source)
     det: detector.MotionDetector | None = None
     last_state = False
-    last_alert_ts = 0.0
-    settle_until = time.time() + settle
+    last_alert_ts = float("-inf")       # the first motion always alerts
+    # Intervals on the monotonic clock: a Pi has no battery-backed clock
+    # and jumps when it syncs after boot.
+    settle_until = time.monotonic() + settle
 
     try:
         for sample in src:
-            if time.time() < settle_until:
+            if time.monotonic() < settle_until:
                 continue
             if det is None:
                 idx = np.flatnonzero(sample.amplitude > 0)
                 if idx.size == 0:
                     continue
                 det = detector.MotionDetector(idx, baseline, cfg)
+                # Only state changes are printed after this, so say it's
+                # up: a quiet log otherwise looks like a dead service.
+                print(f"{csi_collector.now_iso()} watching {source} "
+                      f"(baseline={det.baseline:.4f}); prints MOTION / STILL "
+                      f"when the state changes", flush=True)
             score, motion = det.update(sample.amplitude)
             if motion != last_state:
                 kind = "MOTION" if motion else "STILL"
@@ -74,7 +81,7 @@ def run_detect(source: str,
                       f"baseline={det.baseline:.4f} ratio={ratio:.2f}",
                       flush=True)
 
-                now = time.time()
+                now = time.monotonic()
                 should_notify = False
                 if motion:
                     # STILL → MOTION: notify unless we recently did.

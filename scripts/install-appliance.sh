@@ -33,7 +33,6 @@ ALERT_TOML="$SYSCONF_DIR/alert.toml"
 UNIT_NAME="csidetector-alert"
 UNIT_FILE="/etc/systemd/system/${UNIT_NAME}.service"
 SERVICE_USER="${SUDO_USER:-${USER:-pi}}"
-SERVICE_HOME="$(getent passwd "$SERVICE_USER" | cut -d: -f6)"
 
 UNINSTALL=0
 for arg in "$@"; do
@@ -48,6 +47,11 @@ done
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     echo "ERROR: needs sudo (apt + systemd writes)." >&2
+    exit 1
+fi
+if ! getent passwd "$SERVICE_USER" >/dev/null; then
+    echo "ERROR: the service would run as '$SERVICE_USER', which isn't a user here." >&2
+    echo "       Run this with sudo from the account it should run as (e.g. pi)." >&2
     exit 1
 fi
 
@@ -128,7 +132,9 @@ if [[ -z "${BOT_TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
     exit 1
 fi
 
-# Write alert.toml (read-only by root + service user; not world-readable).
+# Write alert.toml: it holds the bot token, so owner-only (0600) — owned
+# by the service user, who must read it (root:root 0600 made the service
+# fail at start with "Permission denied").
 cat >"$ALERT_TOML" <<EOF
 # Managed by install-appliance.sh. Re-run the installer to edit.
 
@@ -147,7 +153,7 @@ enabled = true
 path    = "/var/lib/csidetector/alert-queue.db"
 EOF
 chmod 600 "$ALERT_TOML"
-chown root:root "$ALERT_TOML"
+chown "$SERVICE_USER":"$SERVICE_USER" "$ALERT_TOML"
 
 # Queue directory needs to be writable by the service user.
 mkdir -p /var/lib/csidetector

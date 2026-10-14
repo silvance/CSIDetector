@@ -31,12 +31,12 @@ def collect_amplitudes(source: str,
     src = csi_collector.open_source(source)
     rows: list[np.ndarray] = []
     idx = None
-    start = time.time()
+    start = time.monotonic()            # see detect.py
     settle_until = start + settle_seconds
     deadline = (settle_until + seconds) if seconds else None
     skipped = 0
     for sample in src:
-        if time.time() < settle_until:
+        if time.monotonic() < settle_until:
             skipped += 1
             continue
         if idx is None:
@@ -46,7 +46,7 @@ def collect_amplitudes(source: str,
         rows.append(sample.amplitude)
         if max_samples and len(rows) >= max_samples:
             break
-        if deadline and time.time() >= deadline:
+        if deadline and time.monotonic() >= deadline:
             break
     if not rows or idx is None:
         raise SystemExit("no CSI samples received")
