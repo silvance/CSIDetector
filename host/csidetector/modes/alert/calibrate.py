@@ -9,6 +9,7 @@ whichever first) of CSI and computes the σ baseline used by
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -28,12 +29,20 @@ def collect_amplitudes(source: str,
         raise SystemExit(
             "calibrate: at least one of --seconds or --max-samples is "
             "required (otherwise it would run forever).")
-    src = csi_collector.open_source(source)
-    rows: list[np.ndarray] = []
-    idx = None
     start = time.monotonic()            # see detect.py
     settle_until = start + settle_seconds
     deadline = (settle_until + seconds) if seconds else None
+    stop = threading.Event()
+
+    def idle() -> None:
+        # Called while no data arrives (serial): without it the deadline
+        # is only checked per sample, and no CSI would mean waiting forever.
+        if deadline and time.monotonic() >= deadline:
+            stop.set()
+
+    src = csi_collector.open_source(source, stop=stop, on_idle=idle)
+    rows: list[np.ndarray] = []
+    idx = None
     skipped = 0
     for sample in src:
         if time.monotonic() < settle_until:
@@ -49,7 +58,10 @@ def collect_amplitudes(source: str,
         if deadline and time.monotonic() >= deadline:
             break
     if not rows or idx is None:
-        raise SystemExit("no CSI samples received")
+        raise SystemExit(
+            f"no CSI samples received from {source}. Check that the transmitter "
+            f"is powered and was flashed for the same channel as the receiver, "
+            f"and that this is the receiver's port.")
     if settle_seconds > 0:
         print(f"dropped {skipped} samples during AGC settle "
               f"({settle_seconds:.1f}s)", file=sys.stderr)

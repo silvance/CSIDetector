@@ -101,28 +101,46 @@ sudo -u "$SERVICE_USER" "$VENV_DIR/bin/pip" install --quiet \
 heading "Telegram + sensor config"
 mkdir -p "$SYSCONF_DIR"
 
+# Current value of a key in alert.toml (a re-run keeps what's there).
+toml_value() {
+    [[ -f "$ALERT_TOML" ]] || return 0
+    sed -n "s/^$1[[:space:]]*=[[:space:]]*\"\(.*\)\"[[:space:]]*\$/\1/p" "$ALERT_TOML" | head -n1
+}
+
 prompt() {
     local var_name="$1"
     local label="$2"
     local default="${3:-}"
+    local secret="${4:-}"
     local current=""
     if [[ -f "$ENV_FILE" ]]; then
         current=$(awk -F= -v k="$var_name" '$1==k {sub(/^"/,"",$2); sub(/"$/,"",$2); print $2}' "$ENV_FILE")
     fi
+    case "$var_name" in
+        BOT_TOKEN) current="$(toml_value bot_token)" ;;
+        CHAT_ID)   current="$(toml_value chat_id)" ;;
+    esac
     local prompt_default="${current:-$default}"
     local hint=""
-    if [[ -n "$prompt_default" ]]; then
+    if [[ -n "$prompt_default" && -n "$secret" ]]; then
+        hint=" [Enter keeps the current one]"
+    elif [[ -n "$prompt_default" ]]; then
         hint=" [${prompt_default}]"
     fi
     printf '%s%s: ' "$label" "$hint"
-    read -r value || value=""
+    if [[ -n "$secret" ]]; then
+        read -rs value || value=""
+        echo
+    else
+        read -r value || value=""
+    fi
     if [[ -z "$value" ]]; then
         value="$prompt_default"
     fi
     printf -v "$var_name" '%s' "$value"
 }
 
-prompt BOT_TOKEN  "Telegram bot token (from @BotFather)"
+prompt BOT_TOKEN  "Telegram bot token (from @BotFather)" "" secret
 prompt CHAT_ID    "Telegram chat ID (from getUpdates)"
 prompt LOCATION   "Location label (e.g. 'Office')" "Sensor"
 prompt DEVICE     "Serial device for the RX" "/dev/ttyACM0"
@@ -134,30 +152,37 @@ fi
 
 # Write alert.toml: it holds the bot token, so owner-only (0600) — owned
 # by the service user, who must read it (root:root 0600 made the service
-# fail at start with "Permission denied").
+# fail at start with "Permission denied"). Created 0600 before anything
+# is written to it.
+toml_escape() {
+    local s="${1//\\/\\\\}"
+    printf '%s' "${s//\"/\\\"}"
+}
+install -m 600 /dev/null "$ALERT_TOML"
 cat >"$ALERT_TOML" <<EOF
 # Managed by install-appliance.sh. Re-run the installer to edit.
 
 [notifier]
 type      = "telegram"
-bot_token = "${BOT_TOKEN}"
-chat_id   = "${CHAT_ID}"
+bot_token = "$(toml_escape "$BOT_TOKEN")"
+chat_id   = "$(toml_escape "$CHAT_ID")"
 
 [alert]
 cooldown_s     = 60
 clear_on_exit  = false
-location_label = "${LOCATION}"
+location_label = "$(toml_escape "$LOCATION")"
 
 [queue]
 enabled = true
 path    = "/var/lib/csidetector/alert-queue.db"
 EOF
 chmod 600 "$ALERT_TOML"
-chown "$SERVICE_USER":"$SERVICE_USER" "$ALERT_TOML"
+chown "$SERVICE_USER": "$ALERT_TOML"
 
 # Queue directory needs to be writable by the service user.
+# (-R: the queue database too, e.g. after re-running as another user.)
 mkdir -p /var/lib/csidetector
-chown "$SERVICE_USER":"$SERVICE_USER" /var/lib/csidetector
+chown -R "$SERVICE_USER": /var/lib/csidetector
 
 # --------------------------------------------------------------------------
 # 4. Calibration. Block on the user being out of the room.
@@ -179,13 +204,31 @@ if [[ ! -c "$DEVICE" ]]; then
     exit 1
 fi
 
+# A re-run: the running service holds the serial port, and two readers
+# on one port make one of them fail. The restart at the end brings it back.
+systemctl stop "$UNIT_NAME" 2>/dev/null || true
+
 echo "Device found. The next step records a 30-second still-room baseline"
 echo "after a 30-second walk-out window. Press Enter, then leave the room."
 read -r _ || true
 
+CAL_ERR="$(mktemp)"
+cal_rc=0
 BASELINE_RAW="$(sudo -u "$SERVICE_USER" "$VENV_DIR/bin/python" \
     "$HOST_DIR/run.py" alert calibrate "$DEVICE" --seconds 30 --settle 30 \
-    2>/dev/null)"
+    2>"$CAL_ERR")" || cal_rc=$?
+if [[ "$cal_rc" -ne 0 ]]; then
+    echo "ERROR: calibration failed:" >&2
+    tail -n 15 "$CAL_ERR" | sed 's/^/         /' >&2
+    rm -f "$CAL_ERR"
+    if [[ -f "$UNIT_FILE" ]]; then
+        # A re-run: don't leave the sensor off; it keeps its old baseline.
+        systemctl start "$UNIT_NAME" 2>/dev/null || true
+        echo "         The sensor is running again with its previous calibration." >&2
+    fi
+    exit 1
+fi
+rm -f "$CAL_ERR"
 # `alert calibrate` prints the baseline as its single stdout line — but
 # parsing via `tail -n1` alone is fragile (any future stdout addition
 # silently breaks the installer). Pick the last line that LOOKS like a

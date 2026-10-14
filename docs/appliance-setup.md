@@ -146,8 +146,8 @@ venv on disk in case you want to come back to it.
 ### The service keeps restarting with "Permission denied: '/etc/csidetector/alert.toml'"
 
 Installed with an older version of the installer, which made the file
-readable by root only. `git pull`, then re-run the installer (hit Enter
-through the prompts).
+readable by root only. `git pull`, then re-run the installer: Enter at
+each prompt keeps the current value, and it recalibrates.
 
 ### "device not found at /dev/ttyACM0"
 

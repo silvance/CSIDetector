@@ -46,3 +46,27 @@ def test_says_it_is_watching_and_alerts_on_the_first_motion_after_boot(
     assert "watching" in out[0] and str(capture) in out[0]
     assert any(" MOTION " in line for line in out)
     assert len(sent) == 1 and "Office" in sent[0].message
+
+
+def test_calibration_ends_at_its_deadline_when_no_csi_arrives(monkeypatch):
+    """Transmitter off: the serial reader only idles. Calibration must give
+    up at its deadline with a reason, not wait forever."""
+    import time as real
+
+    import pytest
+
+    from csidetector.modes.alert import calibrate
+
+    def silent(source, stop=None, on_idle=None):
+        while not stop.is_set():
+            real.sleep(0.01)
+            on_idle()
+        return
+        yield                                         # a generator, like iter_serial
+
+    monkeypatch.setattr(calibrate.csi_collector, "open_source", silent)
+    start = real.monotonic()
+    with pytest.raises(SystemExit, match="no CSI samples received from /dev/ttyACM0"):
+        calibrate.collect_amplitudes("/dev/ttyACM0", seconds=0.3, max_samples=None,
+                                     settle_seconds=0.1)
+    assert real.monotonic() - start < 5
