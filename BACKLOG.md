@@ -57,6 +57,10 @@ where it came from. Add to it rather than opening another review round.
 - **Recording: the wizard can end it unannounced** (recording review).
   Re-running the setup wizard closes an open alert monitor; a recording
   in progress is finished and kept, but the user isn't told.
+- **Recording: Stop pressed while the file is being created** (recording
+  length review). In that fraction of a second nothing has been written
+  yet, so the monitor says "No CSI arrived", which wrongly suggests a
+  hardware problem. Nothing is lost; the file isn't kept either way.
 - **Recording: closing the console window on Windows** (recording
   review) ends the process without a chance to finish the file. The
   file is flushed every 2 s, so it keeps everything but the last
