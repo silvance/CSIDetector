@@ -33,3 +33,29 @@ def test_hampel_filter_2d_per_column():
     assert abs(out[20, 1] - 1.0) < 0.2
     # Other columns at the same row are essentially unchanged.
     assert np.allclose(out[20, [0, 2, 3]], x[20, [0, 2, 3]], atol=0.05)
+
+
+def test_hampel_filter_catches_outliers_at_the_edges():
+    """The detector's window always has the newest packet as its last row:
+    an outlier there (or in the first row) must be filtered too."""
+    x = np.full(50, 32.0) + np.tile([0.4, -0.3, 0.2, -0.5, 0.1], 10)
+    for i in (0, 49):
+        y = x.copy()
+        y[i] = 19.5
+        out = detector.hampel_filter(y, k=3.0, window=7)
+        assert abs(out[i] - 32.0) < 1.0
+
+
+def test_one_glitch_packet_does_not_raise_motion():
+    """Recorded in an empty room: one packet with every subcarrier low
+    (an AGC glitch) used to give MOTION as it entered the window and
+    again as it left it."""
+    rng = np.random.default_rng(0)
+    n_sub, base_amp = 52, 32.0
+    rows = base_amp + rng.normal(0, 1.0, size=(400, n_sub))
+    rows[200] *= 19.5 / 32.0
+    idx = np.arange(n_sub)
+    baseline = detector.compute_baseline(rows[:150], 50)
+    det = detector.MotionDetector(idx, baseline, detector.DetectorConfig(
+        window=50, enter_ratio=1.7, exit_ratio=1.3))
+    assert not any(det.update(r)[1] for r in rows)
