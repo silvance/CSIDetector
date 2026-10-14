@@ -74,12 +74,17 @@ def chip_target(chip):
 def target_name(target):
     return "ESP32" + ("-" + target[5:].upper() if len(target) > 5 else "")
 
+def write_whole(path, text):
+    """Write so a reader polling for the file never sees it half-written."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".tmp", "w") as f:
+        f.write(text)
+    os.replace(path + ".tmp", path)
+
 def hard_reset(port):
     """The chip resets: a native-USB board leaves the bus for a moment."""
     out("Hard resetting via RTS pin...")
-    os.makedirs(os.path.join(BENCH, "reset"), exist_ok=True)
-    with open(os.path.join(BENCH, "reset", port.replace("/", "_")), "w") as f:
-        f.write(str(time.time()))
+    write_whole(os.path.join(BENCH, "reset", port.replace("/", "_")), str(time.time()))
 
 def opt(flag):
     return args[args.index(flag) + 1] if flag in args else ""
@@ -174,11 +179,10 @@ for offset, path in pairs:
     if offset == 0xf000:
         settings = settings_block(path)
 role = settings.get("role", "")
-os.makedirs(os.path.join(BENCH, "firmware"), exist_ok=True)
-with open(os.path.join(BENCH, "firmware", board["mac"].replace(":", "") + ".json"), "w") as f:
-    json.dump({{"project": {{"tx": "csi_transmitter", "rx": "csi_receiver"}}.get(role, ""),
-               "target": want, "port": port, "config": settings,
-               "files": [p for _, p in pairs]}}, f, indent=1)
+write_whole(os.path.join(BENCH, "firmware", board["mac"].replace(":", "") + ".json"),
+            json.dumps({{"project": {{"tx": "csi_transmitter", "rx": "csi_receiver"}}.get(role, ""),
+                        "target": want, "port": port, "config": settings,
+                        "files": [p for _, p in pairs]}}, indent=1))
 '''
 
 
