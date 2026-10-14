@@ -191,6 +191,26 @@ def test_record_worker_waits_then_records_for_its_length(qt_app, tmp_path, monke
     assert rec.end["samples"] == summary["samples"] > 20
 
 
+def test_record_worker_length_counts_from_when_the_file_exists(qt_app, tmp_path,
+                                                               monkeypatch, csi_data_line):
+    """Creating the file can be slow (antivirus on Windows): the recording
+    must still be as long as asked, not shorter by that delay."""
+    import time as real
+    import csidetector.modes.alert.gui as gui
+    from csidetector.core import recording
+    slow_open = recording.new_recording
+
+    def new_recording(*a, **k):
+        real.sleep(0.3)
+        return slow_open(*a, **k)
+    monkeypatch.setattr(gui.recording, "new_recording", new_recording)
+    monkeypatch.setattr(gui.csi_collector, "iter_serial_lines",
+                        _fake_serial_lines(200, csi_data_line() + "\n"))
+    out = _record(gui, tmp_path, delay_s=0.0, length_s=0.4)
+    (path, summary), = out["saved"]
+    assert summary["stopped_by"] == "timer" and 0.35 <= summary["duration_s"] <= 1.0
+
+
 def test_record_worker_ignores_wall_clock_jumps(qt_app, tmp_path, monkeypatch,
                                                csi_data_line):
     """The PC's clock syncing mid-recording (seen on a fresh CI machine)

@@ -383,7 +383,6 @@ class _RecordWorker(QObject):
         self._stopped_by = "stopped"
         self._marks: "queue.SimpleQueue[None]" = queue.SimpleQueue()
         self._writer: Optional[recording.RecordingWriter] = None
-        self._end_at = 0.0
 
     def request_stop(self, reason: str = "stopped") -> None:
         if not self._stop.is_set():
@@ -426,14 +425,17 @@ class _RecordWorker(QObject):
                     except queue.Empty:
                         break
                     w.mark()
-                if now >= self._end_at:
+                # The length runs on the file's own clock, which starts
+                # once the file exists: creating it can take a few hundred
+                # ms on Windows (antivirus), which would cut it short.
+                if w.elapsed >= self._length_s:
                     self.request_stop("timer")
             if now - st["emit"] >= 0.25:
                 st["emit"] = now
                 if w is None:
                     self.progress.emit("WAIT", max(0.0, start_at - now), 0)
                 else:
-                    self.progress.emit("REC", max(0.0, self._end_at - now), w.samples)
+                    self.progress.emit("REC", max(0.0, self._length_s - w.elapsed), w.samples)
 
         def idle() -> None:
             now = time.monotonic()
@@ -457,15 +459,14 @@ class _RecordWorker(QObject):
                 self._writer.write(line)
 
     def _open(self, now: float) -> None:
-        """``now``: time.monotonic(); the file is named and stamped with the
-        wall-clock time."""
+        """Start the file, named and stamped with the wall-clock time. Its
+        length is timed from the file's own clock (see tick)."""
         wall = time.time()
         meta = dict(self._meta)
         meta["started"] = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(wall))
         meta["started_unix"] = round(wall, 3)
         self._writer = recording.new_recording(self._folder, meta.get("condition", ""),
                                                meta, wall)
-        self._end_at = now + self._length_s
 
     def _finish_file(self) -> None:
         w, self._writer = self._writer, None
