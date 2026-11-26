@@ -5,26 +5,33 @@ below the bar for a fix (a crash, a wrong result, data loss, or something
 that would break a demo), plus the gaps we know about. Each entry says
 where it came from. Add to it rather than opening another review round.
 
+The November 2026 look over the whole project is in
+[`docs/project-review-2026-11.md`](docs/project-review-2026-11.md): its
+"Findings worth fixing" are above this bar and not yet fixed; its "Below
+the bar" list belongs with the entries here.
+
 ## Not verified yet
 
-- **The prebuilt firmware on real boards.** CI compiles it; nobody has
-  flashed it yet. On the first boards, check: the boot log says
-  "settings from the setup app" with the board's label; a receiver
-  streams CSI on the channel set in the app; a localize receiver joins
-  the Wi-Fi typed into the app; a board flashed earlier with ESP-IDF
-  (default partition table) boots after the app reflashes it.
+- **The prebuilt firmware beyond the ESP32-S3.** Seen working: an S3
+  transmitter and receiver flashed from the setup app on Windows 11
+  (Python 3.14), alert mode, clean recordings on the channel and filter
+  set in the app. Not yet: the C3, C5, C6 and classic ESP32 images (the
+  classic ESP32 receiver is known not to work: review finding 14); a
+  localize receiver joining the Wi-Fi typed into the app; a board
+  flashed earlier with ESP-IDF (default partition table) booting after
+  the app reflashes it; anyone reading the boot log for "settings from
+  the setup app" with the board's label.
 - **ESP32-C5 / C6 CSI.** Their receiver code path (Wi-Fi 6 reception
   metadata, the CSI acquire config) compiles but has never run. Whether
   they produce CSI from the transmitter's HT20 broadcasts, and whether
   the detector copes with their subcarrier layout, is unknown until a
   recording from one is looked at.
-- **Windows on real hardware.** CI runs the whole suite on windows-latest,
-  but against a fake esptool. Nobody has yet run the setup app on a
-  Windows PC with real boards, the USB drivers, the firewall prompt and a
-  Mobile hotspot. Things to watch on that first run: COM port names in
-  the Devices tab and monitor, esptool's progress output in the log, the
-  firewall prompt for UDP 5566, and the Mobile hotspot's channel (it
-  picks its own).
+- **Windows beyond alert mode with native-USB boards.** Flashing two
+  S3 boards and recording from the alert monitor has been done on
+  Windows 11. Not yet: boards behind a CP210x / CH340 chip (their
+  drivers), and localize mode there: the firewall prompt for UDP 5566
+  and the Mobile hotspot's channel (it picks its own; see review
+  finding 15). CI runs Python 3.11 only; the real run was on 3.14.
 - **macOS.** Never run and not in CI. The monitor accepts `/dev/cu.*`
   ports; nothing else has been checked.
 
@@ -70,9 +77,9 @@ where it came from. Add to it rather than opening another review round.
   installer was run end to end in a container (apt and systemd stubbed,
   a fake receiver on a pseudo-terminal): calibration, the service
   command, MOTION/STILL and the queued alert all work. Untested there:
-  the apt packages on Raspberry Pi OS, systemd starting it at boot, the
-  `dialout` group for the serial port, and a Pi Zero 2 W keeping up with
-  100 samples/s.
+  the apt packages on Raspberry Pi OS, systemd starting it at boot, and
+  the `dialout` group for the serial port. A Pi Zero 2 W is not expected
+  to keep up with 100 samples/s as the code stands (review finding 8).
 
 ## Ideas, not started
 
